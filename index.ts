@@ -234,6 +234,27 @@ function stripThumbnails(results: ExtractedContent[]): ExtractedContent[] {
 	return results.map(({ thumbnail, frames, ...rest }) => rest);
 }
 
+function buildFetchDetail(result: ExtractedContent, index: number, includeMetadata = false): Record<string, unknown> {
+	return {
+		index,
+		url: result.url,
+		status: result.error ? "error" : "success",
+		error: result.error,
+		title: result.title,
+		contentLength: result.content.length,
+		method: result.method,
+		fetchedAt: result.fetchedAt,
+		fetchedUrl: result.fetchedUrl,
+		contentType: result.contentType,
+		httpStatus: result.httpStatus,
+		fallbackPath: result.fallbackPath,
+		truncated: result.truncated,
+		originalContentLength: result.originalContentLength,
+		retrievalStatus: result.retrievalStatus,
+		metadata: includeMetadata ? result.metadata : undefined,
+	};
+}
+
 function formatSearchSummary(results: SearchResult[], answer: string): string {
 	let output = answer ? `${answer}\n\n---\n\n**Sources:**\n` : "";
 	output += results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`).join("\n\n");
@@ -769,6 +790,9 @@ export default function (pi: ExtensionAPI) {
 
 		const searchId = storeAndPublishSearch(opts.results);
 		const isBackgroundFetch = fetchId !== null && !hasInlineReady;
+		const queryMetadata = opts.results.some(r => r.metadata)
+			? opts.results.map(r => ({ query: r.query, provider: r.provider, metadata: r.metadata }))
+			: undefined;
 
 		return {
 			content: [{ type: "text", text: output.trim() }],
@@ -781,6 +805,7 @@ export default function (pi: ExtensionAPI) {
 				fetchId,
 				fetchUrls: isBackgroundFetch ? opts.urls : undefined,
 				searchId,
+				...(queryMetadata ? { metadata: queryMetadata } : {}),
 				...(opts.curated ? {
 					curated: true,
 					curatedFrom: opts.curatedFrom,
@@ -1091,6 +1116,7 @@ export default function (pi: ExtensionAPI) {
 				StringEnum(["day", "week", "month", "year"], { description: "Filter by recency" }),
 			),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude)" })),
+			returnMetadata: Type.Optional(Type.Boolean({ description: "Include provider/debug metadata in details and stored results" })),
 			provider: Type.Optional(
 				StringEnum(["auto", "perplexity", "gemini", "exa"], { description: "Search provider (default: auto)" }),
 			),
@@ -1207,16 +1233,17 @@ export default function (pi: ExtensionAPI) {
 					});
 					const requestedProvider = pc.defaultProvider;
 					try {
-						const { answer, results, inlineContent, provider } = await search(queryList[qi], {
+						const { answer, results, inlineContent, provider, metadata } = await search(queryList[qi], {
 							provider: requestedProvider,
 							numResults: params.numResults,
 							recencyFilter: params.recencyFilter,
 							domainFilter: params.domainFilter,
 							includeContent: params.includeContent,
+							returnMetadata: params.returnMetadata,
 							signal: searchSignal,
 						});
 						if (signal?.aborted || cancelled || searchAbort.signal.aborted) break;
-						searchResults.set(qi, { query: queryList[qi], answer, results, error: null, provider });
+						searchResults.set(qi, { query: queryList[qi], answer, results, error: null, provider, metadata });
 						if (inlineContent) allInlineContent.push(...inlineContent);
 						if (activeCurator) {
 							activeCurator.pushResult(qi, {
@@ -1266,16 +1293,17 @@ export default function (pi: ExtensionAPI) {
 				});
 
 				try {
-					const { answer, results, inlineContent, provider } = await search(query, {
+					const { answer, results, inlineContent, provider, metadata } = await search(query, {
 						provider: resolvedProvider,
 						numResults: params.numResults,
 						recencyFilter: params.recencyFilter,
 						domainFilter: params.domainFilter,
 						includeContent: params.includeContent,
+						returnMetadata: params.returnMetadata,
 						signal,
 					});
 
-					searchResults.push({ query, answer, results, error: null, provider });
+					searchResults.push({ query, answer, results, error: null, provider, metadata });
 					for (const r of results) {
 						if (!allUrls.includes(r.url)) {
 							allUrls.push(r.url);
@@ -1587,6 +1615,12 @@ export default function (pi: ExtensionAPI) {
 			model: Type.Optional(Type.String({
 				description: "Override the Gemini model for video/YouTube analysis (e.g. 'gemini-2.5-flash', 'gemini-3-flash-preview'). Defaults to config or gemini-3-flash-preview.",
 			})),
+			objective: Type.Optional(Type.String({ description: "Focus objective for highlights/summary extraction and Gemini URL Context prompts" })),
+			queries: Type.Optional(Type.Array(Type.String(), { description: "Related search queries/objectives used to rank highlights" })),
+			mode: Type.Optional(StringEnum(["full", "highlights", "summary"], { description: "Content shaping mode: full (default), highlights, or summary" })),
+			maxChars: Type.Optional(Type.Number({ description: "Maximum characters to return/store after content shaping" })),
+			timeoutMs: Type.Optional(Type.Number({ description: "Per-request timeout in milliseconds" })),
+			returnMetadata: Type.Optional(Type.Boolean({ description: "Include extraction metadata/status in details.perUrl" })),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate) {
@@ -1609,9 +1643,16 @@ export default function (pi: ExtensionAPI) {
 				timestamp: params.timestamp,
 				frames: params.frames,
 				model: params.model,
+				objective: params.objective,
+				queries: params.queries,
+				mode: params.mode,
+				maxChars: params.maxChars,
+				timeoutMs: params.timeoutMs,
+				returnMetadata: params.returnMetadata,
 			});
 			const successful = fetchResults.filter((r) => !r.error).length;
 			const totalChars = fetchResults.reduce((sum, r) => sum + r.content.length, 0);
+			const perUrl = fetchResults.map((result, index) => buildFetchDetail(result, index, params.returnMetadata === true));
 
 			// ALWAYS store results (even for single URL)
 			const responseId = generateId();
@@ -1630,7 +1671,7 @@ export default function (pi: ExtensionAPI) {
 				if (result.error) {
 					return {
 						content: [{ type: "text", text: `Error: ${result.error}` }],
-						details: { urls: urlList, urlCount: 1, successful: 0, error: result.error, responseId, prompt: params.prompt, timestamp: params.timestamp, frames: params.frames },
+						details: { urls: urlList, urlCount: 1, successful: 0, error: result.error, responseId, prompt: params.prompt, timestamp: params.timestamp, frames: params.frames, perUrl, results: perUrl },
 					};
 				}
 
@@ -1645,7 +1686,7 @@ export default function (pi: ExtensionAPI) {
 						`Use get_search_content({ responseId: "${responseId}", urlIndex: 0 }) for full content.`;
 				}
 
-				const content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
+				const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
 				if (result.frames?.length) {
 					for (const frame of result.frames) {
 						content.push({ type: "image", data: frame.data, mimeType: frame.mimeType });
@@ -1673,6 +1714,16 @@ export default function (pi: ExtensionAPI) {
 						timestamp: params.timestamp,
 						frames: params.frames,
 						duration: result.duration,
+						method: result.method,
+						fetchedAt: result.fetchedAt,
+						fetchedUrl: result.fetchedUrl,
+						contentType: result.contentType,
+						httpStatus: result.httpStatus,
+						fallbackPath: result.fallbackPath,
+						originalContentLength: result.originalContentLength,
+						metadata: params.returnMetadata ? result.metadata : undefined,
+						perUrl,
+						results: perUrl,
 					},
 				};
 			}
@@ -1690,7 +1741,7 @@ export default function (pi: ExtensionAPI) {
 
 			return {
 				content: [{ type: "text", text: output }],
-				details: { urls: urlList, urlCount: urlList.length, successful, totalChars, responseId },
+				details: { urls: urlList, urlCount: urlList.length, successful, totalChars, responseId, perUrl, results: perUrl },
 			};
 		},
 

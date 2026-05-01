@@ -29,8 +29,124 @@ function isAbortError(err: unknown): boolean {
 	return errorMessage(err).toLowerCase().includes("abort");
 }
 
-function abortedResult(url: string): ExtractedContent {
-	return { url, title: "", content: "", error: "Aborted" };
+function abortedResult(url: string, fallbackPath?: string[]): ExtractedContent {
+	return { url, title: "", content: "", error: "Aborted", status: "error", method: "aborted", fetchedAt: new Date().toISOString(), fallbackPath };
+}
+
+function normalizeMode(mode: unknown): ExtractMode {
+	return mode === "highlights" || mode === "summary" ? mode : "full";
+}
+
+function normalizeMaxChars(value: unknown): number | null {
+	if (typeof value !== "number" || !Number.isFinite(value)) return null;
+	const rounded = Math.floor(value);
+	return rounded > 0 ? rounded : null;
+}
+
+function objectiveTokens(options?: ExtractOptions): Set<string> {
+	const raw = [options?.objective, ...(options?.queries ?? [])].filter((v): v is string => typeof v === "string").join(" ").toLowerCase();
+	const stop = new Set(["about", "after", "also", "and", "are", "because", "but", "can", "for", "from", "has", "have", "how", "into", "its", "not", "our", "that", "the", "their", "this", "was", "what", "when", "where", "which", "with", "you", "your"]);
+	return new Set((raw.match(/[a-z0-9][a-z0-9-]{2,}/g) ?? []).filter(t => !stop.has(t)));
+}
+
+function splitMarkdownBlocks(markdown: string): string[] {
+	return markdown
+		.split(/\n{2,}/)
+		.map(block => block.trim())
+		.filter(block => block.length > 0);
+}
+
+function scoreBlock(block: string, tokens: Set<string>, index: number): number {
+	let score = Math.max(0, 8 - index * 0.05);
+	if (/^#{1,3}\s/.test(block)) score += 2;
+	const lower = block.toLowerCase();
+	for (const token of tokens) {
+		const matches = lower.match(new RegExp(`\\b${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g"));
+		if (matches) score += matches.length * 6;
+	}
+	return score;
+}
+
+function buildHighlights(markdown: string, tokens: Set<string>): string {
+	const blocks = splitMarkdownBlocks(markdown);
+	if (blocks.length === 0 || tokens.size === 0) return blocks.slice(0, 6).join("\n\n");
+	const selected = blocks
+		.map((block, index) => ({ block, index, score: scoreBlock(block, tokens, index) }))
+		.filter(item => item.score > Math.max(1, 8 - item.index * 0.05))
+		.sort((a, b) => b.score - a.score || a.index - b.index)
+		.slice(0, 8)
+		.sort((a, b) => a.index - b.index)
+		.map(item => item.block);
+	return (selected.length > 0 ? selected : blocks.slice(0, 6)).join("\n\n");
+}
+
+function buildSummary(markdown: string, tokens: Set<string>): string {
+	const blocks = splitMarkdownBlocks(markdown);
+	if (blocks.length === 0) return markdown;
+	const headings = blocks.filter(block => /^#{1,3}\s/.test(block)).slice(0, 12);
+	const paragraphs = tokens.size > 0
+		? blocks
+			.map((block, index) => ({ block, index, score: scoreBlock(block, tokens, index) }))
+			.filter(item => !/^#{1,3}\s/.test(item.block))
+			.sort((a, b) => b.score - a.score || a.index - b.index)
+			.slice(0, 5)
+			.sort((a, b) => a.index - b.index)
+			.map(item => item.block)
+		: blocks.filter(block => !/^#{1,3}\s/.test(block)).slice(0, 5);
+	return [...headings, ...paragraphs].join("\n\n") || blocks.slice(0, 6).join("\n\n");
+}
+
+function capContent(content: string, maxChars: number | null): { content: string; truncated: boolean } {
+	if (!maxChars || content.length <= maxChars) return { content, truncated: false };
+	const marker = "\n\n[Truncated by fetch_content maxChars]";
+	const bodyLimit = Math.max(0, maxChars - marker.length);
+	const slice = content.slice(0, bodyLimit);
+	const breakAt = Math.max(slice.lastIndexOf("\n\n"), slice.lastIndexOf(". "), slice.lastIndexOf("\n"));
+	const capped = (breakAt > Math.floor(bodyLimit * 0.5) ? slice.slice(0, breakAt + 1) : slice).trimEnd();
+	const output = `${capped}${marker}`;
+	return { content: output.length > maxChars ? output.slice(0, maxChars) : output, truncated: true };
+}
+
+function shapeExtractedContent(result: ExtractedContent, options?: ExtractOptions): ExtractedContent {
+	if (result.error || !result.content) return { ...result, status: "error", originalContentLength: result.content.length, truncated: false };
+	const originalContentLength = result.content.length;
+	const mode = normalizeMode(options?.mode);
+	const tokens = objectiveTokens(options);
+	let shaped = result.content;
+	if (mode === "highlights") shaped = buildHighlights(shaped, tokens);
+	else if (mode === "summary") shaped = buildSummary(shaped, tokens);
+	const capped = capContent(shaped, normalizeMaxChars(options?.maxChars));
+	return {
+		...result,
+		content: capped.content,
+		status: "success",
+		originalContentLength,
+		truncated: capped.truncated || shaped.length < originalContentLength,
+		metadata: {
+			...(result.metadata ?? {}),
+			mode,
+			objective: options?.objective,
+			queries: options?.queries,
+		},
+	};
+}
+
+function finalizeResult(
+	result: ExtractedContent,
+	options: ExtractOptions | undefined,
+	method: string,
+	fallbackPath: string[],
+	extra?: Partial<ExtractedContent>,
+): ExtractedContent {
+	const merged: ExtractedContent = {
+		...result,
+		...extra,
+		method: result.method ?? extra?.method ?? method,
+		status: result.error ? "error" : "success",
+		fetchedAt: result.fetchedAt ?? extra?.fetchedAt ?? new Date().toISOString(),
+		fallbackPath: result.fallbackPath ?? fallbackPath,
+	};
+	return shapeExtractedContent(merged, options);
 }
 
 const turndown = new TurndownService({
@@ -49,6 +165,8 @@ export interface VideoFrame {
 export type FrameData = { data: string; mimeType: string };
 export type FrameResult = FrameData | { error: string };
 
+export type ExtractMode = "full" | "highlights" | "summary";
+
 export interface ExtractedContent {
 	url: string;
 	title: string;
@@ -57,6 +175,18 @@ export interface ExtractedContent {
 	thumbnail?: { data: string; mimeType: string };
 	frames?: VideoFrame[];
 	duration?: number;
+	status?: "success" | "error";
+	method?: string;
+	fetchedAt?: string;
+	fetchedUrl?: string;
+	contentType?: string;
+	httpStatus?: number;
+	contentLength?: number;
+	originalContentLength?: number;
+	truncated?: boolean;
+	fallbackPath?: string[];
+	retrievalStatus?: string;
+	metadata?: Record<string, unknown>;
 }
 
 export interface ExtractOptions {
@@ -66,6 +196,11 @@ export interface ExtractOptions {
 	timestamp?: string;
 	frames?: number;
 	model?: string;
+	objective?: string;
+	queries?: string[];
+	mode?: ExtractMode;
+	maxChars?: number;
+	returnMetadata?: boolean;
 }
 
 const JINA_READER_BASE = "https://r.jina.ai/";
@@ -114,7 +249,7 @@ async function extractWithJinaReader(
 		}
 
 		const title = extractHeadingTitle(markdownPart) ?? (new URL(url).pathname.split("/").pop() || url);
-		return { url, title, content: markdownPart, error: null };
+		return { url, title, content: markdownPart, error: null, method: "jina", fetchedAt: new Date().toISOString(), fetchedUrl: jinaUrl, httpStatus: res.status, contentType: res.headers.get("content-type") || undefined };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		if (message.toLowerCase().includes("abort")) {
@@ -210,8 +345,9 @@ export async function extractContent(
 	signal?: AbortSignal,
 	options?: ExtractOptions,
 ): Promise<ExtractedContent> {
+	const fallbackPath: string[] = [];
 	if (signal?.aborted) {
-		return { url, title: "", content: "", error: "Aborted" };
+		return abortedResult(url, fallbackPath);
 	}
 
 	if (options?.frames && !options.timestamp) {
@@ -369,15 +505,16 @@ export async function extractContent(
 		return { url, title: "", content: "", error: "Invalid URL" };
 	}
 
+	fallbackPath.push("github");
 	try {
 		const ghResult = await extractGitHub(url, signal, options?.forceClone);
-		if (ghResult) return ghResult;
-		if (signal?.aborted) return abortedResult(url);
+		if (ghResult) return finalizeResult(ghResult, options, "github", fallbackPath);
+		if (signal?.aborted) return abortedResult(url, fallbackPath);
 	} catch (err) {
 		const message = errorMessage(err);
-		if (isAbortError(err)) return abortedResult(url);
+		if (isAbortError(err)) return abortedResult(url, fallbackPath);
 		if (isConfigParseError(err)) {
-			return { url, title: "", content: "", error: message };
+			return finalizeResult({ url, title: "", content: "", error: message }, options, "github", fallbackPath);
 		}
 	}
 
@@ -389,50 +526,60 @@ export async function extractContent(
 		return { url, title: "", content: "", error: errorMessage(err) };
 	}
 	if (ytInfo.isYouTube && youtubeEnabled) {
+		fallbackPath.push("youtube");
 		try {
 			const ytResult = await extractYouTube(url, signal, options?.prompt, options?.model);
-			if (ytResult) return ytResult;
-			if (signal?.aborted) return abortedResult(url);
+			if (ytResult) return finalizeResult(ytResult, options, "youtube", fallbackPath);
+			if (signal?.aborted) return abortedResult(url, fallbackPath);
 		} catch (err) {
 			const message = errorMessage(err);
-			if (isAbortError(err)) return abortedResult(url);
+			if (isAbortError(err)) return abortedResult(url, fallbackPath);
 			if (isConfigParseError(err)) {
-				return { url, title: "", content: "", error: message };
+				return finalizeResult({ url, title: "", content: "", error: message }, options, "youtube", fallbackPath);
 			}
 		}
-		return {
+		return finalizeResult({
 			url,
 			title: "",
 			content: "",
 			error: "Could not extract YouTube video content. Sign into Google in Chrome for automatic access, or set GEMINI_API_KEY.",
-		};
+		}, options, "youtube", fallbackPath);
 	}
 
-	if (signal?.aborted) return abortedResult(url);
+	if (signal?.aborted) return abortedResult(url, fallbackPath);
 
+	fallbackPath.push("http");
 	const httpResult = await extractViaHttp(url, signal, options);
 
-	if (signal?.aborted) return abortedResult(url);
-	if (!httpResult.error) return httpResult;
-	if (NON_RECOVERABLE_ERRORS.some(prefix => httpResult.error!.startsWith(prefix))) return httpResult;
+	if (signal?.aborted) return abortedResult(url, fallbackPath);
+	if (!httpResult.error) return finalizeResult(httpResult, options, httpResult.method ?? "http", fallbackPath);
+	if (NON_RECOVERABLE_ERRORS.some(prefix => httpResult.error!.startsWith(prefix))) return finalizeResult(httpResult, options, httpResult.method ?? "http", fallbackPath);
+	if (httpResult.httpStatus && httpResult.httpStatus >= 400 && httpResult.httpStatus < 500 && httpResult.httpStatus !== 403 && httpResult.httpStatus !== 429) {
+		return finalizeResult(httpResult, options, httpResult.method ?? "http", fallbackPath);
+	}
 
+	fallbackPath.push("jina");
 	const jinaResult = await extractWithJinaReader(url, signal);
-	if (jinaResult) return jinaResult;
-	if (signal?.aborted) return abortedResult(url);
+	if (jinaResult) return finalizeResult(jinaResult, options, "jina", fallbackPath);
+	if (signal?.aborted) return abortedResult(url, fallbackPath);
 
 	let geminiResult: ExtractedContent | null = null;
 	try {
-		geminiResult = await extractWithUrlContext(url, signal)
-			?? await extractWithGeminiWeb(url, signal);
+		fallbackPath.push("gemini-url-context");
+		geminiResult = await extractWithUrlContext(url, signal, options);
+		if (!geminiResult) {
+			fallbackPath.push("gemini-web");
+			geminiResult = await extractWithGeminiWeb(url, signal, options);
+		}
 	} catch (err) {
-		if (isAbortError(err)) return abortedResult(url);
+		if (isAbortError(err)) return abortedResult(url, fallbackPath);
 		if (isConfigParseError(err)) {
-			return { ...httpResult, error: errorMessage(err) };
+			return finalizeResult({ ...httpResult, error: errorMessage(err) }, options, httpResult.method ?? "http", fallbackPath);
 		}
 	}
 
-	if (geminiResult) return geminiResult;
-	if (signal?.aborted) return abortedResult(url);
+	if (geminiResult) return finalizeResult(geminiResult, options, geminiResult.method ?? "gemini", fallbackPath);
+	if (signal?.aborted) return abortedResult(url, fallbackPath);
 
 	const guidance = [
 		httpResult.error,
@@ -442,7 +589,7 @@ export async function extractContent(
 		"  \u2022 Sign into gemini.google.com in Chrome",
 		"  \u2022 Use web_search to find content about this topic",
 	].join("\n");
-	return { ...httpResult, error: guidance };
+	return finalizeResult({ ...httpResult, error: guidance }, options, httpResult.method ?? "http", fallbackPath);
 }
 
 function isLikelyJSRendered(html: string): boolean {
@@ -497,6 +644,20 @@ async function extractViaHttp(
 			},
 		});
 
+		const fetchedAt = new Date().toISOString();
+		const fetchedUrl = response.url || url;
+		const contentType = response.headers.get("content-type") || "";
+		const contentLengthHeader = response.headers.get("content-length");
+		const contentLength = contentLengthHeader ? parseInt(contentLengthHeader, 10) : undefined;
+		const httpMeta: Partial<ExtractedContent> = {
+			method: "http",
+			fetchedAt,
+			fetchedUrl,
+			contentType: contentType || undefined,
+			httpStatus: response.status,
+			contentLength: contentLength !== undefined && Number.isFinite(contentLength) ? contentLength : undefined,
+		};
+
 		if (!response.ok) {
 			activityMonitor.logComplete(activityId, response.status);
 			return {
@@ -504,11 +665,9 @@ async function extractViaHttp(
 				title: "",
 				content: "",
 				error: `HTTP ${response.status}: ${response.statusText}`,
+				...httpMeta,
 			};
 		}
-
-		const contentLengthHeader = response.headers.get("content-length");
-		const contentType = response.headers.get("content-type") || "";
 		const isPDFContent = isPDF(url, contentType);
 		const maxResponseSize = isPDFContent ? 20 * 1024 * 1024 : 5 * 1024 * 1024;
 		if (contentLengthHeader) {
@@ -520,6 +679,8 @@ async function extractViaHttp(
 					title: "",
 					content: "",
 					error: `Response too large (${Math.round(contentLength / 1024 / 1024)}MB)`,
+					...httpMeta,
+					method: "http-size-limit",
 				};
 			}
 		}
@@ -534,11 +695,13 @@ async function extractViaHttp(
 					title: result.title,
 					content: `PDF extracted and saved to: ${result.outputPath}\n\nPages: ${result.pages}\nCharacters: ${result.chars}`,
 					error: null,
+					...httpMeta,
+					method: "pdf",
 				};
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
 				activityMonitor.logError(activityId, message);
-				return { url, title: "", content: "", error: `PDF extraction failed: ${message}` };
+				return { url, title: "", content: "", error: `PDF extraction failed: ${message}`, ...httpMeta, method: "pdf" };
 			}
 		}
 
@@ -553,6 +716,8 @@ async function extractViaHttp(
 				title: "",
 				content: "",
 				error: `Unsupported content type: ${contentType.split(";")[0]}`,
+				...httpMeta,
+				method: "unsupported-content",
 			};
 		}
 
@@ -562,7 +727,7 @@ async function extractViaHttp(
 		if (!isHTML) {
 			activityMonitor.logComplete(activityId, response.status);
 			const title = extractTextTitle(text, url);
-			return { url, title, content: text, error: null };
+			return { url, title, content: text, error: null, ...httpMeta, method: "text" };
 		}
 
 		const { document } = parseHTML(text);
@@ -573,7 +738,7 @@ async function extractViaHttp(
 			const rscResult = extractRSCContent(text);
 			if (rscResult) {
 				activityMonitor.logComplete(activityId, response.status);
-				return { url, title: rscResult.title, content: rscResult.content, error: null };
+				return { url, title: rscResult.title, content: rscResult.content, error: null, ...httpMeta, method: "rsc" };
 			}
 
 			activityMonitor.logComplete(activityId, response.status);
@@ -589,6 +754,8 @@ async function extractViaHttp(
 				title: "",
 				content: "",
 				error: errorMsg,
+				...httpMeta,
+				method: jsRendered ? "js-rendered" : "readability-failed",
 			};
 		}
 
@@ -596,17 +763,20 @@ async function extractViaHttp(
 		activityMonitor.logComplete(activityId, response.status);
 
 		if (markdown.length < MIN_USEFUL_CONTENT) {
+			const incompleteJsRendered = isLikelyJSRendered(text);
 			return {
 				url,
 				title: article.title || "",
 				content: markdown,
-				error: isLikelyJSRendered(text)
+				error: incompleteJsRendered
 					? "Page appears to be JavaScript-rendered (content loads dynamically)"
 					: "Extracted content appears incomplete",
+				...httpMeta,
+				method: incompleteJsRendered ? "js-rendered" : "readability-incomplete",
 			};
 		}
 
-		return { url, title: article.title || "", content: markdown, error: null };
+		return { url, title: article.title || "", content: markdown, error: null, ...httpMeta, method: "readability" };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		if (message.toLowerCase().includes("abort")) {
@@ -614,7 +784,7 @@ async function extractViaHttp(
 		} else {
 			activityMonitor.logError(activityId, message);
 		}
-		return { url, title: "", content: "", error: message };
+		return { url, title: "", content: "", error: message, method: "http", fetchedAt: new Date().toISOString() };
 	} finally {
 		clearTimeout(timeoutId);
 		signal?.removeEventListener("abort", onAbort);

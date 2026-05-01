@@ -83,7 +83,7 @@ web_search({ query: "latest news", numResults: 10, recencyFilter: "week" })
 web_search({ query: "...", domainFilter: ["github.com"] })
 web_search({ query: "...", provider: "exa" })
 web_search({ query: "...", includeContent: true })
-web_search({ queries: ["query 1", "query 2"], workflow: "none" })
+web_search({ queries: ["query 1", "query 2"], workflow: "none", returnMetadata: true })
 web_search({ queries: ["query 1", "query 2"], workflow: "summary-review" })
 ```
 
@@ -96,6 +96,7 @@ web_search({ queries: ["query 1", "query 2"], workflow: "summary-review" })
 | `provider` | `auto` (default), `exa`, `perplexity`, or `gemini` |
 | `includeContent` | Fetch full page content from sources in background |
 | `workflow` | `none` (skip curator) or `summary-review` (auto-generate summary draft after search completion, default) |
+| `returnMetadata` | Include provider/debug metadata (citations, Exa source data, Gemini grounding/search queries) in `details` and stored search results |
 
 ### code_search
 
@@ -117,6 +118,7 @@ Fetch URL(s) and extract readable content as markdown. Automatically detects and
 
 ```typescript
 fetch_content({ url: "https://example.com/article" })
+fetch_content({ url: "https://example.com/article", mode: "highlights", objective: "ownership and usage rights", maxChars: 1200, returnMetadata: true })
 fetch_content({ urls: ["url1", "url2", "url3"] })
 fetch_content({ url: "https://github.com/owner/repo" })
 fetch_content({ url: "https://youtube.com/watch?v=abc", prompt: "What libraries are shown?" })
@@ -131,6 +133,12 @@ fetch_content({ url: "https://youtube.com/watch?v=abc", timestamp: "23:41-25:00"
 | `timestamp` | Extract frame(s) — single (`"23:41"`), range (`"23:41-25:00"`), or seconds (`"85"`) |
 | `frames` | Number of frames to extract (max 12) |
 | `forceClone` | Clone GitHub repos that exceed the 350MB size threshold |
+| `objective` | Focus objective used to rank `highlights`/`summary` excerpts and guide Gemini URL Context prompts |
+| `queries` | Related search queries used as relevance terms for focused extraction |
+| `mode` | `full` (default), `highlights`, or `summary` content shaping |
+| `maxChars` | Maximum characters to return/store after content shaping; sets `truncated`/`originalContentLength` metadata |
+| `timeoutMs` | Per-request timeout in milliseconds for HTTP/Gemini fetch paths |
+| `returnMetadata` | Include extraction metadata in `details.perUrl` (method, `fallbackPath`, HTTP status/type, fetched URL/time, retrieval status) |
 
 ### get_search_content
 
@@ -141,6 +149,18 @@ get_search_content({ responseId: "abc123", urlIndex: 0 })
 get_search_content({ responseId: "abc123", url: "https://..." })
 get_search_content({ responseId: "abc123", query: "original query" })
 ```
+
+## Recommended agent workflow
+
+1. Search with `queries` containing 2–4 varied angles; prefer official docs or `domainFilter` when source quality matters.
+2. Fetch only the most relevant sources from search results. Use `mode: "highlights"` plus an `objective` for token-efficient fact gathering, and `mode: "full"` when auditing exact wording.
+3. Inspect `details.perUrl` before citing fetched content. It reports success/error, extraction `method`, `fallbackPath`, HTTP status/type, fetched URL/time, and truncation fields.
+4. Use `returnMetadata: true` when debugging provider behavior or source quality; leave it off for normal concise output.
+5. Retrieve stored full results with `get_search_content({ responseId, urlIndex })` when inline output is truncated.
+
+## Current limits
+
+Extraction is intentionally lossy for many web pages: Readability removes navigation/ads and may omit app-rendered content. This tool does not bypass paywalls or access controls. JavaScript-heavy sites, PDFs, YouTube, and local video depend on the available fallbacks and optional binaries/API keys. Raw HTML output, robots.txt enforcement, and cache-only/max-age policies are not implemented in this pass; HTTP/Jina/Gemini fetches are live requests.
 
 ## Capabilities
 
