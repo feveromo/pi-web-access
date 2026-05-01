@@ -227,7 +227,20 @@ async function searchWithGeminiApi(query: string, options: SearchOptions = {}): 
 		const results = await resolveGroundingChunks(metadata?.groundingChunks, options.signal);
 
 		if (!answer && results.length === 0) return null;
-		return { answer, results };
+		return {
+			answer,
+			results,
+			...(options.returnMetadata ? {
+				metadata: {
+					providerApi: "gemini-api",
+					model,
+					fetchedAt: new Date().toISOString(),
+					webSearchQueries: metadata?.webSearchQueries,
+					groundingChunks: metadata?.groundingChunks,
+					groundingSupports: metadata?.groundingSupports,
+				},
+			} : {}),
+		};
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		if (message.toLowerCase().includes("abort")) {
@@ -256,7 +269,18 @@ async function searchWithGeminiWeb(query: string, options: SearchOptions = {}): 
 		activityMonitor.logComplete(activityId, 200);
 
 		const results = extractSourceUrls(text);
-		return { answer: text, results };
+		return {
+			answer: text,
+			results,
+			...(options.returnMetadata ? {
+				metadata: {
+					providerApi: "gemini-web",
+					model: "gemini-3-flash-preview",
+					fetchedAt: new Date().toISOString(),
+					sourceUrls: results.map(r => r.url),
+				},
+			} : {}),
+		};
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		if (message.toLowerCase().includes("abort")) {

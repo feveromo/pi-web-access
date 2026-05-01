@@ -394,6 +394,17 @@ async function searchWithExaMcp(query: string, options: ExaSearchOptions = {}): 
 				url: result.url,
 				snippet: "",
 			})),
+			...(options.returnMetadata ? {
+				metadata: {
+					providerApi: "exa-mcp",
+					fetchedAt: new Date().toISOString(),
+					directApi: false,
+					recencyFilter: options.recencyFilter,
+					domainFilter: options.domainFilter,
+					enrichedQuery,
+					sources: parsedResults.map(r => ({ title: r.title, url: r.url })),
+				},
+			} : {}),
 		};
 
 		if (options.includeContent) {
@@ -466,6 +477,16 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 			return {
 				answer: data.answer || "",
 				results: mapResults(data.citations),
+				...(options.returnMetadata ? {
+					metadata: {
+						providerApi: "exa-answer",
+						fetchedAt: new Date().toISOString(),
+						directApi: true,
+						recencyFilter: options.recencyFilter,
+						domainFilter: options.domainFilter,
+						sources: data.citations?.map(c => ({ url: c.url, title: c.title, publishedDate: c.publishedDate, textLength: c.text?.length })) ?? [],
+					},
+				} : {}),
 			};
 		}
 
@@ -502,6 +523,22 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 		const mapped: SearchResponse = {
 			answer: buildAnswerFromSearchResults(data.results),
 			results: mapResults(data.results),
+			...(options.returnMetadata ? {
+				metadata: {
+					providerApi: "exa-search",
+					fetchedAt: new Date().toISOString(),
+					directApi: true,
+					recencyFilter: options.recencyFilter,
+					domainFilter: options.domainFilter,
+					sources: data.results?.map(r => ({
+						url: r.url,
+						title: r.title,
+						publishedDate: r.publishedDate,
+						highlights: normalizeHighlights(r.highlights),
+						highlightScores: r.highlightScores,
+					})) ?? [],
+				},
+			} : {}),
 		};
 		if (options.includeContent) {
 			const inlineContent = mapInlineContent(data.results);

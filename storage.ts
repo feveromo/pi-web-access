@@ -10,6 +10,7 @@ export interface QueryResultData {
 	results: SearchResult[];
 	error: string | null;
 	provider?: string;
+	metadata?: Record<string, unknown>;
 }
 
 export interface StoredSearchData {

@@ -24,6 +24,7 @@ export interface SearchResponse {
 	answer: string;
 	results: SearchResult[];
 	inlineContent?: ExtractedContent[];
+	metadata?: Record<string, unknown>;
 }
 
 export interface SearchOptions {
@@ -31,6 +32,7 @@ export interface SearchOptions {
 	recencyFilter?: "day" | "week" | "month" | "year";
 	domainFilter?: string[];
 	signal?: AbortSignal;
+	returnMetadata?: boolean;
 }
 
 interface WebSearchConfig {
@@ -191,5 +193,16 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 	}
 
 	activityMonitor.logComplete(activityId, response.status);
-	return { answer, results };
+	return {
+		answer,
+		results,
+		...(options.returnMetadata ? {
+			metadata: {
+				providerApi: "perplexity",
+				fetchedAt: new Date().toISOString(),
+				citationCount: citations.length,
+				citations,
+			},
+		} : {}),
+	};
 }

@@ -1,13 +1,27 @@
 import { activityMonitor } from "./activity.js";
 import { getApiKey, API_BASE, DEFAULT_MODEL } from "./gemini-api.js";
 import { isGeminiWebAvailable, queryWithCookies } from "./gemini-web.js";
-import { extractHeadingTitle, type ExtractedContent } from "./extract.js";
+import { extractHeadingTitle, type ExtractedContent, type ExtractOptions, type ExtractMode } from "./extract.js";
 
-const EXTRACTION_PROMPT = `Extract the complete readable content from this URL as clean markdown.
-Include the page title, all text content, code blocks, and tables.
-Do not summarize — extract the full content.
+function normalizeMode(mode: ExtractOptions["mode"]): ExtractMode {
+	return mode === "highlights" || mode === "summary" ? mode : "full";
+}
 
-URL: `;
+function buildExtractionPrompt(url: string, options?: ExtractOptions): string {
+	const mode = normalizeMode(options?.mode);
+	let prompt = "Extract readable content from this URL as clean markdown. Include the page title, important text, code blocks, and tables when present.";
+	if (mode === "full") {
+		prompt += " Do not summarize; preserve as much source content as possible.";
+	} else if (mode === "highlights") {
+		prompt += " Return only concise excerpts most relevant to the objective/search queries; preserve source wording where possible.";
+	} else {
+		prompt += " Return a concise structured summary with headings and the first most relevant paragraphs.";
+	}
+	if (options?.objective) prompt += `\nObjective: ${options.objective}`;
+	if (options?.queries?.length) prompt += `\nRelated queries: ${options.queries.join(" | ")}`;
+	prompt += `\n\nURL: ${url}`;
+	return prompt;
+}
 
 function shouldRethrow(err: unknown): boolean {
 	const message = err instanceof Error ? err.message : String(err);
@@ -17,6 +31,7 @@ function shouldRethrow(err: unknown): boolean {
 export async function extractWithUrlContext(
 	url: string,
 	signal?: AbortSignal,
+	options?: ExtractOptions,
 ): Promise<ExtractedContent | null> {
 	const apiKey = getApiKey();
 	if (!apiKey) return null;
@@ -26,7 +41,7 @@ export async function extractWithUrlContext(
 	try {
 		const model = DEFAULT_MODEL;
 		const body = {
-			contents: [{ parts: [{ text: EXTRACTION_PROMPT + url }] }],
+			contents: [{ parts: [{ text: buildExtractionPrompt(url, options) }] }],
 			tools: [{ url_context: {} }],
 		};
 
@@ -35,7 +50,7 @@ export async function extractWithUrlContext(
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
 			signal: AbortSignal.any([
-				AbortSignal.timeout(60000),
+				AbortSignal.timeout(options?.timeoutMs ?? 60000),
 				...(signal ? [signal] : []),
 			]),
 		});
@@ -49,11 +64,10 @@ export async function extractWithUrlContext(
 		activityMonitor.logComplete(activityId, res.status);
 
 		const metadata = data.candidates?.[0]?.url_context_metadata;
-		if (metadata?.url_metadata?.length) {
-			const status = metadata.url_metadata[0].url_retrieval_status;
-			if (status === "URL_RETRIEVAL_STATUS_UNSAFE" || status === "URL_RETRIEVAL_STATUS_ERROR") {
-				return null;
-			}
+		const urlMetadata = metadata?.url_metadata?.[0];
+		const retrievalStatus = urlMetadata?.url_retrieval_status;
+		if (retrievalStatus === "URL_RETRIEVAL_STATUS_UNSAFE" || retrievalStatus === "URL_RETRIEVAL_STATUS_ERROR") {
+			return null;
 		}
 
 		const content = data.candidates?.[0]?.content?.parts
@@ -62,7 +76,21 @@ export async function extractWithUrlContext(
 		if (!content || content.length < 50) return null;
 
 		const title = extractTitleFromContent(content, url);
-		return { url, title, content, error: null };
+		return {
+			url,
+			title,
+			content,
+			error: null,
+			method: "gemini-url-context",
+			fetchedAt: new Date().toISOString(),
+			fetchedUrl: urlMetadata?.retrieved_url || url,
+			retrievalStatus,
+			metadata: {
+				providerApi: "gemini-url-context",
+				model,
+				urlContextMetadata: metadata,
+			},
+		};
 	} catch (err) {
 		if (shouldRethrow(err)) throw err;
 		const message = err instanceof Error ? err.message : String(err);
@@ -78,6 +106,7 @@ export async function extractWithUrlContext(
 export async function extractWithGeminiWeb(
 	url: string,
 	signal?: AbortSignal,
+	options?: ExtractOptions,
 ): Promise<ExtractedContent | null> {
 	const cookies = await isGeminiWebAvailable();
 	if (!cookies) return null;
@@ -85,10 +114,11 @@ export async function extractWithGeminiWeb(
 	const activityId = activityMonitor.logStart({ type: "api", query: `gemini_web: ${url}` });
 
 	try {
-		const text = await queryWithCookies(EXTRACTION_PROMPT + url, cookies, {
-			model: "gemini-3-flash-preview",
+		const model = options?.model ?? "gemini-3-flash-preview";
+		const text = await queryWithCookies(buildExtractionPrompt(url, options), cookies, {
+			model,
 			signal,
-			timeoutMs: 60000,
+			timeoutMs: options?.timeoutMs ?? 60000,
 		});
 
 		activityMonitor.logComplete(activityId, 200);
@@ -96,7 +126,15 @@ export async function extractWithGeminiWeb(
 		if (!text || text.length < 50) return null;
 
 		const title = extractTitleFromContent(text, url);
-		return { url, title, content: text, error: null };
+		return {
+			url,
+			title,
+			content: text,
+			error: null,
+			method: "gemini-web",
+			fetchedAt: new Date().toISOString(),
+			metadata: { providerApi: "gemini-web", model },
+		};
 	} catch (err) {
 		if (shouldRethrow(err)) throw err;
 		const message = err instanceof Error ? err.message : String(err);
