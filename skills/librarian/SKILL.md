@@ -24,6 +24,7 @@ Before doing anything, classify the request to pick the right research strategy.
 | Type | Trigger | Primary Approach |
 |------|---------|-----------------|
 | **Conceptual** | "How do I use X?", "Best practice for Y?" | web_search + fetch_content (README/docs) |
+| **Scholarly** | papers, research literature, citations, methods comparisons | paper_search + web_search for context |
 | **Implementation** | "How does X implement Y?", "Show me the source" | fetch_content (clone) + code search |
 | **Context/History** | "Why was this changed?", "History of X?" | git log + git blame + issue/PR search |
 | **Comprehensive** | Complex or ambiguous requests, "deep dive" | All of the above |
@@ -34,8 +35,9 @@ Before doing anything, classify the request to pick the right research strategy.
 
 Batch these in one turn:
 
-1. **web_search**: `"library-name topic"` via Perplexity for recent articles and discussions
+1. **web_search**: `"library-name topic"` via the configured search provider for recent articles and discussions
 2. **fetch_content**: the library's GitHub repo URL to clone and check README, docs, or examples
+3. For scientific/library research papers, use **paper_search** first to gather DOI/PDF/citation metadata.
 
 Synthesize web results + repo docs. Cite official documentation and link to relevant source files.
 
@@ -136,43 +138,6 @@ function isStale(query: Query, staleTime: number): boolean {
 
 For conceptual answers, link to official docs and relevant source files. For implementation answers, every function/class reference should have a permalink.
 
-## Video Analysis
-
-For questions about video tutorials, conference talks, or screen recordings:
-
-```typescript
-// Full extraction (transcript + visual descriptions)
-fetch_content({ url: "https://youtube.com/watch?v=abc" })
-
-// Ask a specific question about a video
-fetch_content({ url: "https://youtube.com/watch?v=abc", prompt: "What libraries are imported in this tutorial?" })
-
-// Single frame at a known moment
-fetch_content({ url: "https://youtube.com/watch?v=abc", timestamp: "23:41" })
-
-// Range scan for visual discovery
-fetch_content({ url: "https://youtube.com/watch?v=abc", timestamp: "23:41-25:00" })
-
-// Custom density across a range
-fetch_content({ url: "https://youtube.com/watch?v=abc", timestamp: "23:41-25:00", frames: 3 })
-
-// Whole-video sampling
-fetch_content({ url: "https://youtube.com/watch?v=abc", frames: 6 })
-
-// Analyze a local recording
-fetch_content({ url: "/path/to/demo.mp4", prompt: "What error message appears on screen?" })
-
-// Batch multiple videos with the same question
-fetch_content({
-  urls: ["https://youtube.com/watch?v=abc", "https://youtube.com/watch?v=def"],
-  prompt: "What packages are installed?"
-})
-```
-
-Use single timestamps for known moments, ranges for visual scanning, and frames-alone for a quick overview of the whole video.
-
-The `prompt` parameter only applies to video content (YouTube URLs and local video files). For non-video URLs, it's ignored.
-
 ## Failure Recovery
 
 | Failure | Recovery |
@@ -182,9 +147,8 @@ The `prompt` parameter only applies to video content (YouTube URLs and local vid
 | Repo too large to clone | fetch_content returns an API-only view automatically; use that or add `forceClone: true` |
 | File not found in clone | Branch name with slashes may have misresolved; list the repo tree and navigate manually |
 | Uncertain about implementation | State your uncertainty explicitly, propose a hypothesis, show what evidence you did find |
-| Video extraction fails | Ensure Chrome is signed into gemini.google.com (free) or set GEMINI_API_KEY |
-| Page returns 403/bot block | Gemini fallback triggers automatically; no action needed if Gemini is configured |
-| web_search fails | Check provider config; try explicit `provider: "gemini"` if Perplexity key is missing |
+| Page returns 403/bot block | Try `web_search` for alternate sources or fetch a raw/official URL |
+| web_search fails | Check Exa config; try explicit `provider: "exa"` |
 
 ## Guidelines
 
