@@ -45,13 +45,24 @@ function clampMaxResults(value: unknown): number {
 	return Math.min(25, Math.max(1, Math.floor(value)));
 }
 
+const REQUEST_TIMEOUT_MS = 20000;
+
 function requestSignal(signal?: AbortSignal): AbortSignal {
-	const timeout = AbortSignal.timeout(20000);
+	const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
 	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
 function isAbortError(err: unknown): boolean {
 	return (err instanceof Error ? err.message : String(err)).toLowerCase().includes("abort");
+}
+
+function shouldRethrowAbort(err: unknown, signal?: AbortSignal): boolean {
+	return isAbortError(err) && signal?.aborted === true;
+}
+
+function formatSearchError(err: unknown): string {
+	if (err instanceof Error && err.name === "TimeoutError") return `Timed out after ${REQUEST_TIMEOUT_MS / 1000}s`;
+	return err instanceof Error ? err.message : String(err);
 }
 
 function reconstructAbstract(index: Record<string, number[]> | undefined): string | undefined {
@@ -212,16 +223,16 @@ export async function executePaperSearch(params: PaperSearchParams, signal?: Abo
 			try {
 				records = await searchOpenAlex(normalized, signal);
 			} catch (err) {
-				if (isAbortError(err)) throw err;
-				errors.push(err instanceof Error ? err.message : String(err));
+				if (shouldRethrowAbort(err, signal)) throw err;
+				errors.push(formatSearchError(err));
 			}
 		}
 		if (source === "arxiv" || (source === "auto" && records.length === 0 && !normalized.openAccessOnly)) {
 			try {
 				records = await searchArxiv(normalized, signal);
 			} catch (err) {
-				if (isAbortError(err)) throw err;
-				errors.push(err instanceof Error ? err.message : String(err));
+				if (shouldRethrowAbort(err, signal)) throw err;
+				errors.push(formatSearchError(err));
 			}
 		}
 		if (records.length === 0 && errors.length > 0) {
@@ -232,8 +243,8 @@ export async function executePaperSearch(params: PaperSearchParams, signal?: Abo
 			details: { query, source, count: records.length, papers: records, errors },
 		};
 	} catch (err) {
-		if (isAbortError(err)) throw err;
-		const message = err instanceof Error ? err.message : String(err);
+		if (shouldRethrowAbort(err, signal)) throw err;
+		const message = formatSearchError(err);
 		return { content: [{ type: "text", text: `Paper search failed: ${message}` }], details: { query, source, error: message } };
 	}
 }
