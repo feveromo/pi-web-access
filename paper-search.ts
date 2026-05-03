@@ -1,0 +1,239 @@
+export type PaperSearchSource = "auto" | "openalex" | "arxiv";
+
+export interface PaperSearchParams {
+	query: string;
+	source?: PaperSearchSource;
+	maxResults?: number;
+	yearFrom?: number;
+	openAccessOnly?: boolean;
+	includeAbstracts?: boolean;
+}
+
+interface PaperRecord {
+	title: string;
+	authors: string[];
+	year?: number;
+	venue?: string;
+	doi?: string;
+	url?: string;
+	pdfUrl?: string;
+	citationCount?: number;
+	openAccess?: boolean;
+	source: "openalex" | "arxiv";
+	abstract?: string;
+}
+
+interface OpenAlexWork {
+	title?: string;
+	display_name?: string;
+	publication_year?: number;
+	doi?: string;
+	id?: string;
+	cited_by_count?: number;
+	authorships?: Array<{ author?: { display_name?: string } }>;
+	primary_location?: {
+		landing_page_url?: string;
+		pdf_url?: string;
+		source?: { display_name?: string };
+	};
+	open_access?: { is_oa?: boolean; oa_url?: string };
+	abstract_inverted_index?: Record<string, number[]>;
+}
+
+function clampMaxResults(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return 8;
+	return Math.min(25, Math.max(1, Math.floor(value)));
+}
+
+function requestSignal(signal?: AbortSignal): AbortSignal {
+	const timeout = AbortSignal.timeout(20000);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function isAbortError(err: unknown): boolean {
+	return (err instanceof Error ? err.message : String(err)).toLowerCase().includes("abort");
+}
+
+function reconstructAbstract(index: Record<string, number[]> | undefined): string | undefined {
+	if (!index) return undefined;
+	const words: Array<{ word: string; pos: number }> = [];
+	for (const [word, positions] of Object.entries(index)) {
+		for (const pos of positions) {
+			if (typeof pos === "number") words.push({ word, pos });
+		}
+	}
+	if (words.length === 0) return undefined;
+	return words.sort((a, b) => a.pos - b.pos).map(item => item.word).join(" ");
+}
+
+function paperUrl(record: PaperRecord): string {
+	if (record.doi) return `https://doi.org/${record.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")}`;
+	return record.url || record.pdfUrl || "";
+}
+
+function formatAuthors(authors: string[]): string {
+	if (authors.length <= 3) return authors.join(", ");
+	return `${authors.slice(0, 3).join(", ")} et al.`;
+}
+
+function formatPaperMarkdown(records: PaperRecord[], params: PaperSearchParams): string {
+	if (records.length === 0) return `No papers found for "${params.query}".`;
+	const lines = [`## Papers for "${params.query}"`, ""];
+	for (let i = 0; i < records.length; i++) {
+		const paper = records[i];
+		const bits = [paper.year ? String(paper.year) : null, paper.venue, paper.citationCount != null ? `${paper.citationCount} citations` : null, paper.openAccess ? "open access" : null]
+			.filter(Boolean)
+			.join(" · ");
+		const url = paperUrl(paper);
+		lines.push(`${i + 1}. **${paper.title || "Untitled"}**${url ? ` — ${url}` : ""}`);
+		if (paper.authors.length) lines.push(`   - Authors: ${formatAuthors(paper.authors)}`);
+		if (bits) lines.push(`   - ${bits}`);
+		if (paper.pdfUrl) lines.push(`   - PDF: ${paper.pdfUrl}`);
+		if (params.includeAbstracts && paper.abstract) lines.push(`   - Abstract: ${paper.abstract.slice(0, 800)}${paper.abstract.length > 800 ? "…" : ""}`);
+	}
+	return lines.join("\n");
+}
+
+function openAlexFilters(params: PaperSearchParams): string | null {
+	const filters: string[] = [];
+	if (typeof params.yearFrom === "number" && Number.isFinite(params.yearFrom)) {
+		filters.push(`from_publication_date:${Math.floor(params.yearFrom)}-01-01`);
+	}
+	if (params.openAccessOnly) filters.push("is_oa:true");
+	return filters.length ? filters.join(",") : null;
+}
+
+async function searchOpenAlex(params: PaperSearchParams, signal?: AbortSignal): Promise<PaperRecord[]> {
+	const maxResults = clampMaxResults(params.maxResults);
+	const url = new URL("https://api.openalex.org/works");
+	url.searchParams.set("search", params.query);
+	url.searchParams.set("per-page", String(maxResults));
+	const filters = openAlexFilters(params);
+	if (filters) url.searchParams.set("filter", filters);
+
+	const res = await fetch(url, {
+		headers: { "User-Agent": "pi-web-access/0.10 (mailto:openalex@example.com)" },
+		signal: requestSignal(signal),
+	});
+	if (!res.ok) throw new Error(`OpenAlex error ${res.status}: ${(await res.text()).slice(0, 200)}`);
+	const data = await res.json() as { results?: OpenAlexWork[] };
+	return (data.results ?? []).map(work => {
+		const doi = typeof work.doi === "string" ? work.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "") : undefined;
+		const abstract = params.includeAbstracts ? reconstructAbstract(work.abstract_inverted_index) : undefined;
+		return {
+			title: work.title || work.display_name || "Untitled",
+			authors: work.authorships?.map(a => a.author?.display_name).filter((name): name is string => !!name) ?? [],
+			year: work.publication_year,
+			venue: work.primary_location?.source?.display_name,
+			doi,
+			url: work.primary_location?.landing_page_url || work.id,
+			pdfUrl: work.primary_location?.pdf_url || work.open_access?.oa_url,
+			citationCount: work.cited_by_count,
+			openAccess: work.open_access?.is_oa,
+			source: "openalex" as const,
+			...(abstract ? { abstract } : {}),
+		};
+	});
+}
+
+function decodeXml(value: string): string {
+	return value
+		.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+		.replace(/&amp;/g, "&")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+function tagText(block: string, tag: string): string | undefined {
+	const match = block.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i"));
+	return match ? decodeXml(match[1]) : undefined;
+}
+
+function tagTexts(block: string, tag: string): string[] {
+	const regex = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "gi");
+	return Array.from(block.matchAll(regex)).map(match => decodeXml(match[1])).filter(Boolean);
+}
+
+async function searchArxiv(params: PaperSearchParams, signal?: AbortSignal): Promise<PaperRecord[]> {
+	const maxResults = clampMaxResults(params.maxResults);
+	const url = new URL("https://export.arxiv.org/api/query");
+	url.searchParams.set("search_query", `all:${params.query}`);
+	url.searchParams.set("start", "0");
+	url.searchParams.set("max_results", String(maxResults));
+	url.searchParams.set("sortBy", "relevance");
+	url.searchParams.set("sortOrder", "descending");
+
+	const res = await fetch(url, { signal: requestSignal(signal) });
+	if (!res.ok) throw new Error(`arXiv error ${res.status}: ${(await res.text()).slice(0, 200)}`);
+	const xml = await res.text();
+	const entries = Array.from(xml.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)).map(match => match[1]);
+	const records: PaperRecord[] = [];
+	for (const entry of entries) {
+		const published = tagText(entry, "published");
+		const year = published ? Number.parseInt(published.slice(0, 4), 10) : undefined;
+		if (params.yearFrom && year && year < params.yearFrom) continue;
+		const id = tagText(entry, "id");
+		const pdfMatch = entry.match(/<link[^>]+title=["']pdf["'][^>]+href=["']([^"']+)["']/i)
+			|| entry.match(/<link[^>]+href=["']([^"']+\.pdf)["']/i);
+		records.push({
+			title: tagText(entry, "title") || "Untitled",
+			authors: tagTexts(entry, "name"),
+			year: Number.isFinite(year) ? year : undefined,
+			venue: "arXiv",
+			url: id,
+			pdfUrl: pdfMatch ? decodeXml(pdfMatch[1]) : undefined,
+			openAccess: true,
+			source: "arxiv",
+			...(params.includeAbstracts ? { abstract: tagText(entry, "summary") } : {}),
+		});
+	}
+	return records;
+}
+
+export async function executePaperSearch(params: PaperSearchParams, signal?: AbortSignal): Promise<{
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, unknown>;
+}> {
+	const query = typeof params.query === "string" ? params.query.trim() : "";
+	if (!query) {
+		return { content: [{ type: "text", text: "Error: No paper search query provided." }], details: { error: "No query provided" } };
+	}
+	const source: PaperSearchSource = params.source === "openalex" || params.source === "arxiv" ? params.source : "auto";
+	const normalized: PaperSearchParams = { ...params, query, source, maxResults: clampMaxResults(params.maxResults) };
+
+	try {
+		let records: PaperRecord[] = [];
+		const errors: string[] = [];
+		if (source === "openalex" || source === "auto") {
+			try {
+				records = await searchOpenAlex(normalized, signal);
+			} catch (err) {
+				if (isAbortError(err)) throw err;
+				errors.push(err instanceof Error ? err.message : String(err));
+			}
+		}
+		if (source === "arxiv" || (source === "auto" && records.length === 0 && !normalized.openAccessOnly)) {
+			try {
+				records = await searchArxiv(normalized, signal);
+			} catch (err) {
+				if (isAbortError(err)) throw err;
+				errors.push(err instanceof Error ? err.message : String(err));
+			}
+		}
+		if (records.length === 0 && errors.length > 0) {
+			return { content: [{ type: "text", text: `Paper search failed:\n- ${errors.join("\n- ")}` }], details: { query, source, errors } };
+		}
+		return {
+			content: [{ type: "text", text: formatPaperMarkdown(records, normalized) }],
+			details: { query, source, count: records.length, papers: records, errors },
+		};
+	} catch (err) {
+		if (isAbortError(err)) throw err;
+		const message = err instanceof Error ? err.message : String(err);
+		return { content: [{ type: "text", text: `Paper search failed: ${message}` }], details: { query, source, error: message } };
+	}
+}

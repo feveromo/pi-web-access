@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Added `paper_search` for structured scholarly search via OpenAlex with arXiv support/fallback.
+- Added Exa research controls on `web_search`: `researchDepth`, `searchType`, `contentMode`, `maxCharacters`, `livecrawl`, and `synthesize`.
+
+### Changed
+- Removed Perplexity and Gemini search/fetch/media paths; web search now routes through Exa only (direct API when keyed, Exa MCP otherwise).
+- Made Exa direct API use `/search` by default for fast source-passage retrieval; Exa `/answer` is now opt-in with `synthesize: true`.
+- Removed video/YouTube frame extraction and media analysis to keep the extension lean, fast, and focused on research/content extraction.
+- Removed the curator UI, summary-review workflow, `/websearch`, and `/curator`; `web_search` now returns results directly after all requested search/content work finishes.
+- `fetch_content` now stays on deterministic extraction paths: GitHub, HTTP/Readability/RSC, PDF/text, and Jina fallback.
+
 ## [0.10.6] - 2026-04-04
 
 ### Changed

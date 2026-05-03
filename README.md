@@ -4,7 +4,7 @@
 
 # Pi Web Access
 
-**Web search, content extraction, and video understanding for Pi agent. Zero config with a supported Chromium-based browser, or bring your own API keys.**
+**Lean Exa-powered web research, content extraction, GitHub/PDF fetching, and scholarly search for Pi agent. Zero config with Exa MCP, or bring your own Exa API key.**
 
 [![npm version](https://img.shields.io/npm/v/pi-web-access?style=for-the-badge)](https://www.npmjs.com/package/pi-web-access)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
@@ -14,11 +14,9 @@ https://github.com/user-attachments/assets/cac6a17a-1eeb-4dde-9818-cdf85d8ea98f
 
 ## Why Pi Web Access
 
-**Zero Config** — Works out of the box with Exa MCP (no API key needed). Or sign into Google in Chrome, Arc, Helium, or Chromium for Gemini Web. Add API keys for Exa, Perplexity, or Gemini API for more control.
+**Zero Config** — Works out of the box with Exa MCP (no API key needed). Add an Exa API key only when you want direct API access.
 
-**Video Understanding** — Point it at a YouTube video or local screen recording and ask questions about what's on screen. Full transcripts, visual descriptions, and frame extraction at exact timestamps.
-
-**Smart Fallbacks** — Every capability has a fallback chain. Search tries Exa, then Perplexity, then Gemini API, then Gemini Web. YouTube tries Gemini Web, then API, then Perplexity. Blocked pages retry through Jina Reader and Gemini extraction. Something always works.
+**Lean Research Core** — Exa search returns useful source snippets fast. URL fetching uses deterministic extraction paths only: GitHub clone, PDF/text parsing, Readability/RSC, then Jina Reader fallback.
 
 **GitHub Cloning** — GitHub URLs are cloned locally instead of scraped. The agent gets real file contents and a local path to explore, not rendered HTML.
 
@@ -28,26 +26,15 @@ https://github.com/user-attachments/assets/cac6a17a-1eeb-4dde-9818-cdf85d8ea98f
 pi install npm:pi-web-access
 ```
 
-Works immediately with no API keys — Exa MCP provides zero-config search. For more providers or direct API access, add keys to `~/.pi/web-search.json`:
+Works immediately with no API keys — Exa MCP provides zero-config search. For direct API access, add an Exa key to `~/.pi/web-search.json`:
 
 ```json
 {
-  "exaApiKey": "exa-...",
-  "perplexityApiKey": "pplx-...",
-  "geminiApiKey": "AIza..."
+  "exaApiKey": "exa-..."
 }
 ```
 
-In `auto` mode (default), `web_search` tries Exa first (direct API if keyed, MCP if not), then Perplexity, then Gemini API, then Gemini Web.
-
-Optional dependencies for video frame extraction:
-
-```bash
-brew install ffmpeg   # frame extraction, video thumbnails, local video duration
-brew install yt-dlp   # YouTube stream URLs for frame extraction
-```
-
-Without these, video content analysis (transcripts, visual descriptions via Gemini) still works. The binaries are only needed for extracting individual frames as images.
+In `auto` mode (default), `web_search` uses Exa direct API when keyed, otherwise the zero-config Exa MCP path.
 
 Requires Pi v0.37.3+.
 
@@ -63,18 +50,15 @@ fetch_content({ url: "https://docs.example.com/guide" })
 // Clone a GitHub repo
 fetch_content({ url: "https://github.com/owner/repo" })
 
-// Understand a YouTube video
-fetch_content({ url: "https://youtube.com/watch?v=abc", prompt: "What libraries are shown?" })
-
-// Analyze a screen recording
-fetch_content({ url: "/path/to/recording.mp4", prompt: "What error appears on screen?" })
+// Search scholarly papers
+paper_search({ query: "retrieval augmented generation evaluation", includeAbstracts: true })
 ```
 
 ## Tools
 
 ### web_search
 
-Search the web via Exa, Perplexity AI, or Gemini. Returns a synthesized answer with source citations.
+Search the web via Exa. Defaults to fast Exa source-passages with citations; set `synthesize: true` for Exa answer synthesis.
 
 ```typescript
 web_search({ query: "rust async programming" })
@@ -82,9 +66,10 @@ web_search({ queries: ["query 1", "query 2"] })
 web_search({ query: "latest news", numResults: 10, recencyFilter: "week" })
 web_search({ query: "...", domainFilter: ["github.com"] })
 web_search({ query: "...", provider: "exa" })
-web_search({ query: "...", includeContent: true })
-web_search({ queries: ["query 1", "query 2"], workflow: "none", returnMetadata: true })
-web_search({ queries: ["query 1", "query 2"], workflow: "summary-review" })
+web_search({ query: "...", researchDepth: "deep", contentMode: "highlights" })
+web_search({ query: "...", contentMode: "text", maxCharacters: 12000 })
+web_search({ query: "...", synthesize: true })
+web_search({ queries: ["query 1", "query 2"], returnMetadata: true })
 ```
 
 | Parameter | Description |
@@ -93,10 +78,17 @@ web_search({ queries: ["query 1", "query 2"], workflow: "summary-review" })
 | `numResults` | Results per query (default: 5, max: 20) |
 | `recencyFilter` | `day`, `week`, `month`, or `year` |
 | `domainFilter` | Limit to domains (prefix with `-` to exclude) |
-| `provider` | `auto` (default), `exa`, `perplexity`, or `gemini` |
-| `includeContent` | Fetch full page content from sources in background |
-| `workflow` | `none` (skip curator) or `summary-review` (auto-generate summary draft after search completion, default) |
-| `returnMetadata` | Include provider/debug metadata (citations, Exa source data, Gemini grounding/search queries) in `details` and stored search results |
+| `provider` | `auto` (default) or `exa` |
+| `includeContent` | Include bounded full text from Exa when available |
+| `researchDepth` | `quick` (default fast), `standard`, or `deep` Exa retrieval profile |
+| `searchType` | Explicit Exa type: `fast`, `auto`, `deep-lite`, `deep`, or `deep-reasoning` |
+| `contentMode` | Exa result content: `none`, `highlights` (default), `summary`, or `text` |
+| `maxCharacters` | Character cap per Exa text result when using `contentMode: "text"` |
+| `livecrawl` | Exa livecrawl mode: `never`, `fallback`, or `always` |
+| `synthesize` | Use Exa answer synthesis instead of fast source-passage search |
+| `returnMetadata` | Include provider/debug metadata (citations and Exa source data) in `details` and stored search results |
+
+`web_search` also returns lightweight `details.metrics` (result counts, unique domains, answer/snippet character counts) and, when `includeContent` is true, `details.contentFetch` coverage/timing for measuring retrieval quality without another turn.
 
 ### code_search
 
@@ -112,32 +104,46 @@ code_search({ query: "Express middleware error handling", maxTokens: 10000 })
 | `query` | Programming question, API, library, or debugging topic |
 | `maxTokens` | Maximum tokens of context to return (default: 5000, max: 50000) |
 
+### paper_search
+
+Search scholarly papers via OpenAlex, with arXiv support/fallback. No API key required.
+
+```typescript
+paper_search({ query: "transformer mechanistic interpretability", includeAbstracts: true })
+paper_search({ query: "graph neural networks molecules", yearFrom: 2022, openAccessOnly: true })
+paper_search({ query: "diffusion models", source: "arxiv", maxResults: 5 })
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `query` | Scholarly literature query |
+| `source` | `auto` (default), `openalex`, or `arxiv` |
+| `maxResults` | Maximum papers (default 8, max 25) |
+| `yearFrom` | Only include papers from this year onward |
+| `openAccessOnly` | Limit OpenAlex results to open-access papers |
+| `includeAbstracts` | Include abstracts when available |
+
 ### fetch_content
 
-Fetch URL(s) and extract readable content as markdown. Automatically detects and handles GitHub repos, YouTube videos, PDFs, local video files, and regular web pages.
+Fetch URL(s) and extract readable content as markdown. Handles regular web pages, GitHub repos, PDFs, and text/JSON/Markdown.
 
 ```typescript
 fetch_content({ url: "https://example.com/article" })
 fetch_content({ url: "https://example.com/article", mode: "highlights", objective: "ownership and usage rights", maxChars: 1200, returnMetadata: true })
 fetch_content({ urls: ["url1", "url2", "url3"] })
 fetch_content({ url: "https://github.com/owner/repo" })
-fetch_content({ url: "https://youtube.com/watch?v=abc", prompt: "What libraries are shown?" })
-fetch_content({ url: "/path/to/recording.mp4", prompt: "What error appears on screen?" })
-fetch_content({ url: "https://youtube.com/watch?v=abc", timestamp: "23:41-25:00", frames: 4 })
+fetch_content({ url: "https://example.com/blocked" })
 ```
 
 | Parameter | Description |
 |-----------|-------------|
 | `url` / `urls` | Single URL/path or multiple URLs |
-| `prompt` | Question to ask about a YouTube video or local video file |
-| `timestamp` | Extract frame(s) — single (`"23:41"`), range (`"23:41-25:00"`), or seconds (`"85"`) |
-| `frames` | Number of frames to extract (max 12) |
 | `forceClone` | Clone GitHub repos that exceed the 350MB size threshold |
-| `objective` | Focus objective used to rank `highlights`/`summary` excerpts and guide Gemini URL Context prompts |
+| `objective` | Focus objective used to rank `highlights`/`summary` excerpts |
 | `queries` | Related search queries used as relevance terms for focused extraction |
 | `mode` | `full` (default), `highlights`, or `summary` content shaping |
 | `maxChars` | Maximum characters to return/store after content shaping; sets `truncated`/`originalContentLength` metadata |
-| `timeoutMs` | Per-request timeout in milliseconds for HTTP/Gemini fetch paths |
+| `timeoutMs` | Per-request timeout in milliseconds for HTTP/Jina fetch paths |
 | `returnMetadata` | Include extraction metadata in `details.perUrl` (method, `fallbackPath`, HTTP status/type, fetched URL/time, retrieval status) |
 
 ### get_search_content
@@ -160,7 +166,7 @@ get_search_content({ responseId: "abc123", query: "original query" })
 
 ## Current limits
 
-Extraction is intentionally lossy for many web pages: Readability removes navigation/ads and may omit app-rendered content. This tool does not bypass paywalls or access controls. JavaScript-heavy sites, PDFs, YouTube, and local video depend on the available fallbacks and optional binaries/API keys. Raw HTML output, robots.txt enforcement, and cache-only/max-age policies are not implemented in this pass; HTTP/Jina/Gemini fetches are live requests.
+Extraction is intentionally lossy for many web pages: Readability removes navigation/ads and may omit app-rendered content. This tool does not bypass paywalls or access controls. JavaScript-heavy sites may need Jina or a more specific/raw source URL. Raw HTML output, robots.txt enforcement, and cache-only/max-age policies are not implemented in this pass; HTTP/Jina fetches are live requests.
 
 ## Capabilities
 
@@ -170,52 +176,24 @@ GitHub URLs are cloned locally instead of scraped. The agent gets real file cont
 
 Repos over 350MB get a lightweight API-based view instead of a full clone (override with `forceClone: true`). Commit SHA URLs are handled via the API. Clones are cached for the session and wiped on session change. Private repos require the `gh` CLI.
 
-### YouTube videos
-
-YouTube URLs are processed via Gemini for full video understanding — visual descriptions, transcripts with timestamps, and chapter markers. Pass a `prompt` to ask specific questions about the video. Results include the video thumbnail so the agent gets visual context alongside the transcript.
-
-Fallback: Gemini Web → Gemini API → Perplexity (text summary only). Handles all URL formats: `/watch?v=`, `youtu.be/`, `/shorts/`, `/live/`, `/embed/`, `/v/`.
-
-### Local video files
-
-Pass a file path (`/`, `./`, `../`, or `file://` prefix) to analyze video content via Gemini. Supports MP4, MOV, WebM, AVI, and other common formats up to 50MB. Pass a `prompt` to ask about specific content. If ffmpeg is installed, a thumbnail frame is included alongside the analysis.
-
-Fallback: Gemini API (Files API upload) → Gemini Web.
-
-### Video frame extraction
-
-Use `timestamp` and/or `frames` on any YouTube URL or local video file to extract visual frames as images.
-
-```typescript
-fetch_content({ url: "...", timestamp: "23:41" })                       // single frame
-fetch_content({ url: "...", timestamp: "23:41-25:00" })                 // range, 6 frames
-fetch_content({ url: "...", timestamp: "23:41-25:00", frames: 3 })      // range, custom count
-fetch_content({ url: "...", timestamp: "23:41", frames: 5 })            // 5 frames at 5s intervals
-fetch_content({ url: "...", frames: 6 })                                // sample whole video
-```
-
-Requires `ffmpeg` (and `yt-dlp` for YouTube). Timestamps accept `H:MM:SS`, `MM:SS`, or bare seconds.
-
 ### PDFs
 
 PDF URLs are extracted as text and saved to `~/Downloads/` as markdown. The agent can then `read` specific sections without loading the full document into context. Text-based extraction only — no OCR.
 
 ### Blocked pages
 
-When Readability fails or returns only a cookie notice, the extension retries via Jina Reader (handles JS rendering server-side, no API key needed), then Gemini URL Context API, then Gemini Web extraction. Handles SPAs, JS-heavy pages, and anti-bot protections transparently. Also parses Next.js RSC flight data when present.
+When Readability fails or returns only a cookie notice, the extension retries via Jina Reader (handles many JS-rendered pages server-side, no API key needed). It also parses Next.js RSC flight data when present.
 
 ## How It Works
 
 ```
 web_search(query)
-  → Exa (direct API with key, MCP without) → Perplexity → Gemini API → Gemini Web
+  → Exa (direct API with key, MCP without)
 
 fetch_content(url)
-  → Video file?  Gemini API (Files API) → Gemini Web
   → GitHub URL?  Clone repo, return file contents + local path
-  → YouTube URL? Gemini Web → Gemini API → Perplexity
   → HTTP fetch → PDF? Extract text, save to ~/Downloads/
-               → HTML? Readability → RSC parser → Jina Reader → Gemini fallback
+               → HTML? Readability → RSC parser → Jina Reader
                → Text/JSON/Markdown? Return directly
 ```
 
@@ -227,37 +205,9 @@ Bundled research workflow for investigating open-source libraries. Combines GitH
 
 ## Commands
 
-### /websearch
-
-Open the search curator directly. Runs searches and lets you review, add, select results, and approve a summary before it is sent back to the agent — no LLM round-trip needed.
-
-```
-/websearch                                               # empty page, type your own searches
-/websearch react hooks, next.js caching                  # pre-fill with comma-separated queries
-```
-
-Results get injected into the conversation when you approve the summary or click "Send selected results without summary". On timeout, the curator auto-submits and falls back to a deterministic summary if no approved draft is present.
-
-### /curator
-
-Toggle or configure the curator workflow at runtime.
-
-```
-/curator                    # toggle on/off
-/curator on                 # enable curator (summary-review)
-/curator off                # disable curator (raw results only)
-/curator summary-review     # explicit workflow
-```
-
-Persists to `~/.pi/web-search.json` and takes effect on the next `web_search` call. When disabled, `web_search` returns raw results without opening the curator window.
-
 ### /search
 
 Browse stored search results interactively. Lists all results from the current session with their response IDs for easy retrieval.
-
-### /google-account
-
-Show the active Google account currently authenticated for Gemini Web. Useful when multiple Chromium profiles exist or `chromeProfile` is set in config.
 
 ## Activity Monitor
 
@@ -278,27 +228,12 @@ All config lives in `~/.pi/web-search.json`. Every field is optional.
 ```json
 {
   "exaApiKey": "exa-...",
-  "perplexityApiKey": "pplx-...",
-  "geminiApiKey": "AIza...",
   "provider": "exa",
-  "chromeProfile": "Profile 2",
-  "searchModel": "gemini-2.5-flash",
-  "workflow": "summary-review",
-  "curatorTimeoutSeconds": 20,
   "githubClone": {
     "enabled": true,
     "maxRepoSizeMB": 350,
     "cloneTimeoutSeconds": 30,
     "clonePath": "/tmp/pi-github-repos"
-  },
-  "youtube": {
-    "enabled": true,
-    "preferredModel": "gemini-3-flash-preview"
-  },
-  "video": {
-    "enabled": true,
-    "preferredModel": "gemini-3-flash-preview",
-    "maxSizeMB": 50
   },
   "shortcuts": {
     "curate": "ctrl+shift+s",
@@ -307,16 +242,15 @@ All config lives in `~/.pi/web-search.json`. Every field is optional.
 }
 ```
 
-`EXA_API_KEY`, `GEMINI_API_KEY`, and `PERPLEXITY_API_KEY` env vars take precedence over config file values. `provider` sets the default search provider: `"exa"`, `"perplexity"`, or `"gemini"`. This is also updated automatically when you change the provider in the curator UI. `workflow` sets the default curator mode: `"summary-review"` (default, opens curator with auto-generated summary draft) or `"none"` (raw results, no curator). Overridden per-call via the `workflow` parameter on `web_search`, or toggled at runtime with `/curator`. `chromeProfile` overrides the Chromium profile directory used for Gemini Web cookie lookup. `searchModel` overrides the Gemini API model used by `web_search` without changing URL, YouTube, or video extraction defaults. `curatorTimeoutSeconds` controls the initial curator idle timeout (default `20`, max `600`); users can still adjust the timer in the curator UI.
+`EXA_API_KEY` env var takes precedence over the config file value. `provider` sets the default search provider (`"exa"`; `"auto"` also resolves to Exa).
 
 ### Shortcuts
 
-Both shortcuts are configurable via `~/.pi/web-search.json`:
+The activity shortcut is configurable via `~/.pi/web-search.json`:
 
 ```json
 {
   "shortcuts": {
-    "curate": "ctrl+shift+s",
     "activity": "ctrl+shift+w"
   }
 }
@@ -324,15 +258,12 @@ Both shortcuts are configurable via `~/.pi/web-search.json`:
 
 Values use the same format as pi keybindings (e.g. `ctrl+s`, `ctrl+shift+s`, `alt+r`). Changes take effect on next pi restart.
 
-Set `"enabled": false` under any feature to disable it. Config changes require a Pi restart.
+Config changes require a Pi restart.
 
-Rate limits: Perplexity is capped at 10 requests/minute (client-side). Content fetches run 3 concurrent with a 30s timeout per URL.
+Rate limits: Exa direct API requests are tracked against the monthly free tier. Content fetches run 3 concurrent with a 30s timeout per URL.
 
 ## Limitations
 
-- Chromium cookie extraction works on macOS and Linux. Linux uses `secret-tool` when available and falls back to Chromium's default password otherwise; other platforms fall through to API keys. First-time macOS access may trigger a Keychain dialog.
-- YouTube private/age-restricted videos may fail on all extraction paths.
-- Gemini can process videos up to ~1 hour; longer videos may be truncated.
 - PDFs are text-extracted only (no OCR for scanned documents).
 - GitHub branch names with slashes may misresolve file paths; the clone still works and the agent can navigate manually.
 - Non-code GitHub URLs (issues, PRs, wiki) fall through to normal web extraction.
@@ -343,25 +274,15 @@ Rate limits: Perplexity is capped at 10 requests/minute (client-side). Content f
 | File | Purpose |
 |------|---------|
 | `index.ts` | Extension entry, tool definitions, commands, widget |
-| `curator-page.ts` | HTML/CSS/JS generation for the curator UI with markdown rendering |
-| `curator-server.ts` | Ephemeral HTTP server with SSE streaming and state machine |
-| `summary-review.ts` | Summary prompt construction, model-based draft generation, and deterministic fallback summary |
 | `exa.ts` | Exa.ai search provider — direct API and MCP proxy, budget tracking |
 | `code-search.ts` | Code/docs search via Exa MCP |
 | `extract.ts` | URL/file path routing, HTTP extraction, fallback orchestration |
-| `gemini-search.ts` | Search routing across Exa, Perplexity, Gemini API, Gemini Web |
-| `gemini-url-context.ts` | Gemini URL Context + Web extraction fallbacks |
-| `gemini-web.ts` | Gemini Web client (cookie auth, StreamGenerate) |
-| `gemini-api.ts` | Gemini REST API client (generateContent) |
-| `chrome-cookies.ts` | macOS/Linux Chromium-based cookie extraction (Keychain/secret-tool + SQLite) |
-| `youtube-extract.ts` | YouTube detection, three-tier extraction, frame extraction |
-| `video-extract.ts` | Local video detection, Files API upload, Gemini analysis |
+| `search.ts` | Lean Exa search routing and cache |
+| `paper-search.ts` | Scholarly paper search via OpenAlex/arXiv |
 | `github-extract.ts` | GitHub URL parsing, clone cache, content generation |
 | `github-api.ts` | GitHub API fallback for large repos and commit SHAs |
-| `perplexity.ts` | Perplexity API client with rate limiting |
 | `pdf-extract.ts` | PDF text extraction, saves to markdown |
 | `rsc-extract.ts` | RSC flight data parser for Next.js pages |
-| `utils.ts` | Shared formatting and error helpers |
 | `storage.ts` | Session-aware result storage |
 | `activity.ts` | Activity tracking for the observability widget |
 | `skills/librarian/` | Bundled skill for library research |

@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { activityMonitor } from "./activity.js";
 import type { ExtractedContent } from "./extract.js";
-import type { SearchOptions, SearchResponse } from "./perplexity.js";
+import type { SearchOptions, SearchResponse } from "./search-types.js";
 
 const EXA_ANSWER_URL = "https://api.exa.ai/answer";
 const EXA_SEARCH_URL = "https://api.exa.ai/search";
@@ -25,7 +25,7 @@ interface ExaUsage {
 
 interface ExaAnswerResponse {
 	answer?: string;
-	citations?: Array<{ url?: string; title?: string; text?: string; publishedDate?: string }>;
+	citations?: Array<{ url?: string; title?: string; text?: string; summary?: string; publishedDate?: string }>;
 }
 
 interface ExaSearchResponse {
@@ -35,6 +35,7 @@ interface ExaSearchResponse {
 		publishedDate?: string;
 		author?: string;
 		text?: string;
+		summary?: string;
 		highlights?: unknown;
 		highlightScores?: number[];
 	}>;
@@ -174,47 +175,155 @@ function normalizeHighlights(value: unknown): string[] {
 	return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
 }
 
-function buildAnswerFromSearchResults(results: ExaSearchResponse["results"]): string {
-	if (!results?.length) return "";
-	const parts: string[] = [];
-	for (let i = 0; i < results.length; i++) {
-		const item = results[i];
+type ExaResultItem = NonNullable<ExaSearchResponse["results"]>[number];
+type ExaCitationItem = NonNullable<ExaAnswerResponse["citations"]>[number];
+
+function clampPositiveInt(value: unknown, fallback: number, max: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	const normalized = Math.floor(value);
+	if (normalized < 1) return fallback;
+	return Math.min(normalized, max);
+}
+
+function normalizeResearchDepth(value: unknown): "quick" | "standard" | "deep" {
+	return value === "standard" || value === "deep" ? value : "quick";
+}
+
+function normalizeSearchType(options: ExaSearchOptions): "fast" | "auto" | "deep-lite" | "deep" | "deep-reasoning" {
+	if (options.searchType === "fast" || options.searchType === "auto" || options.searchType === "deep-lite" || options.searchType === "deep" || options.searchType === "deep-reasoning") {
+		return options.searchType;
+	}
+	const depth = normalizeResearchDepth(options.researchDepth);
+	if (depth === "deep") return "deep-lite";
+	if (depth === "standard") return "auto";
+	return "fast";
+}
+
+function normalizeContentMode(options: ExaSearchOptions): "none" | "highlights" | "summary" | "text" {
+	// includeContent is a stronger request than contentMode: callers expect stored full text
+	// before the tool returns. Force Exa/MCP to return bounded text when possible.
+	if (options.includeContent === true) return "text";
+	if (options.contentMode === "none" || options.contentMode === "highlights" || options.contentMode === "summary" || options.contentMode === "text") {
+		return options.contentMode;
+	}
+	return "highlights";
+}
+
+function normalizeLivecrawl(value: unknown): "never" | "fallback" | "always" | undefined {
+	return value === "never" || value === "fallback" || value === "always" ? value : undefined;
+}
+
+function buildSearchContents(options: ExaSearchOptions, safeFallback = false): Record<string, unknown> | undefined {
+	const mode = safeFallback && normalizeContentMode(options) === "summary" ? "highlights" : normalizeContentMode(options);
+	if (mode === "none") return undefined;
+	const maxCharacters = clampPositiveInt(options.maxCharacters, options.includeContent || mode === "text" ? 12000 : 1000, 50000);
+	if (mode === "text") {
+		return {
+			highlights: true,
+			text: { maxCharacters },
+		};
+	}
+	if (mode === "summary") {
+		return {
+			highlights: true,
+			summary: true,
+		};
+	}
+	return { highlights: true };
+}
+
+function buildSearchBody(query: string, options: ExaSearchOptions, safeFallback = false): Record<string, unknown> {
+	const startDate = options.recencyFilter ? recencyToStartDate(options.recencyFilter) : null;
+	const domainFilters = mapDomainFilter(options.domainFilter);
+	const contents = buildSearchContents(options, safeFallback);
+	const livecrawl = normalizeLivecrawl(options.livecrawl);
+	return {
+		query,
+		type: safeFallback ? "auto" : normalizeSearchType(options),
+		numResults: Math.min(options.numResults ?? 5, 20),
+		...domainFilters,
+		...(startDate ? { startPublishedDate: startDate } : {}),
+		...(livecrawl ? { livecrawl } : {}),
+		...(contents ? { contents } : {}),
+	};
+}
+
+function normalizeResultUrl(url: string): string {
+	try {
+		const parsed = new URL(url);
+		parsed.hash = "";
+		for (const key of Array.from(parsed.searchParams.keys())) {
+			if (/^(utm_|fbclid$|gclid$|mc_cid$|mc_eid$)/i.test(key)) parsed.searchParams.delete(key);
+		}
+		let normalized = parsed.toString();
+		if (normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+		return normalized;
+	} catch {
+		return url.trim();
+	}
+}
+
+function dedupeResults<T extends { url?: string }>(results: T[] | undefined): T[] {
+	if (!Array.isArray(results)) return [];
+	const seen = new Set<string>();
+	const deduped: T[] = [];
+	for (const item of results) {
 		if (!item?.url) continue;
-		const highlights = normalizeHighlights(item.highlights);
-		const content = highlights.length > 0
-			? highlights.join(" ")
-			: typeof item.text === "string" ? item.text.trim().slice(0, 1000) : "";
-		if (!content) continue;
+		const key = normalizeResultUrl(item.url);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		deduped.push(item);
+	}
+	return deduped;
+}
+
+function cleanSnippet(value: string, maxLength = 1000): string {
+	const normalized = value.replace(/\s+/g, " ").trim();
+	return normalized.length > maxLength ? `${normalized.slice(0, maxLength).trimEnd()}…` : normalized;
+}
+
+function resultSnippet(item: ExaResultItem | ExaCitationItem): string {
+	if (typeof item.summary === "string" && item.summary.trim()) return cleanSnippet(item.summary);
+	const highlights = "highlights" in item ? normalizeHighlights(item.highlights) : [];
+	if (highlights.length > 0) return cleanSnippet(highlights.join(" "));
+	if (typeof item.text === "string" && item.text.trim()) return cleanSnippet(item.text);
+	return "";
+}
+
+function buildAnswerFromSearchResults(results: ExaSearchResponse["results"]): string {
+	const deduped = dedupeResults(results);
+	if (!deduped.length) return "";
+	const parts: string[] = [];
+	for (let i = 0; i < deduped.length; i++) {
+		const item = deduped[i];
+		if (!item.url) continue;
+		const snippet = resultSnippet(item);
+		if (!snippet) continue;
 		const sourceTitle = item.title || `Source ${i + 1}`;
-		parts.push(`${content}\nSource: ${sourceTitle} (${item.url})`);
+		parts.push(`${snippet}\nSource: ${sourceTitle} (${item.url})`);
 	}
 	return parts.join("\n\n");
 }
 
 function mapResults(results: ExaSearchResponse["results"] | ExaAnswerResponse["citations"]): SearchResponse["results"] {
-	if (!Array.isArray(results)) return [];
-	const mapped: SearchResponse["results"] = [];
-	for (let i = 0; i < results.length; i++) {
-		const item = results[i];
-		if (!item?.url) continue;
-		mapped.push({
-			title: item.title || `Source ${i + 1}`,
-			url: item.url,
-			snippet: "",
-		});
-	}
-	return mapped;
+	const deduped = dedupeResults(results);
+	return deduped.map((item, index) => ({
+		title: item.title || `Source ${index + 1}`,
+		url: item.url!,
+		snippet: resultSnippet(item),
+	}));
 }
 
-function mapInlineContent(results: ExaSearchResponse["results"]): ExtractedContent[] {
-	if (!results?.length) return [];
-	return results
-		.filter((r): r is NonNullable<ExaSearchResponse["results"]>[number] & { url: string; text: string } =>
-			!!r?.url && typeof r.text === "string" && r.text.length > 0)
+function mapInlineContent(results: ExaSearchResponse["results"], options: ExaSearchOptions): ExtractedContent[] {
+	if (!options.includeContent && normalizeContentMode(options) !== "text") return [];
+	const maxCharacters = clampPositiveInt(options.maxCharacters, 12000, 50000);
+	return dedupeResults(results)
+		.filter((r): r is ExaResultItem & { url: string; text: string } =>
+			!!r.url && typeof r.text === "string" && r.text.trim().length > 0)
 		.map(r => ({
 			url: r.url,
 			title: r.title || "",
-			content: r.text,
+			content: r.text.length > maxCharacters ? `${r.text.slice(0, maxCharacters).trimEnd()}\n\n[Truncated by Exa maxCharacters]` : r.text,
 			error: null,
 		}));
 }
@@ -371,28 +480,29 @@ async function searchWithExaMcp(query: string, options: ExaSearchOptions = {}): 
 	const activityId = activityMonitor.logStart({ type: "api", query: enrichedQuery });
 
 	try {
+		const contentMode = normalizeContentMode(options);
 		const text = await callExaMcp(
 			"web_search_exa",
 			{
 				query: enrichedQuery,
-				numResults: options.numResults ?? 5,
-				livecrawl: "fallback",
-				type: "auto",
-				contextMaxCharacters: options.includeContent ? 50000 : 3000,
+				numResults: Math.min(options.numResults ?? 5, 20),
+				livecrawl: normalizeLivecrawl(options.livecrawl) ?? "fallback",
+				type: normalizeSearchType(options),
+				contextMaxCharacters: contentMode === "text" || options.includeContent ? clampPositiveInt(options.maxCharacters, 12000, 50000) : 3000,
 			},
 			options.signal,
 		);
-		const parsedResults = parseMcpResults(text);
+		const parsedResults = dedupeResults(parseMcpResults(text) ?? undefined);
 		activityMonitor.logComplete(activityId, 200);
 
-		if (!parsedResults) return null;
+		if (parsedResults.length === 0) return null;
 
 		const response: SearchResponse = {
 			answer: buildAnswerFromMcpResults(parsedResults),
 			results: parsedResults.map((result, index) => ({
 				title: result.title || `Source ${index + 1}`,
 				url: result.url,
-				snippet: "",
+				snippet: cleanSnippet(result.content),
 			})),
 			...(options.returnMetadata ? {
 				metadata: {
@@ -401,13 +511,16 @@ async function searchWithExaMcp(query: string, options: ExaSearchOptions = {}): 
 					directApi: false,
 					recencyFilter: options.recencyFilter,
 					domainFilter: options.domainFilter,
+					researchDepth: options.researchDepth,
+					searchType: normalizeSearchType(options),
+					contentMode,
 					enrichedQuery,
 					sources: parsedResults.map(r => ({ title: r.title, url: r.url })),
 				},
 			} : {}),
 		};
 
-		if (options.includeContent) {
+		if (options.includeContent || contentMode === "text") {
 			const inlineContent = mapMcpInlineContent(parsedResults);
 			if (inlineContent.length > 0) response.inlineContent = inlineContent;
 		}
@@ -445,25 +558,17 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 	const budget = reserveRequestBudget();
 	if (budget) return budget;
 
-	const useSearch = options.includeContent
-		|| !!options.recencyFilter
-		|| !!options.domainFilter?.length
-		|| !!(options.numResults && options.numResults !== 5);
-
 	const activityId = activityMonitor.logStart({ type: "api", query });
 
 	try {
-		if (!useSearch) {
+		if (options.synthesize === true) {
 			const response = await fetch(EXA_ANSWER_URL, {
 				method: "POST",
 				headers: {
 					"x-api-key": apiKey,
 					"Content-Type": "application/json",
 				},
-				body: JSON.stringify({
-					query,
-					text: true,
-				}),
+				body: JSON.stringify({ query, text: true }),
 				signal: requestSignal(options.signal),
 			});
 
@@ -482,35 +587,38 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 						providerApi: "exa-answer",
 						fetchedAt: new Date().toISOString(),
 						directApi: true,
+						synthesize: true,
 						recencyFilter: options.recencyFilter,
 						domainFilter: options.domainFilter,
-						sources: data.citations?.map(c => ({ url: c.url, title: c.title, publishedDate: c.publishedDate, textLength: c.text?.length })) ?? [],
+						sources: dedupeResults(data.citations).map(c => ({ url: c.url, title: c.title, publishedDate: c.publishedDate, textLength: c.text?.length })),
 					},
 				} : {}),
 			};
 		}
 
-		const startDate = options.recencyFilter ? recencyToStartDate(options.recencyFilter) : null;
-		const domainFilters = mapDomainFilter(options.domainFilter);
-		const response = await fetch(EXA_SEARCH_URL, {
+		let response = await fetch(EXA_SEARCH_URL, {
 			method: "POST",
 			headers: {
 				"x-api-key": apiKey,
 				"Content-Type": "application/json",
 			},
-			body: JSON.stringify({
-				query,
-				type: "auto",
-				numResults: options.numResults ?? 5,
-				...domainFilters,
-				...(startDate ? { startPublishedDate: startDate } : {}),
-				contents: {
-					text: options.includeContent ? true : { maxCharacters: 3000 },
-					highlights: true,
-				},
-			}),
+			body: JSON.stringify(buildSearchBody(query, options)),
 			signal: requestSignal(options.signal),
 		});
+		let retriedSafeFallback = false;
+
+		if (!response.ok && response.status >= 400 && response.status < 500) {
+			response = await fetch(EXA_SEARCH_URL, {
+				method: "POST",
+				headers: {
+					"x-api-key": apiKey,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify(buildSearchBody(query, { ...options, searchType: "auto", contentMode: normalizeContentMode(options) === "text" ? "text" : "highlights" }, true)),
+				signal: requestSignal(options.signal),
+			});
+			retriedSafeFallback = true;
+		}
 
 		if (!response.ok) {
 			const errorText = await response.text();
@@ -519,31 +627,39 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 
 		const data = await response.json() as ExaSearchResponse;
 		activityMonitor.logComplete(activityId, response.status);
+		const dedupedResults = dedupeResults(data.results);
+		const contentMode = normalizeContentMode(options);
 
 		const mapped: SearchResponse = {
-			answer: buildAnswerFromSearchResults(data.results),
-			results: mapResults(data.results),
+			answer: buildAnswerFromSearchResults(dedupedResults),
+			results: mapResults(dedupedResults),
 			...(options.returnMetadata ? {
 				metadata: {
 					providerApi: "exa-search",
 					fetchedAt: new Date().toISOString(),
 					directApi: true,
+					retriedSafeFallback,
+					researchDepth: normalizeResearchDepth(options.researchDepth),
+					searchType: retriedSafeFallback ? "auto" : normalizeSearchType(options),
+					contentMode,
+					maxCharacters: options.maxCharacters,
+					livecrawl: normalizeLivecrawl(options.livecrawl),
 					recencyFilter: options.recencyFilter,
 					domainFilter: options.domainFilter,
-					sources: data.results?.map(r => ({
+					sources: dedupedResults.map(r => ({
 						url: r.url,
 						title: r.title,
 						publishedDate: r.publishedDate,
+						summary: r.summary,
 						highlights: normalizeHighlights(r.highlights),
 						highlightScores: r.highlightScores,
+						textLength: r.text?.length,
 					})) ?? [],
 				},
 			} : {}),
 		};
-		if (options.includeContent) {
-			const inlineContent = mapInlineContent(data.results);
-			if (inlineContent.length > 0) mapped.inlineContent = inlineContent;
-		}
+		const inlineContent = mapInlineContent(dedupedResults, options);
+		if (inlineContent.length > 0) mapped.inlineContent = inlineContent;
 		return mapped;
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
