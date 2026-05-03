@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import type { ExtractedContent } from "./extract.js";
 import type { GitHubUrlInfo } from "./github-extract.js";
 
-const MAX_TREE_ENTRIES = 200;
+const MAX_TREE_ENTRIES = 80;
 const MAX_INLINE_FILE_CHARS = 100_000;
 
 let ghAvailable: boolean | null = null;
@@ -172,15 +172,15 @@ export async function fetchViaApi(
 
 	if (!tree && !readme) return null;
 
-	if (tree) {
-		lines.push("## Structure");
-		lines.push(tree);
-		lines.push("");
-	}
-
 	if (readme) {
 		lines.push("## README.md");
 		lines.push(readme);
+		lines.push("");
+	}
+
+	if (tree) {
+		lines.push("## Structure");
+		lines.push(tree);
 		lines.push("");
 	}
 

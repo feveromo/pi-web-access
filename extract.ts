@@ -3,7 +3,6 @@ import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
 import pLimit from "p-limit";
 import { activityMonitor } from "./activity.js";
-import { extractRSCContent } from "./rsc-extract.js";
 import { extractPDFToMarkdown, isPDF } from "./pdf-extract.js";
 import { extractGitHub } from "./github-extract.js";
 
@@ -441,12 +440,6 @@ async function extractViaHttp(
 		const article = reader.parse();
 
 		if (!article) {
-			const rscResult = extractRSCContent(text);
-			if (rscResult) {
-				activityMonitor.logComplete(activityId, response.status);
-				return { url, title: rscResult.title, content: rscResult.content, error: null, ...httpMeta, method: "rsc" };
-			}
-
 			activityMonitor.logComplete(activityId, response.status);
 
 			// Provide more specific error message
