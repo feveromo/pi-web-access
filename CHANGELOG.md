@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 - Added `paper_search` for structured scholarly search via OpenAlex with arXiv support/fallback.
 - Added Exa research controls on `web_search`: `researchDepth`, `searchType`, `contentMode`, `maxCharacters`, `livecrawl`, and `synthesize`.
+- Added a Node 22 PDF extraction regression test and `npm test` script.
 
 ### Changed
 - Removed Perplexity and Gemini search/fetch/media paths; web search now routes through Exa only (direct API when keyed, Exa MCP otherwise).
@@ -15,7 +16,8 @@ All notable changes to this project will be documented in this file.
 - Removed the curator UI, summary-review workflow, `/websearch`, and `/curator`; `web_search` now returns results directly after all requested search/content work finishes.
 - Removed the `code_search` wrapper for now because Exa MCP no longer exposes the dedicated code-context tool; use `web_search` with code/doc-specific queries and GitHub fetches for the baseline.
 - Removed the RSC flight-data extractor from the baseline; `fetch_content` now stays on deterministic extraction paths: GitHub, HTTP/Readability, PDF/text, and Jina fallback.
-- Merged relevant upstream baseline fixes: Pi bundled `typebox` import for tool schemas and `unpdf` 1.6.x for Node 22 PDF extraction compatibility.
+- Merged relevant upstream baseline fixes through upstream `v0.10.7`: Pi bundled `typebox` import for tool schemas, `unpdf` 1.6.x for Node 22 PDF extraction compatibility, and package/test metadata.
+- Intentionally kept the lean fork removals in place instead of re-adding upstream Gemini/Perplexity, curator, media, and `code_search` paths.
 
 ## [0.10.6] - 2026-04-04
 

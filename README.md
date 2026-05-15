@@ -1,6 +1,6 @@
 # Pi Web Access — Lean Fork
 
-A slimmed-down fork of [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for Pi. This version is intentionally focused on one thing: fast, predictable research and content extraction without interactive review UIs, media analysis, or extra provider layers.
+A slimmed-down fork of [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for Pi, synced with the useful upstream baseline fixes through `v0.10.7`. This version is intentionally focused on one thing: fast, predictable research and content extraction without interactive review UIs, media analysis, or extra provider layers.
 
 ## What is different in this fork?
 
