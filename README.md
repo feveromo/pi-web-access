@@ -1,6 +1,6 @@
 # Pi Web Access — Lean Fork
 
-A slimmed-down fork of [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for Pi, synced with the useful upstream baseline fixes through `v0.10.7`. This version is intentionally focused on one thing: fast, predictable research and content extraction without interactive review UIs, media analysis, or extra provider layers.
+A slimmed-down fork of [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for Pi, synced with the useful upstream baseline fixes through `v0.10.7`. This version is intentionally focused on one thing: fast, predictable research and content extraction without interactive review UIs, media analysis, or extra provider layers. It is designed to behave like close-to-the-metal Pi software: small API surface, bounded output, cancellable work, session-safe storage, and native TUI rendering.
 
 ## What is different in this fork?
 
@@ -36,13 +36,13 @@ web_search({ query: "synthesize this", synthesize: true })
 | --- | --- |
 | `query` / `queries` | Single query or multiple varied queries |
 | `numResults` | Results per query, default 5, max 20 |
-| `includeContent` | Fetch/store bounded source text before returning |
+| `includeContent` | Fetch/store bounded source text before returning; fallback fetches default to 12K chars per source unless `maxCharacters` is set |
 | `recencyFilter` | `day`, `week`, `month`, `year` |
 | `domainFilter` | Include/exclude domains; prefix exclusions with `-` |
 | `researchDepth` | `quick`, `standard`, `deep` |
 | `searchType` | Exa type override: `fast`, `auto`, `deep-lite`, `deep`, `deep-reasoning` |
 | `contentMode` | `none`, `highlights`, `summary`, `text` |
-| `maxCharacters` | Per-result text cap when requesting text content |
+| `maxCharacters` | Per-result source text cap when requesting text content or `includeContent` fallback fetching |
 | `livecrawl` | `never`, `fallback`, `always` |
 | `synthesize` | Use Exa answer synthesis instead of source-passage output |
 | `returnMetadata` | Include provider/source metadata in `details` |
@@ -103,7 +103,7 @@ paper_search({ query: "diffusion models", source: "arxiv", maxResults: 5 })
 
 ## Recommended workflow
 
-1. Use `web_search` with 2–4 meaningfully different queries.
+1. Use `web_search` with 2–4 meaningfully different queries. Independent query searches run with small bounded concurrency for speed without API stampedes.
 2. Prefer official docs/source domains with `domainFilter` when accuracy matters.
 3. Use `includeContent: true` only when source text matters immediately.
 4. Use `fetch_content` for selected pages, GitHub repos/files, and PDFs.
@@ -121,13 +121,23 @@ fetch_content({ url: "https://github.com/reactjs/react.dev" })
 
 Then inspect fetched repos with normal Pi file tools (`read`, `rg`, `bash`) instead of relying on a separate opaque code-search wrapper.
 
+## Long research durability
+
+Long research sessions should stay useful without stuffing giant blobs into Pi's session log.
+
+- Search/fetch metadata is still persisted with `pi.appendEntry()` so `/search` and `get_search_content` survive reloads and tree navigation.
+- Large fetched source bodies are stored outside the session under `~/.pi/web-access/content/`; the session entry keeps a compact preview plus a content reference.
+- `get_search_content` hydrates from that disk cache when available, while current-session calls also keep full content in memory.
+- Session restore keeps recent web-access entries for 24 hours; disk-backed large content is pruned after about 7 days.
+- For tight context work, prefer `mode: "highlights"` / `"summary"` and set `maxChars` explicitly.
+
 ## GitHub behavior
 
 - GitHub repo URLs are cloned locally when under the size threshold.
 - Large repos use a lightweight GitHub API view unless `forceClone: true` is set.
 - Blob URLs return file content.
 - Tree URLs return directory context.
-- Clone cache is session-scoped and cleared on session changes.
+- The in-memory clone cache is reset on session changes, but temp clone directories are not eagerly deleted; stored repo paths stay useful across reloads/tree navigation. Old temp clones in the default cache are pruned after about 7 days or replaced by a later refresh.
 
 ## PDF behavior
 
@@ -182,7 +192,7 @@ There is intentionally no curator/browser UI in this fork.
 | `github-api.ts` | GitHub API fallback for large repos and commit/blob views |
 | `pdf-extract.ts` | PDF text extraction to markdown |
 | `paper-search.ts` | OpenAlex/arXiv scholarly search |
-| `storage.ts` | Session-aware result storage |
+| `storage.ts` | Session-aware result storage with disk-backed large-content references |
 | `activity.ts` | Request activity tracking widget |
 | `search-types.ts` | Shared search option/result types |
 

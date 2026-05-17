@@ -9,11 +9,12 @@ Answer questions about open-source libraries by finding evidence with GitHub per
 
 ## Execution Model
 
-Pi executes tool calls sequentially, even when you emit multiple calls in one turn. But batching independent calls in a single turn still saves LLM round-trips (~5-10s each). Use these patterns:
+Pi can execute independent tool calls efficiently, and this extension also has native bounded parallelism for multi-URL fetches and multi-query searches. Batch independent work when it saves round trips, but keep each result bounded and source-backed.
 
 | Pattern | When | Actually parallel? |
 |---------|------|-------------------|
-| Batch tool calls in one turn | Independent ops (web_search + fetch_content + read) | No, but saves round-trips |
+| Batch tool calls in one turn | Independent ops (web_search + fetch_content + read) | Saves round-trips |
+| `web_search({ queries: [...] })` | Multiple search angles | Yes (bounded concurrency) |
 | `fetch_content({ urls: [...] })` | Multiple URLs to fetch | Yes (3 concurrent) |
 | Bash with `&` + `wait` | Multiple git/gh commands | Yes (OS-level) |
 
@@ -36,7 +37,7 @@ Before doing anything, classify the request to pick the right research strategy.
 Batch these in one turn:
 
 1. **web_search**: `"library-name topic"` via the configured search provider for recent articles and discussions
-2. **fetch_content**: the library's GitHub repo URL to clone and check README, docs, or examples
+2. **fetch_content**: the library's GitHub repo URL to clone/check README, docs, examples, and file paths
 3. For scientific/library research papers, use **paper_search** first to gather DOI/PDF/citation metadata.
 
 Synthesize web results + repo docs. Cite official documentation and link to relevant source files.
@@ -144,7 +145,7 @@ For conceptual answers, link to official docs and relevant source files. For imp
 |---------|----------|
 | grep finds nothing | Broaden the query, try concept names instead of exact function names |
 | gh CLI rate limited | Use the already-cloned repo in /tmp/pi-github-repos/ for git operations |
-| Repo too large to clone | fetch_content returns an API-only view automatically; use that or add `forceClone: true` |
+| Repo too large to clone | fetch_content returns an API-only view automatically; use that or add `forceClone: true` after confirming the heavier path is worth it |
 | File not found in clone | Branch name with slashes may have misresolved; list the repo tree and navigate manually |
 | Uncertain about implementation | State your uncertainty explicitly, propose a hypothesis, show what evidence you did find |
 | Page returns 403/bot block | Try `web_search` for alternate sources or fetch a raw/official URL |

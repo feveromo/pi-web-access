@@ -1,7 +1,8 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Box, Text, truncateToWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { StringEnum } from "@mariozechner/pi-ai";
+import { StringEnum } from "@earendil-works/pi-ai";
+import pLimit from "p-limit";
 import { fetchAllContent, type ExtractedContent, type ExtractOptions } from "./extract.js";
 import { clearCloneCache } from "./github-extract.js";
 import { search, type SearchProvider } from "./search.js";
@@ -13,6 +14,7 @@ import {
 	generateId,
 	getAllResults,
 	getResult,
+	prepareStoredDataForSession,
 	restoreFromSession,
 	storeResult,
 	type QueryResultData,
@@ -25,6 +27,8 @@ import { join } from "node:path";
 
 const WEB_SEARCH_CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
 const MAX_INLINE_CONTENT = 30000;
+const DEFAULT_SEARCH_CONTENT_MAX_CHARS = 12000;
+const SEARCH_QUERY_CONCURRENCY = 3;
 const DEFAULT_SHORTCUTS = { activity: "ctrl+shift+w" };
 
 interface WebSearchConfig {
@@ -114,6 +118,7 @@ function buildFetchDetail(result: ExtractedContent, index: number, includeMetada
 		truncated: result.truncated,
 		originalContentLength: result.originalContentLength,
 		retrievalStatus: result.retrievalStatus,
+		contentRef: includeMetadata ? result.contentRef : undefined,
 		metadata: includeMetadata ? result.metadata : undefined,
 	};
 }
@@ -279,7 +284,7 @@ export default function (pi: ExtensionAPI) {
 			id, type: "search", timestamp: Date.now(), queries: results,
 		};
 		storeResult(id, data);
-		pi.appendEntry("web-search-results", data);
+		pi.appendEntry("web-search-results", prepareStoredDataForSession(id, data));
 		return id;
 	}
 
@@ -288,8 +293,18 @@ export default function (pi: ExtensionAPI) {
 		const data: StoredSearchData = {
 			id, type: "fetch", timestamp: Date.now(), urls: results,
 		};
-		storeResult(id, data);
-		pi.appendEntry("web-search-results", data);
+		const sessionData = prepareStoredDataForSession(id, data);
+		if (sessionData.urls) {
+			for (let i = 0; i < sessionData.urls.length; i++) {
+				const sessionItem = sessionData.urls[i];
+				if (sessionItem?.contentRef && results[i]) {
+					results[i].contentRef = sessionItem.contentRef;
+					results[i].metadata = sessionItem.metadata;
+				}
+			}
+		}
+		storeResult(id, sessionData);
+		pi.appendEntry("web-search-results", sessionData);
 		return id;
 	}
 
@@ -399,7 +414,7 @@ export default function (pi: ExtensionAPI) {
 			researchDepth: Type.Optional(StringEnum(["quick", "standard", "deep"], { description: "Exa retrieval depth: quick=fast default, standard=auto, deep=deeper retrieval" })),
 			searchType: Type.Optional(StringEnum(["fast", "auto", "deep-lite", "deep", "deep-reasoning"], { description: "Explicit Exa search type override" })),
 			contentMode: Type.Optional(StringEnum(["none", "highlights", "summary", "text"], { description: "Exa content returned with results (default highlights; text is larger)" })),
-			maxCharacters: Type.Optional(Type.Number({ description: "Maximum Exa text characters per result when contentMode is text" })),
+			maxCharacters: Type.Optional(Type.Number({ description: "Maximum source text characters per result for Exa text/includeContent fallback" })),
 			livecrawl: Type.Optional(StringEnum(["never", "fallback", "always"], { description: "Exa livecrawl mode for fresher pages" })),
 			synthesize: Type.Optional(Type.Boolean({ description: "Use Exa answer synthesis instead of source-passage search" })),
 			returnMetadata: Type.Optional(Type.Boolean({ description: "Include provider/debug metadata in details and stored results" })),
@@ -421,17 +436,16 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const searchResults: QueryResultData[] = [];
 			const allUrls: string[] = [];
 			const allInlineContent: ExtractedContent[] = [];
 			const resolvedProvider = normalizeProviderInput(params.provider ?? loadConfig().provider);
+			const queryLimit = pLimit(SEARCH_QUERY_CONCURRENCY);
+			let completedQueries = 0;
 
-			for (let i = 0; i < queryList.length; i++) {
-				const query = queryList[i];
-
+			const queryOutcomes = await Promise.all(queryList.map((query, index) => queryLimit(async () => {
 				onUpdate?.({
-					content: [{ type: "text", text: `Searching ${i + 1}/${queryList.length}: "${query}"...` }],
-					details: { phase: "search", progress: i / queryList.length, currentQuery: query },
+					content: [{ type: "text", text: `Searching ${index + 1}/${queryList.length}: "${query}"...` }],
+					details: { phase: "search", progress: Math.min(0.9, completedQueries / queryList.length * 0.9), currentQuery: query },
 				});
 
 				try {
@@ -451,27 +465,48 @@ export default function (pi: ExtensionAPI) {
 						signal,
 					});
 
-					searchResults.push({ query, answer, results, error: null, provider, metadata });
-					for (const r of results) {
-						if (!allUrls.includes(r.url)) allUrls.push(r.url);
-					}
-					if (inlineContent) allInlineContent.push(...inlineContent);
+					return {
+						data: { query, answer, results, error: null, provider, metadata } satisfies QueryResultData,
+						urls: results.map(r => r.url),
+						inlineContent: inlineContent ?? [],
+					};
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const requestedProvider = typeof resolvedProvider === "string" && resolvedProvider !== "auto"
 						? resolvedProvider
 						: undefined;
-					searchResults.push({ query, answer: "", results: [], error: message, provider: requestedProvider });
+					return {
+						data: { query, answer: "", results: [], error: message, provider: requestedProvider } satisfies QueryResultData,
+						urls: [],
+						inlineContent: [],
+					};
+				} finally {
+					completedQueries++;
+					onUpdate?.({
+						content: [{ type: "text", text: `Completed ${completedQueries}/${queryList.length} search(es)...` }],
+						details: { phase: "search", progress: Math.min(0.9, completedQueries / queryList.length * 0.9) },
+					});
 				}
+			})));
+
+			const searchResults = queryOutcomes.map(outcome => outcome.data);
+			for (const outcome of queryOutcomes) {
+				for (const url of outcome.urls) {
+					if (!allUrls.includes(url)) allUrls.push(url);
+				}
+				allInlineContent.push(...outcome.inlineContent);
 			}
 
+			const searchContentMaxChars = typeof params.maxCharacters === "number" && Number.isFinite(params.maxCharacters) && params.maxCharacters > 0
+				? Math.floor(params.maxCharacters)
+				: DEFAULT_SEARCH_CONTENT_MAX_CHARS;
 			const returnOptions = await ensureRequestedContent({
 				queryList,
 				results: searchResults,
 				urls: allUrls,
 				includeContent: params.includeContent ?? false,
 				inlineContent: allInlineContent.length > 0 ? allInlineContent : undefined,
-				contentFetchOptions: { maxChars: params.maxCharacters, queries: queryList },
+				contentFetchOptions: { maxChars: searchContentMaxChars, queries: queryList },
 			}, signal, onUpdate as Parameters<typeof ensureRequestedContent>[2]);
 
 			return buildSearchReturn(returnOptions);
@@ -637,9 +672,8 @@ export default function (pi: ExtensionAPI) {
 			});
 			const successful = fetchResults.filter((r) => !r.error).length;
 			const totalChars = fetchResults.reduce((sum, r) => sum + r.content.length, 0);
-			const perUrl = fetchResults.map((result, index) => buildFetchDetail(result, index, params.returnMetadata === true));
-
 			const responseId = storeAndPublishFetch(fetchResults);
+			const perUrl = fetchResults.map((result, index) => buildFetchDetail(result, index, params.returnMetadata === true));
 
 			if (urlList.length === 1) {
 				const result = fetchResults[0];
@@ -678,6 +712,7 @@ export default function (pi: ExtensionAPI) {
 						httpStatus: result.httpStatus,
 						fallbackPath: result.fallbackPath,
 						originalContentLength: result.originalContentLength,
+						contentRef: params.returnMetadata ? result.contentRef : undefined,
 						metadata: params.returnMetadata ? result.metadata : undefined,
 						perUrl,
 						results: perUrl,
