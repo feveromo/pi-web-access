@@ -140,6 +140,54 @@ function formatFullResults(queryData: QueryResultData): string {
 	return output;
 }
 
+function normalizeHeadingText(value: string): string {
+	return value
+		.replace(/^#{1,6}\s+/, "")
+		.replace(/[\*_`]+/g, "")
+		.replace(/\s+/g, " ")
+		.trim()
+		.toLowerCase();
+}
+
+function firstNonEmptyLine(lines: string[], start = 0): { index: number; text: string } | null {
+	for (let i = start; i < lines.length; i++) {
+		const text = lines[i].trim();
+		if (text) return { index: i, text };
+	}
+	return null;
+}
+
+function stripDuplicateLeadingTitle(content: string, title: string): string {
+	const expected = normalizeHeadingText(title);
+	if (!expected || !content.trim()) return content;
+
+	const lines = content.split(/\r?\n/);
+	const first = firstNonEmptyLine(lines);
+	if (!first || normalizeHeadingText(first.text) !== expected) return content;
+
+	const second = firstNonEmptyLine(lines, first.index + 1);
+	const firstIsHeading = /^#{1,6}\s+/.test(first.text);
+	const secondIsSameHeading = !!second && /^#{1,6}\s+/.test(second.text) && normalizeHeadingText(second.text) === expected;
+
+	if (!firstIsHeading && secondIsSameHeading) {
+		return lines.slice(second.index).join("\n").trimStart();
+	}
+
+	return content;
+}
+
+function contentStartsWithTitle(content: string, title: string): boolean {
+	const first = firstNonEmptyLine(content.split(/\r?\n/));
+	return !!first && normalizeHeadingText(first.text) === normalizeHeadingText(title);
+}
+
+function formatFetchedContentForDisplay(item: ExtractedContent): string {
+	const title = item.title?.trim() || "Content";
+	const content = stripDuplicateLeadingTitle(item.content, title);
+	if (!title || contentStartsWithTitle(content, title)) return content;
+	return `# ${title}\n\n${content}`;
+}
+
 function hasFullInlineCoverage(urls: string[], inlineContent: ExtractedContent[] | undefined): boolean {
 	if (!inlineContent || inlineContent.length === 0) return false;
 	const coveredUrls = new Set(inlineContent.map(c => c.url));
@@ -907,8 +955,9 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
+				const output = formatFetchedContentForDisplay(urlData);
 				return {
-					content: [{ type: "text", text: `# ${urlData.title}\n\n${urlData.content}` }],
+					content: [{ type: "text", text: output }],
 					details: { url: urlData.url, title: urlData.title, contentLength: urlData.content.length },
 				};
 			}

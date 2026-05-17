@@ -14,6 +14,11 @@ test("package stays lean and Pi-native", () => {
   assert.ok(!pkg.files.includes("eval/"));
   assert.ok(!pkg.files.includes("test/"));
 
+  assert.match(pkg.description, /Lean Exa-powered/);
+  assert.match(pkg.repository?.url, /github\.com\/feveromo\/pi-web-access/);
+  assert.match(pkg.homepage, /github\.com\/feveromo\/pi-web-access/);
+  assert.match(pkg.bugs?.url, /github\.com\/feveromo\/pi-web-access/);
+
   for (const dep of [
     "@earendil-works/pi-ai",
     "@earendil-works/pi-coding-agent",

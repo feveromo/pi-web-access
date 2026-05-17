@@ -46,6 +46,17 @@ function clampMaxResults(value: unknown): number {
 }
 
 const REQUEST_TIMEOUT_MS = 20000;
+const OPENALEX_BASE_SELECT_FIELDS = [
+	"id",
+	"title",
+	"display_name",
+	"publication_year",
+	"doi",
+	"cited_by_count",
+	"authorships",
+	"primary_location",
+	"open_access",
+];
 
 function requestSignal(signal?: AbortSignal): AbortSignal {
 	const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
@@ -63,6 +74,26 @@ function shouldRethrowAbort(err: unknown, signal?: AbortSignal): boolean {
 function formatSearchError(err: unknown): string {
 	if (err instanceof Error && err.name === "TimeoutError") return `Timed out after ${REQUEST_TIMEOUT_MS / 1000}s`;
 	return err instanceof Error ? err.message : String(err);
+}
+
+function formatSourceError(source: "OpenAlex" | "arXiv", err: unknown): string {
+	return `${source}: ${formatSearchError(err)}`;
+}
+
+function isArxivRateLimit(error: string): boolean {
+	return /arxiv/i.test(error) && (/\b429\b/.test(error) || /rate/i.test(error));
+}
+
+function formatFailureMarkdown(params: PaperSearchParams, errors: string[]): string {
+	if (params.source === "auto") {
+		const primary = errors.find(error => !isArxivRateLimit(error)) ?? errors[0];
+		const lines = [`Paper search temporarily unavailable for "${params.query}".`, `- ${primary}`];
+		if (errors.some(isArxivRateLimit)) {
+			lines.push("", "arXiv fallback was rate-limited; try again later or pass `source: \"openalex\"` to avoid the fallback.");
+		}
+		return lines.join("\n");
+	}
+	return `Paper search failed:\n- ${errors.join("\n- ")}`;
 }
 
 function reconstructAbstract(index: Record<string, number[]> | undefined): string | undefined {
@@ -119,6 +150,10 @@ async function searchOpenAlex(params: PaperSearchParams, signal?: AbortSignal): 
 	const url = new URL("https://api.openalex.org/works");
 	url.searchParams.set("search", params.query);
 	url.searchParams.set("per-page", String(maxResults));
+	url.searchParams.set("select", [
+		...OPENALEX_BASE_SELECT_FIELDS,
+		...(params.includeAbstracts ? ["abstract_inverted_index"] : []),
+	].join(","));
 	const filters = openAlexFilters(params);
 	if (filters) url.searchParams.set("filter", filters);
 
@@ -219,12 +254,15 @@ export async function executePaperSearch(params: PaperSearchParams, signal?: Abo
 	try {
 		let records: PaperRecord[] = [];
 		const errors: string[] = [];
+		const warnings: string[] = [];
 		if (source === "openalex" || source === "auto") {
 			try {
 				records = await searchOpenAlex(normalized, signal);
 			} catch (err) {
 				if (shouldRethrowAbort(err, signal)) throw err;
-				errors.push(formatSearchError(err));
+				const message = formatSourceError("OpenAlex", err);
+				if (source === "openalex") errors.push(message);
+				else warnings.push(message);
 			}
 		}
 		if (source === "arxiv" || (source === "auto" && records.length === 0 && !normalized.openAccessOnly)) {
@@ -232,15 +270,23 @@ export async function executePaperSearch(params: PaperSearchParams, signal?: Abo
 				records = await searchArxiv(normalized, signal);
 			} catch (err) {
 				if (shouldRethrowAbort(err, signal)) throw err;
-				errors.push(formatSearchError(err));
+				const message = formatSourceError("arXiv", err);
+				if (source === "arxiv") errors.push(message);
+				else warnings.push(message);
 			}
 		}
-		if (records.length === 0 && errors.length > 0) {
-			return { content: [{ type: "text", text: `Paper search failed:\n- ${errors.join("\n- ")}` }], details: { query, source, errors } };
+		const allErrors = [...errors, ...warnings];
+		if (records.length === 0 && allErrors.length > 0) {
+			const error = allErrors.join("; ");
+			return { content: [{ type: "text", text: formatFailureMarkdown(normalized, allErrors) }], details: { query, source, count: 0, error, errors: allErrors, warnings } };
 		}
+
+		const warningText = warnings.length > 0
+			? `\n\n_Note: ${warnings.join("; ")}_`
+			: "";
 		return {
-			content: [{ type: "text", text: formatPaperMarkdown(records, normalized) }],
-			details: { query, source, count: records.length, papers: records, errors },
+			content: [{ type: "text", text: formatPaperMarkdown(records, normalized) + warningText }],
+			details: { query, source, count: records.length, papers: records, errors: allErrors, warnings },
 		};
 	} catch (err) {
 		if (shouldRethrowAbort(err, signal)) throw err;
