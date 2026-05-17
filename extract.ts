@@ -153,6 +153,16 @@ const fetchLimit = pLimit(CONCURRENT_LIMIT);
 
 export type ExtractMode = "full" | "highlights" | "summary";
 
+export interface StoredContentRef {
+	version: number;
+	kind: "file";
+	path: string;
+	chars: number;
+	sha256: string;
+	savedAt: number;
+	previewChars: number;
+}
+
 export interface ExtractedContent {
 	url: string;
 	title: string;
@@ -169,6 +179,7 @@ export interface ExtractedContent {
 	truncated?: boolean;
 	fallbackPath?: string[];
 	retrievalStatus?: string;
+	contentRef?: StoredContentRef;
 	metadata?: Record<string, unknown>;
 }
 

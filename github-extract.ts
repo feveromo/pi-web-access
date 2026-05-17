@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, rmSync, statSync, readdirSync, openSync, readSync, closeSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, rmSync, statSync, readdirSync, openSync, readSync, closeSync, realpathSync, type Dirent } from "node:fs";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { extname, join, resolve as resolvePath, sep as pathSep } from "node:path";
@@ -7,6 +7,7 @@ import type { ExtractedContent } from "./extract.js";
 import { checkGhAvailable, checkRepoSize, fetchViaApi, showGhHint } from "./github-api.js";
 
 const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
+const DEFAULT_CLONE_PATH = "/tmp/pi-github-repos";
 
 const BINARY_EXTENSIONS = new Set([
 	".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg", ".tiff", ".tif",
@@ -28,6 +29,7 @@ const NOISE_DIRS = new Set([
 
 const MAX_INLINE_FILE_CHARS = 100_000;
 const MAX_TREE_ENTRIES = 200;
+const CLONE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface GitHubUrlInfo {
 	owner: string;
@@ -76,7 +78,7 @@ function loadGitHubConfig(): GitHubCloneConfig {
 		enabled: true,
 		maxRepoSizeMB: 350,
 		cloneTimeoutSeconds: 30,
-		clonePath: "/tmp/pi-github-repos",
+		clonePath: DEFAULT_CLONE_PATH,
 	};
 
 	if (!existsSync(CONFIG_PATH)) {
@@ -283,6 +285,80 @@ function readTextFile(path: string): string | null {
 		return readFileSync(path, "utf-8");
 	} catch {
 		return null;
+	}
+}
+
+function isDefaultClonePath(clonePath: string): boolean {
+	if (resolvePath(clonePath) !== DEFAULT_CLONE_PATH) return false;
+	try {
+		return !existsSync(clonePath) || realpathSync(clonePath) === DEFAULT_CLONE_PATH;
+	} catch {
+		return false;
+	}
+}
+
+function isPathWithinRoot(rootRealPath: string, candidateRealPath: string): boolean {
+	if (candidateRealPath === rootRealPath) return true;
+	const prefix = rootRealPath.endsWith(pathSep) ? rootRealPath : rootRealPath + pathSep;
+	return candidateRealPath.startsWith(prefix);
+}
+
+function pruneClonePath(config: GitHubCloneConfig): void {
+	if (!isDefaultClonePath(config.clonePath)) return;
+	if (!existsSync(config.clonePath)) return;
+	const now = Date.now();
+	let rootRealPath: string;
+	try {
+		rootRealPath = realpathSync(config.clonePath);
+	} catch {
+		return;
+	}
+
+	let owners: Dirent[];
+	try {
+		owners = readdirSync(config.clonePath, { withFileTypes: true });
+	} catch {
+		return;
+	}
+
+	for (const owner of owners) {
+		if (!owner.isDirectory() || owner.isSymbolicLink()) continue;
+		const ownerPath = join(config.clonePath, owner.name);
+		let ownerRealPath: string;
+		let repos: Dirent[];
+		try {
+			ownerRealPath = realpathSync(ownerPath);
+			if (!isPathWithinRoot(rootRealPath, ownerRealPath)) continue;
+			repos = readdirSync(ownerPath, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+
+		for (const repoDir of repos) {
+			if (!repoDir.isDirectory() || repoDir.isSymbolicLink()) continue;
+			const repoPath = join(ownerPath, repoDir.name);
+			try {
+				const lstat = lstatSync(repoPath);
+				if (!lstat.isDirectory() || lstat.isSymbolicLink()) continue;
+				const repoRealPath = realpathSync(repoPath);
+				if (!isPathWithinRoot(rootRealPath, repoRealPath)) continue;
+				if (now - lstat.mtimeMs > CLONE_CACHE_TTL_MS) {
+					rmSync(repoPath, { recursive: true, force: true });
+				}
+			} catch {
+			}
+		}
+
+		try {
+			const lstat = lstatSync(ownerPath);
+			if (lstat.isDirectory() && !lstat.isSymbolicLink() && readdirSync(ownerPath).length === 0) {
+				const ownerRealPathAfter = realpathSync(ownerPath);
+				if (isPathWithinRoot(rootRealPath, ownerRealPathAfter)) {
+					rmSync(ownerPath, { recursive: true, force: true });
+				}
+			}
+		} catch {
+		}
 	}
 }
 
@@ -622,10 +698,17 @@ export async function extractGitHub(
 	return { url, title, content, error: null };
 }
 
-export function clearCloneCache(): void {
-	for (const entry of cloneCache.values()) {
+export function clearCloneCache(options: { removeFiles?: boolean } = {}): void {
+	if (options.removeFiles === true) {
+		for (const entry of cloneCache.values()) {
+			try {
+				rmSync(entry.localPath, { recursive: true, force: true });
+			} catch {
+			}
+		}
+	} else {
 		try {
-			rmSync(entry.localPath, { recursive: true, force: true });
+			pruneClonePath(loadGitHubConfig());
 		} catch {
 		}
 	}

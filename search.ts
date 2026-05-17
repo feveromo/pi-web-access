@@ -17,6 +17,7 @@ const MAX_SEARCH_CACHE_ENTRIES = 100;
 
 let cachedSearchConfig: { searchProvider: SearchProvider } | null = null;
 const searchCache = new Map<string, { expiresAt: number; response: AttributedSearchResponse }>();
+const inFlightSearches = new Map<string, Promise<AttributedSearchResponse>>();
 
 function getSearchConfig(): { searchProvider: SearchProvider } {
 	if (cachedSearchConfig) return cachedSearchConfig;
@@ -69,6 +70,7 @@ function searchCacheKey(query: string, provider: SearchProvider, options: FullSe
 		maxCharacters: options.maxCharacters,
 		livecrawl: options.livecrawl,
 		synthesize: options.synthesize === true,
+		returnMetadata: options.returnMetadata === true,
 	});
 }
 
@@ -116,21 +118,36 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 	const cached = getCachedSearchResult(cacheKey, options.returnMetadata);
 	if (cached) return cached;
 
-	try {
-		const result = await searchWithExa(query, options);
-		if (result && "exhausted" in result) {
-			throw new Error(
-				"Exa monthly free tier exhausted (1,000 requests). Resets next month. " +
-				"Upgrade at exa.ai/pricing or remove the configured Exa API key to use the zero-config Exa MCP path."
-			);
-		}
-		if (result && "answer" in result) {
-			return storeCachedSearchResult(cacheKey, { ...result, provider: "exa" });
-		}
-		throw new Error(hasExaApiKey() ? "Exa search returned no results." : "Exa MCP search returned no results.");
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		if (message.toLowerCase().includes("abort")) throw err;
-		throw new Error(`Exa search failed: ${message}`);
+	const inFlight = inFlightSearches.get(cacheKey);
+	if (inFlight) {
+		const response = await inFlight;
+		const cloned = cloneSearchResponse(response);
+		if (!options.returnMetadata) delete cloned.metadata;
+		return cloned;
 	}
+
+	const request = (async () => {
+		try {
+			const result = await searchWithExa(query, options);
+			if (result && "exhausted" in result) {
+				throw new Error(
+					"Exa monthly free tier exhausted (1,000 requests). Resets next month. " +
+					"Upgrade at exa.ai/pricing or remove the configured Exa API key to use the zero-config Exa MCP path."
+				);
+			}
+			if (result && "answer" in result) {
+				return storeCachedSearchResult(cacheKey, { ...result, provider: "exa" });
+			}
+			throw new Error(hasExaApiKey() ? "Exa search returned no results." : "Exa MCP search returned no results.");
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			if (message.toLowerCase().includes("abort")) throw err;
+			throw new Error(`Exa search failed: ${message}`);
+		} finally {
+			inFlightSearches.delete(cacheKey);
+		}
+	})();
+
+	inFlightSearches.set(cacheKey, request);
+	return request;
 }
