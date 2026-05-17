@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 - Added `paper_search` for structured scholarly search via OpenAlex with arXiv support/fallback.
 - Added Exa research controls on `web_search`: `researchDepth`, `searchType`, `contentMode`, `maxCharacters`, `livecrawl`, and `synthesize`.
-- Added a Node 22 PDF extraction regression test and `npm test` script.
+- Added parser/error regression tests for `paper_search` plus a Node 22 PDF extraction regression test and `npm test` script.
 
 ### Changed
 - Removed Perplexity and Gemini search/fetch/media paths; web search now routes through Exa only (direct API when keyed, Exa MCP otherwise).
@@ -17,7 +17,12 @@ All notable changes to this project will be documented in this file.
 - Removed the `code_search` wrapper for now because Exa MCP no longer exposes the dedicated code-context tool; use `web_search` with code/doc-specific queries and GitHub fetches for the baseline.
 - Removed the RSC flight-data extractor from the baseline; `fetch_content` now stays on deterministic extraction paths: GitHub, HTTP/Readability, PDF/text, and Jina fallback.
 - Merged relevant upstream baseline fixes through upstream `v0.10.7`: Pi bundled `typebox` import for tool schemas, `unpdf` 1.6.x for Node 22 PDF extraction compatibility, and package/test metadata.
+- Pointed package repository/homepage metadata at this lean fork so package/search surfaces do not default to the removed upstream feature set.
 - Intentionally kept the lean fork removals in place instead of re-adding upstream Gemini/Perplexity, curator, media, and `code_search` paths.
+
+### Fixed
+- Reduced `paper_search` auto-mode noise when OpenAlex is transiently unavailable and arXiv fallback is rate-limited; OpenAlex requests now ask for only the fields this tool displays.
+- Avoided duplicated title headings when `get_search_content` renders stored fetched content that already starts with the same title.
 
 ## [0.10.6] - 2026-04-04
 
