@@ -121,6 +121,22 @@ fetch_content({ url: "https://github.com/reactjs/react.dev" })
 
 Then inspect fetched repos with normal Pi file tools (`read`, `rg`, `bash`) instead of relying on a separate opaque code-search wrapper.
 
+## Local validation
+
+Use these checks before handing off or publishing changes:
+
+```bash
+npm run check
+```
+
+That wraps:
+
+- `npm run syntax` — parses every root `*.ts` file with Node.
+- `npm test` — runs the regression tests.
+- `npm run pack:dry-run` — verifies the packed extension stays small and only ships intended files.
+
+For Pi-runtime confidence after reloading tool schemas, also run the manual regression checklist in `eval/web-access-checklist.md`. If `npm ls` reports missing `@earendil-works/*` or `typebox` peer dependencies in a plain checkout, that is expected: Pi supplies those packages when loading the extension.
+
 ## Long research durability
 
 Long research sessions should stay useful without stuffing giant blobs into Pi's session log.
