@@ -4,7 +4,10 @@
   "description": "Lean Exa-powered web research, URL fetching, GitHub repo cloning, PDF extraction, and scholarly search for Pi coding agent",
   "type": "module",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "syntax": "find . -maxdepth 1 -name '*.ts' -print | sort | xargs -n1 node --check",
+    "pack:dry-run": "npm pack --dry-run",
+    "check": "npm run syntax && npm test && npm run pack:dry-run"
   },
   "keywords": [
     "pi-package",

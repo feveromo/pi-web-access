@@ -8,8 +8,10 @@ All notable changes to this project will be documented in this file.
 - Added `paper_search` for structured scholarly search via OpenAlex with arXiv support/fallback.
 - Added Exa research controls on `web_search`: `researchDepth`, `searchType`, `contentMode`, `maxCharacters`, `livecrawl`, and `synthesize`.
 - Added parser/error regression tests for `paper_search` plus a Node 22 PDF extraction regression test and `npm test` script.
+- Added `npm run syntax`, `npm run pack:dry-run`, and `npm run check` so repeated session-polish validation is one command.
 
 ### Changed
+- Expanded `.gitignore` for local editor/runtime logs and accidental package tarballs.
 - Removed Perplexity and Gemini search/fetch/media paths; web search now routes through Exa only (direct API when keyed, Exa MCP otherwise).
 - Made Exa direct API use `/search` by default for fast source-passage retrieval; Exa `/answer` is now opt-in with `synthesize: true`.
 - Removed video/YouTube frame extraction and media analysis to keep the extension lean, fast, and focused on research/content extraction.

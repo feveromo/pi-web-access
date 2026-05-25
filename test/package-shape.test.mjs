@@ -8,6 +8,11 @@ test("package stays lean and Pi-native", () => {
   assert.deepEqual(pkg.pi?.extensions, ["./index.ts"]);
   assert.deepEqual(pkg.pi?.skills, ["./skills"]);
 
+  assert.equal(pkg.scripts?.test, "node --test");
+  assert.match(pkg.scripts?.syntax ?? "", /node --check/);
+  assert.equal(pkg.scripts?.["pack:dry-run"], "npm pack --dry-run");
+  assert.equal(pkg.scripts?.check, "npm run syntax && npm test && npm run pack:dry-run");
+
   assert.ok(pkg.files.includes("*.ts"));
   assert.ok(pkg.files.includes("skills/"));
   assert.ok(!pkg.files.includes("banner.png"));

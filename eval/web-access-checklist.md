@@ -2,6 +2,13 @@
 
 Run from a Pi session after reloading the extension/tool schemas. These checks exercise the lean Exa/OpenAlex/GitHub/HTTP/PDF paths that this fork intentionally keeps.
 
+## Before manual runs
+
+- [ ] Run `npm run check` from the repo root.
+  - Expect: syntax checks, Node tests, and `npm pack --dry-run` all pass.
+- [ ] Reload the Pi extension/tool schemas before testing live tool behavior.
+  - Expect: the loaded tools reflect the current checkout, not a previous session's extension code.
+
 ## Search
 
 - [ ] Basic search: `web_search({ query: "OpenAI official web search docs", numResults: 3 })`
