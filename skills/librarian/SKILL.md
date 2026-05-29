@@ -24,9 +24,9 @@ Before doing anything, classify the request to pick the right research strategy.
 
 | Type | Trigger | Primary Approach |
 |------|---------|-----------------|
-| **Conceptual** | "How do I use X?", "Best practice for Y?" | web_search + fetch_content (README/docs) |
-| **Scholarly** | papers, research literature, citations, methods comparisons | paper_search + web_search for context |
-| **Implementation** | "How does X implement Y?", "Show me the source" | fetch_content (clone) + code search |
+| **Conceptual** | "How do I use X?", "Best practice for Y?" | docs_search + fetch_content; web_search for broader context |
+| **Scholarly** | papers, research literature, citations, methods comparisons | paper_search + paper_research; fetch_content/read_paper for full evidence |
+| **Implementation** | "How does X implement Y?", "Show me the source" | github_examples for examples, fetch_content clone + code search for internals |
 | **Context/History** | "Why was this changed?", "History of X?" | git log + git blame + issue/PR search |
 | **Comprehensive** | Complex or ambiguous requests, "deep dive" | All of the above |
 
@@ -36,9 +36,11 @@ Before doing anything, classify the request to pick the right research strategy.
 
 Batch these in one turn:
 
-1. **web_search**: `"library-name topic"` via the configured search provider for recent articles and discussions
-2. **fetch_content**: the library's GitHub repo URL to clone/check README, docs, examples, and file paths
-3. For scientific/library research papers, use **paper_search** first to gather DOI/PDF/citation metadata.
+1. **docs_search**: official docs or `llms.txt` for the library/API when available.
+2. **github_examples**: find current examples/tutorials/notebooks in official repos before guessing call patterns.
+3. **web_search**: `"library-name topic"` via the configured search provider for recent articles and discussions when official docs/examples are not enough.
+4. **fetch_content**: exact docs pages or the library's GitHub repo URL to clone/check README, docs, examples, and file paths.
+5. For scientific/library research papers, use **paper_search** or **paper_research** first to gather DOI/PDF/citation metadata, topic maps, related work, and paper sections.
 
 Synthesize web results + repo docs. Cite official documentation and link to relevant source files.
 
@@ -52,7 +54,7 @@ The core workflow -- clone, find, permalink:
 4. Get the commit SHA: `cd /tmp/pi-github-repos/owner/repo && git rev-parse HEAD`
 5. Construct permalink: `https://github.com/owner/repo/blob/<sha>/path/to/file#L10-L20`
 
-Batch the initial calls: fetch_content (clone) + web_search (recent discussions) in one turn. Then dig into the clone with grep/read once it's available.
+Batch the initial calls when independent: docs_search or github_examples + fetch_content (clone) + web_search (recent discussions) in one turn. Then dig into the clone with grep/read once it's available.
 
 ### Context/History Questions
 
@@ -95,9 +97,11 @@ gh api repos/owner/repo/releases --jq '.[0:5] | .[].tag_name'
 
 Combine everything. Batch these in one turn:
 
-1. **web_search**: recent articles and discussions
-2. **fetch_content**: clone the repo (or multiple repos if comparing)
-3. **bash**: `gh search issues "keyword" --repo owner/repo --limit 10 & gh search prs "keyword" --repo owner/repo --state merged --limit 10 & wait`
+1. **docs_search** / **openapi_search**: official docs or REST endpoint details when relevant.
+2. **github_examples**: current examples/tutorials/notebooks/cookbooks.
+3. **web_search**: recent articles and discussions.
+4. **fetch_content**: clone the repo (or multiple repos if comparing).
+5. **bash**: `gh search issues "keyword" --repo owner/repo --limit 10 & gh search prs "keyword" --repo owner/repo --state merged --limit 10 & wait`
 
 Then dig into the clone with grep, read, git blame, git log as needed.
 
@@ -149,6 +153,7 @@ For conceptual answers, link to official docs and relevant source files. For imp
 | File not found in clone | Branch name with slashes may have misresolved; list the repo tree and navigate manually |
 | Uncertain about implementation | State your uncertainty explicitly, propose a hypothesis, show what evidence you did find |
 | Page returns 403/bot block | Try `web_search` for alternate sources or fetch a raw/official URL |
+| docs/API/example lookup is inconclusive | Fall back to `web_search` and `fetch_content` authoritative pages; state the gap |
 | web_search fails | Check Exa config; try explicit `provider: "exa"` |
 
 ## Guidelines

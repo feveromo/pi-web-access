@@ -4,11 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.10.8] - 2026-05-29
+
 ### Added
+- Added `paper_research` as a no-key OpenAlex/arXiv/Hugging Face research flow: topic maps, citation graphs, abstract search, related works, arXiv section reading, and paper-linked HF datasets/models.
+- Added `docs_search` for official docs and `llms.txt` indexing, plus `openapi_search` for OpenAPI endpoint discovery with curl examples.
+- Added `github_examples` for GitHub API-based example discovery and remote file-range reads without cloning; it can use `GITHUB_TOKEN` or private config `githubToken` for higher API limits.
+- Added an `internet-research` skill that teaches the Pi-native evidence-first workflow across web, papers, docs, OpenAPI, GitHub examples, and fetch tools.
 - Added `paper_search` for structured scholarly search via OpenAlex with arXiv support/fallback.
 - Added Exa research controls on `web_search`: `researchDepth`, `searchType`, `contentMode`, `maxCharacters`, `livecrawl`, and `synthesize`.
 - Added parser/error regression tests for `paper_search` plus a Node 22 PDF extraction regression test and `npm test` script.
-- Added `npm run syntax`, `npm run pack:dry-run`, and `npm run check` so repeated session-polish validation is one command.
+- Added `npm run syntax`, `npm run pack:dry-run`, `npm run scan:sensitive`, and `npm run check` so repeated session-polish validation is one command with a targeted residue scan.
 
 ### Changed
 - Expanded `.gitignore` for local editor/runtime logs and accidental package tarballs.
@@ -23,6 +29,12 @@ All notable changes to this project will be documented in this file.
 - Intentionally kept the lean fork removals in place instead of re-adding upstream Gemini/Perplexity, curator, media, and `code_search` paths.
 
 ### Fixed
+- Fixed `paper_research` arXiv-to-OpenAlex resolution so arXiv-driven operations only bind to verified matching OpenAlex works instead of first title-search candidates.
+- Fixed `paper_research` Hugging Face linked-resource output to display collection titles/slugs and avoid counting failed resource category lookups as successful results.
+- Fixed `github_examples` large-file reads by falling back to raw GitHub content when the Contents API reports `encoding: "none"`.
+- Fixed `github_examples` repository-tree truncation reporting and branch/ref metadata so users and programmatic callers can tell when discovery may be incomplete.
+- Fixed `docs_search` query-biased cache reuse and heading-only snippet selection.
+- Fixed `openapi_search` curl examples to include path-item parameters as well as operation-level parameters.
 - Reduced `paper_search` auto-mode noise when OpenAlex is transiently unavailable and arXiv fallback is rate-limited; OpenAlex requests now ask for only the fields this tool displays.
 - Avoided duplicated title headings when `get_search_content` renders stored fetched content that already starts with the same title.
 
