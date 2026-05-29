@@ -9,9 +9,9 @@ This fork removes the heavier/less predictable parts of the original extension:
 - **No curator UI** — `web_search` returns results directly. No browser page, no summary-review workflow, no `/curator`, no `/websearch`.
 - **No background follow-up turns** — if `includeContent` is requested, content is fetched/stored before the tool returns.
 - **Exa-only web search** — direct Exa API when configured, otherwise Exa MCP fallback.
-- **No Gemini / Perplexity paths** — fewer auth modes, fewer fallbacks, less latency variance.
+- **No legacy multi-provider paths** — fewer auth modes, fewer fallbacks, less latency variance.
 - **No video / YouTube / frame extraction** — this is research/content extraction only.
-- **No `code_search` wrapper** — use `web_search` for docs/examples and `fetch_content` for GitHub repos/files.
+- **No opaque `code_search` wrapper** — use explicit `docs_search`, `openapi_search`, `github_examples`, and `fetch_content` flows for docs/API/code evidence.
 - **No RSC custom parser** — Readability first, then Jina Reader fallback for difficult pages.
 
 The goal is a clean baseline: small surface area, fewer surprises, and easier quality measurement.
@@ -101,25 +101,69 @@ paper_search({ query: "diffusion models", source: "arxiv", maxResults: 5 })
 | `openAccessOnly` | Limit OpenAlex results to open-access papers |
 | `includeAbstracts` | Include abstracts when available |
 
+### `paper_research`
+
+No-key literature navigation via OpenAlex, arXiv/ar5iv HTML, and Hugging Face paper resources.
+
+```ts
+paper_research({ operation: "search", query: "RAG evaluation", minCitations: 25, sortBy: "citationCount" })
+paper_research({ operation: "map_topic", query: "RAG evaluation", maxResults: 3 })
+paper_research({ operation: "citation_graph", openAlexId: "W1234567890", direction: "citations" })
+paper_research({ operation: "read_paper", arxivId: "2401.00001", section: "3" })
+paper_research({ operation: "abstract_search", query: "RAG faithfulness benchmark" })
+paper_research({ operation: "linked_resources", arxivId: "2401.00001" })
+```
+
+Key operations: `search`, `map_topic`, `trending`, `details`, `read_paper`, `citation_graph`, `abstract_search`, `related`, `linked_resources`.
+
+### `docs_search`
+
+Search official documentation roots and `llms.txt` indexes with a lightweight in-memory page index.
+
+```ts
+docs_search({ source: "react.dev/reference/react", query: "useEffect cleanup" })
+docs_search({ source: "https://docs.example.com/llms.txt", query: "authentication", maxPages: 80 })
+```
+
+Use `fetch_content` on a result URL when you need the full docs page.
+
+### `openapi_search`
+
+Search OpenAPI JSON specs and return endpoint details with curl examples. Defaults to the Hugging Face OpenAPI spec when `url` is omitted.
+
+```ts
+openapi_search({ query: "upload file" })
+openapi_search({ url: "https://api.example.com/openapi.json", query: "create webhook" })
+```
+
+### `github_examples`
+
+Find and read current examples/tutorials/notebooks/cookbook files in GitHub repos without cloning first.
+
+```ts
+github_examples({ operation: "find", repo: "huggingface/trl", keyword: "sft" })
+github_examples({ operation: "read", repo: "huggingface/trl", path: "examples/scripts/sft.py", lineStart: 1, lineEnd: 180 })
+```
+
 ## Recommended workflow
 
-1. Use `web_search` with 2–4 meaningfully different queries. Independent query searches run with small bounded concurrency for speed without API stampedes.
-2. Prefer official docs/source domains with `domainFilter` when accuracy matters.
-3. Use `includeContent: true` only when source text matters immediately.
-4. Use `fetch_content` for selected pages, GitHub repos/files, and PDFs.
-5. Use `get_search_content` when inline output was truncated or content was stored.
+1. Use `web_search` with 2–4 meaningfully different queries for broad discovery. Independent query searches run with small bounded concurrency for speed without API stampedes.
+2. Prefer `docs_search` / `openapi_search` for official API details, then `fetch_content` the exact docs pages you need.
+3. Prefer `github_examples` before writing code against fast-moving libraries; read the exact example file/range that matches the task.
+4. Prefer `paper_search` for quick scholarly discovery and `paper_research` when you need OpenAlex citation graphs/topic maps, paper sections, abstract snippets, related works, or linked HF resources.
+5. Use `includeContent: true` only when source text matters immediately.
+6. Use `fetch_content` for selected pages, GitHub repos/files, and PDFs.
+7. Use `get_search_content` when inline output was truncated or content was stored.
 
 For code questions, the baseline approach is explicit:
 
 ```ts
-web_search({ queries: [
-  "React useEffect cleanup official docs",
-  "React useEffect cleanup fetch ignore example"
-] })
-fetch_content({ url: "https://github.com/reactjs/react.dev" })
+docs_search({ source: "react.dev/reference/react", query: "useEffect cleanup" })
+github_examples({ operation: "find", repo: "reactjs/react.dev", keyword: "useEffect" })
+fetch_content({ url: "https://react.dev/reference/react/useEffect" })
 ```
 
-Then inspect fetched repos with normal Pi file tools (`read`, `rg`, `bash`) instead of relying on a separate opaque code-search wrapper.
+Then inspect fetched repos/pages with normal Pi file tools (`read`, `rg`, `bash`) or `github_examples({ operation: "read" })` for remote file ranges instead of relying on an opaque code-search wrapper.
 
 ## Local validation
 
@@ -133,6 +177,7 @@ That wraps:
 
 - `npm run syntax` — parses every root `*.ts` file with Node.
 - `npm test` — runs the regression tests.
+- `npm run scan:sensitive` — scans changed/untracked files for common credential patterns, private local paths, and accidental personal identifiers.
 - `npm run pack:dry-run` — verifies the packed extension stays small and only ships intended files.
 
 For Pi-runtime confidence after reloading tool schemas, also run the manual regression checklist in `eval/web-access-checklist.md`. If `npm ls` reports missing `@earendil-works/*` or `typebox` peer dependencies in a plain checkout, that is expected: Pi supplies those packages when loading the extension.
@@ -166,6 +211,7 @@ Config lives at `~/.pi/web-search.json` and every field is optional.
 ```json
 {
   "exaApiKey": "exa-...",
+  "githubToken": "github_pat_...",
   "provider": "exa",
   "githubClone": {
     "enabled": true,
@@ -179,7 +225,9 @@ Config lives at `~/.pi/web-search.json` and every field is optional.
 }
 ```
 
-`EXA_API_KEY` env var takes precedence over `exaApiKey`. If no Exa key is configured, the extension uses Exa MCP fallback.
+`EXA_API_KEY` env var takes precedence over `exaApiKey`. If no Exa key is configured, the extension uses Exa MCP fallback. `GITHUB_TOKEN` takes precedence over `githubToken`; either one raises GitHub API limits for `github_examples`. No scholarly API key is required: `paper_research` uses OpenAlex, arXiv/ar5iv, and Hugging Face public endpoints.
+
+Keep `~/.pi/web-search.json` private (`chmod 600 ~/.pi/web-search.json`) and never commit it. If a key is pasted into chat, shell history, logs, or a public issue, rotate it with the provider even if the repository scan is clean.
 
 ## Commands and UI
 
@@ -190,11 +238,12 @@ There is intentionally no curator/browser UI in this fork.
 
 ## Current limitations
 
-- No Gemini, Perplexity, video, YouTube, or media analysis.
-- No dedicated code-search endpoint. Use `web_search` + GitHub `fetch_content` instead.
+- No legacy multi-provider search stack, video, YouTube, or media analysis.
+- No opaque dedicated code-search endpoint. Use `docs_search`, `openapi_search`, `github_examples`, `web_search`, and GitHub `fetch_content` explicitly.
 - No custom RSC parser. Readability and Jina handle the baseline extraction path.
 - PDF extraction is text-only; scanned PDFs need OCR elsewhere.
 - Some sites block HTTP/Jina extraction; use `web_search` to find alternate sources or fetch raw/official URLs.
+- `docs_search` discovery is intentionally shallow and bounded: `auto` prefers `llms.txt`, while `crawl` follows same-site links from the source page rather than recursively spidering an entire docs site.
 
 ## Active source files
 
@@ -208,6 +257,9 @@ There is intentionally no curator/browser UI in this fork.
 | `github-api.ts` | GitHub API fallback for large repos and commit/blob views |
 | `pdf-extract.ts` | PDF text extraction to markdown |
 | `paper-search.ts` | OpenAlex/arXiv scholarly search |
+| `paper-research.ts` | OpenAlex topic maps/citation graphs/related works, arXiv section reading, and HF paper resources |
+| `docs-research.ts` | Documentation/llms.txt indexing and OpenAPI endpoint search |
+| `github-examples.ts` | GitHub API example discovery and remote file-range reads |
 | `storage.ts` | Session-aware result storage with disk-backed large-content references |
 | `activity.ts` | Request activity tracking widget |
 | `search-types.ts` | Shared search option/result types |

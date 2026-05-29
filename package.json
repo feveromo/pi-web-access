@@ -1,13 +1,14 @@
 {
   "name": "pi-web-access",
-  "version": "0.10.7",
-  "description": "Lean Exa-powered web research, URL fetching, GitHub repo cloning, PDF extraction, and scholarly search for Pi coding agent",
+  "version": "0.10.8",
+  "description": "Lean Exa-powered web research, docs/API search, GitHub examples, URL fetching, PDF extraction, and scholarly research for Pi coding agent",
   "type": "module",
   "scripts": {
     "test": "node --test",
     "syntax": "find . -maxdepth 1 -name '*.ts' -print | sort | xargs -n1 node --check",
     "pack:dry-run": "npm pack --dry-run",
-    "check": "npm run syntax && npm test && npm run pack:dry-run"
+    "scan:sensitive": "node scripts/scan-sensitive.mjs",
+    "check": "npm run syntax && npm test && npm run scan:sensitive && npm run pack:dry-run"
   },
   "keywords": [
     "pi-package",
@@ -31,6 +32,7 @@
   "files": [
     "*.ts",
     "skills/",
+    "scripts/scan-sensitive.mjs",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"

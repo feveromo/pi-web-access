@@ -2,6 +2,11 @@ node_modules/
 bun.lock
 .pi/
 
+# Local secrets/config
+.env
+.env.*
+!.env.example
+
 # Local editor/runtime noise
 .vscode/
 .DS_Store

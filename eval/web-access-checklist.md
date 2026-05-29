@@ -1,6 +1,6 @@
 # Web Access Manual Regression Checklist
 
-Run from a Pi session after reloading the extension/tool schemas. These checks exercise the lean Exa/OpenAlex/GitHub/HTTP/PDF paths that this fork intentionally keeps.
+Run from a Pi session after reloading the extension/tool schemas. These checks exercise the lean Exa/OpenAlex/arXiv/Hugging Face/docs/OpenAPI/GitHub/HTTP/PDF paths that this fork intentionally keeps.
 
 ## Before manual runs
 
@@ -39,12 +39,31 @@ Run from a Pi session after reloading the extension/tool schemas. These checks e
 - [ ] JS-heavy fallback: fetch a known SPA or blocked page with `returnMetadata: true`.
   - Expect: `fallbackPath` showing HTTP/Jina attempts; final method indicates the successful fallback or clear error guidance.
 
-## Paper Search
+## Paper Search / Research
 
 - [ ] OpenAlex: `paper_search({ query: "retrieval augmented generation evaluation", includeAbstracts: true, maxResults: 5 })`
   - Expect: titles, authors, years, citations/open-access metadata when available.
 - [ ] arXiv: `paper_search({ query: "diffusion model sampling", source: "arxiv", maxResults: 5 })`
   - Expect: arXiv records with PDF links when available.
+- [ ] OpenAlex deep search: `paper_research({ operation: "search", query: "retrieval augmented generation evaluation", minCitations: 25, sortBy: "citationCount", maxResults: 5 })`
+  - Expect: citation counts, OpenAlex IDs, DOI/PDF/arXiv metadata when available, abstracts, and next-step guidance.
+- [ ] Topic map: `paper_research({ operation: "map_topic", query: "retrieval augmented generation evaluation", maxResults: 3 })`
+  - Expect: anchor papers plus compact downstream/related branches.
+- [ ] Citation graph: call `paper_research({ operation: "citation_graph", openAlexId: "<OpenAlex id from previous result>", direction: "citations", maxResults: 5 })`.
+  - Expect: references and/or downstream citations from OpenAlex.
+- [ ] Paper section: call `paper_research({ operation: "read_paper", arxivId: "<id>", section: "3" })`.
+  - Expect: methodology/section text or clear fallback if arXiv HTML is unavailable.
+
+## Docs / API / GitHub Examples
+
+- [ ] Docs search: `docs_search({ source: "react.dev/reference/react", query: "useEffect cleanup", maxResults: 5 })`
+  - Expect: indexed page count, ranked docs URLs, and concise snippets.
+- [ ] OpenAPI search: `openapi_search({ query: "upload file", maxResults: 5 })`
+  - Expect: endpoint method/path, parameters, and curl examples from the HF OpenAPI spec.
+- [ ] GitHub examples: `github_examples({ operation: "find", repo: "huggingface/trl", keyword: "sft", maxResults: 5 })`
+  - Expect: example paths and copyable `github_examples({ operation: "read", ... })` calls.
+- [ ] GitHub read: use one returned file with `github_examples({ operation: "read", repo: "huggingface/trl", path: "<path>", lineStart: 1, lineEnd: 120 })`.
+  - Expect: bounded file content with line range metadata.
 
 ## General expectations
 

@@ -7,6 +7,9 @@ import { fetchAllContent, type ExtractedContent, type ExtractOptions } from "./e
 import { clearCloneCache } from "./github-extract.js";
 import { search, type SearchProvider } from "./search.js";
 import { executePaperSearch } from "./paper-search.js";
+import { executePaperResearch } from "./paper-research.js";
+import { executeDocsSearch, executeOpenApiSearch } from "./docs-research.js";
+import { executeGitHubExamples } from "./github-examples.js";
 import type { SearchResult } from "./search-types.js";
 import {
 	clearResults,
@@ -671,6 +674,181 @@ export default function (pi: ExtensionAPI) {
 			if (!expanded) return new Text(summary, 0, 0);
 			const textContent = result.content.find((c) => c.type === "text")?.text || "";
 			const preview = textContent.length > 700 ? textContent.slice(0, 700) + "..." : textContent;
+			return new Text(summary + "\n" + theme.fg("dim", preview), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "paper_research",
+		label: "Paper Research",
+		description: "No-key deep scholarly research via OpenAlex, arXiv/ar5iv HTML, and Hugging Face paper resources. Use after paper_search when you need citation graphs, methodology sections, abstract claim search, related works, topic maps, or linked HF datasets/models.",
+		promptSnippet:
+			"Use for deep no-key scholarly research: OpenAlex citation graphs/topic maps, arXiv paper sections, abstract search, related works, and HF-linked resources.",
+		promptGuidelines: [
+			"Use paper_research for literature-backed research after paper_search finds candidate papers; prefer citation_graph, map_topic, related, and read_paper over broad web search when methodology/results matter.",
+		],
+		parameters: Type.Object({
+			operation: StringEnum(["search", "map_topic", "trending", "details", "read_paper", "citation_graph", "abstract_search", "related", "linked_resources"], { description: "Research operation to run" }),
+			query: Type.Optional(Type.String({ description: "Search/topic/abstract query. Required for search, map_topic, and abstract_search; optional topic filter for trending." })),
+			arxivId: Type.Optional(Type.String({ description: "arXiv ID or URL for read_paper/linked_resources/details/citation_graph/related when available" })),
+			doi: Type.Optional(Type.String({ description: "DOI for details/citation_graph/related" })),
+			openAlexId: Type.Optional(Type.String({ description: "OpenAlex work ID such as W1234567890 or https://openalex.org/W1234567890" })),
+			paperId: Type.Optional(Type.String({ description: "Convenience paper identifier: OpenAlex ID/URL, DOI/doi URL, or arXiv ID/URL" })),
+			section: Type.Optional(Type.String({ description: "Section name or number for read_paper, e.g. '3', 'Method', '4.2'" })),
+			direction: Type.Optional(StringEnum(["citations", "references", "both"], { description: "OpenAlex citation graph direction (default both)" })),
+			date: Type.Optional(Type.String({ description: "YYYY-MM-DD for Hugging Face trending papers" })),
+			yearFrom: Type.Optional(Type.Integer({ description: "Minimum publication year for OpenAlex search/abstract_search" })),
+			yearTo: Type.Optional(Type.Integer({ description: "Maximum publication year for OpenAlex search/abstract_search" })),
+			openAccessOnly: Type.Optional(Type.Boolean({ description: "Limit OpenAlex search to open-access works" })),
+			minCitations: Type.Optional(Type.Integer({ description: "Client-side minimum citation count for OpenAlex search/abstract_search" })),
+			sortBy: Type.Optional(StringEnum(["relevance", "citationCount", "publicationDate"], { description: "OpenAlex search sort" })),
+			maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "Maximum returned papers/resources (default 10, max 50)" })),
+			resourceSort: Type.Optional(StringEnum(["downloads", "likes", "trending"], { description: "Sort for linked_resources datasets/models" })),
+			includeAbstracts: Type.Optional(Type.Boolean({ description: "Include OpenAlex abstracts where available" })),
+		}),
+
+		async execute(_toolCallId, params, signal) {
+			return executePaperResearch(params, signal);
+		},
+
+		renderCall(args, theme) {
+			const input = args as { operation?: string; query?: string; arxivId?: string; paperId?: string };
+			const target = input.query || input.arxivId || input.paperId || "";
+			const display = target.length > 54 ? target.slice(0, 51) + "..." : target;
+			return new Text(theme.fg("toolTitle", theme.bold("paper_research ")) + theme.fg("accent", input.operation || "?") + (display ? theme.fg("muted", ` ${display}`) : ""), 0, 0);
+		},
+
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as { count?: number; error?: string; operation?: string; sectionCount?: number; referencesCount?: number; citationsCount?: number };
+			if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
+			let summary = theme.fg("success", `${details?.operation ?? "paper_research"}`);
+			if (details?.count != null) summary += theme.fg("muted", ` · ${details.count} result(s)`);
+			if (details?.sectionCount != null) summary += theme.fg("muted", ` · ${details.sectionCount} sections`);
+			if (details?.referencesCount != null || details?.citationsCount != null) summary += theme.fg("muted", ` · ${details.referencesCount ?? 0} refs/${details.citationsCount ?? 0} cites`);
+			if (!expanded) return new Text(summary, 0, 0);
+			const textContent = result.content.find((c) => c.type === "text")?.text || "";
+			const preview = textContent.length > 900 ? textContent.slice(0, 900) + "..." : textContent;
+			return new Text(summary + "\n" + theme.fg("dim", preview), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "docs_search",
+		label: "Docs Search",
+		description: "Discover and search documentation sites, llms.txt indexes, and markdown docs pages with a lightweight in-memory index. Use for current API/library docs before fetching full pages.",
+		promptSnippet:
+			"Use to search official docs/llms.txt indexes before broad web search; follow with fetch_content on selected URLs.",
+		promptGuidelines: [
+			"Use docs_search for official documentation lookups; use fetch_content on a docs_search result URL when exact API details or examples are needed.",
+		],
+		parameters: Type.Object({
+			source: Type.String({ description: "Docs root URL/domain or llms.txt URL, e.g. react.dev/reference/react or https://docs.example.com/llms.txt" }),
+			query: Type.Optional(Type.String({ description: "Keyword query to rank docs pages. Omit to list discovered pages." })),
+			maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 25, description: "Max results to return (default 10, max 25)" })),
+			maxPages: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max docs pages to fetch/index (default 40, max 100)" })),
+			mode: Type.Optional(StringEnum(["auto", "llms", "crawl"], { description: "Discovery mode: auto tries llms.txt then root-page links; llms only uses llms.txt; crawl follows same-site links from the source page" })),
+			maxCharacters: Type.Optional(Type.Integer({ minimum: 1, maximum: 3000, description: "Max snippet characters per result" })),
+			returnMetadata: Type.Optional(Type.Boolean({ description: "Include indexed page metadata in details" })),
+		}),
+
+		async execute(_toolCallId, params, signal) {
+			return executeDocsSearch(params, signal);
+		},
+
+		renderCall(args, theme) {
+			const input = args as { source?: string; query?: string };
+			const source = input.source || "(no source)";
+			const display = source.length > 52 ? source.slice(0, 49) + "..." : source;
+			return new Text(theme.fg("toolTitle", theme.bold("docs_search ")) + theme.fg("accent", display) + (input.query ? theme.fg("muted", ` · ${input.query}`) : ""), 0, 0);
+		},
+
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as { count?: number; error?: string; pagesIndexed?: number };
+			if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
+			const summary = theme.fg("success", `${details?.count ?? 0} docs result(s)`) + theme.fg("muted", ` · ${details?.pagesIndexed ?? 0} pages indexed`);
+			if (!expanded) return new Text(summary, 0, 0);
+			const textContent = result.content.find((c) => c.type === "text")?.text || "";
+			const preview = textContent.length > 900 ? textContent.slice(0, 900) + "..." : textContent;
+			return new Text(summary + "\n" + theme.fg("dim", preview), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "openapi_search",
+		label: "OpenAPI Search",
+		description: "Search an OpenAPI JSON spec for REST endpoints and return endpoint details plus curl examples. Defaults to the Hugging Face OpenAPI spec when url is omitted.",
+		promptSnippet:
+			"Use to find REST API endpoints in an OpenAPI spec with parameters and curl examples.",
+		parameters: Type.Object({
+			url: Type.Optional(Type.String({ description: "OpenAPI JSON URL. Defaults to https://huggingface.co/.well-known/openapi.json" })),
+			query: Type.Optional(Type.String({ description: "Keyword search across summaries, descriptions, operation IDs, paths, tags, and parameters" })),
+			tag: Type.Optional(Type.String({ description: "Filter by exact OpenAPI tag" })),
+			maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 25, description: "Max endpoints to return (default 10, max 25)" })),
+		}),
+
+		async execute(_toolCallId, params, signal) {
+			return executeOpenApiSearch(params, signal);
+		},
+
+		renderCall(args, theme) {
+			const input = args as { query?: string; tag?: string; url?: string };
+			const target = input.query || input.tag || input.url || "huggingface openapi";
+			const display = target.length > 60 ? target.slice(0, 57) + "..." : target;
+			return new Text(theme.fg("toolTitle", theme.bold("openapi_search ")) + theme.fg("accent", display), 0, 0);
+		},
+
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as { count?: number; error?: string; totalEndpoints?: number };
+			if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
+			const summary = theme.fg("success", `${details?.count ?? 0} endpoint(s)`) + theme.fg("muted", ` · ${details?.totalEndpoints ?? 0} indexed`);
+			if (!expanded) return new Text(summary, 0, 0);
+			const textContent = result.content.find((c) => c.type === "text")?.text || "";
+			const preview = textContent.length > 900 ? textContent.slice(0, 900) + "..." : textContent;
+			return new Text(summary + "\n" + theme.fg("dim", preview), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "github_examples",
+		label: "GitHub Examples",
+		description: "Find and read working example scripts, notebooks, tutorials, cookbook files, and guides in GitHub repositories using the GitHub API. Use before implementing against a fast-moving library API.",
+		promptSnippet:
+			"Use to discover and read current GitHub example files with fuzzy keyword/path ranking and line ranges.",
+		promptGuidelines: [
+			"Use github_examples before writing code against a library whose current API matters: find examples first, then read selected files with operation='read'.",
+		],
+		parameters: Type.Object({
+			operation: Type.Optional(StringEnum(["find", "read"], { description: "find example files (default) or read a specific file" })),
+			repo: Type.String({ description: "Repository as owner/name or GitHub URL" }),
+			keyword: Type.Optional(Type.String({ description: "Keyword to rank paths, e.g. sft, auth, streaming, websocket" })),
+			path: Type.Optional(Type.String({ description: "File path to read when operation='read'" })),
+			ref: Type.Optional(Type.String({ description: "Branch, tag, or commit/ref. Defaults to repo default branch for find and HEAD for read." })),
+			maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "Max results for find (default 12, max 50)" })),
+			minScore: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Minimum path score for find" })),
+			lineStart: Type.Optional(Type.Integer({ minimum: 1, description: "First line to read (1-indexed)" })),
+			lineEnd: Type.Optional(Type.Integer({ minimum: 1, description: "Last line to read (inclusive)" })),
+		}),
+
+		async execute(_toolCallId, params, signal) {
+			return executeGitHubExamples(params, signal);
+		},
+
+		renderCall(args, theme) {
+			const input = args as { operation?: string; repo?: string; keyword?: string; path?: string };
+			const target = input.path || input.keyword || input.repo || "";
+			const display = target.length > 58 ? target.slice(0, 55) + "..." : target;
+			return new Text(theme.fg("toolTitle", theme.bold("github_examples ")) + theme.fg("accent", input.operation || "find") + (display ? theme.fg("muted", ` ${display}`) : ""), 0, 0);
+		},
+
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as { count?: number; error?: string; operation?: string; totalCandidates?: number; totalLines?: number; truncated?: boolean };
+			if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
+			let summary = theme.fg("success", details?.operation === "read" ? `${details.totalLines ?? 0} lines` : `${details?.count ?? 0} example(s)`);
+			if (details?.totalCandidates != null) summary += theme.fg("muted", ` · ${details.totalCandidates} candidates`);
+			if (details?.truncated) summary += theme.fg("warning", " · truncated");
+			if (!expanded) return new Text(summary, 0, 0);
+			const textContent = result.content.find((c) => c.type === "text")?.text || "";
+			const preview = textContent.length > 900 ? textContent.slice(0, 900) + "..." : textContent;
 			return new Text(summary + "\n" + theme.fg("dim", preview), 0, 0);
 		},
 	});
