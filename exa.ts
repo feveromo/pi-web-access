@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { activityMonitor } from "./activity.js";
 import type { ExtractedContent } from "./extract.js";
 import type { SearchOptions, SearchResponse } from "./search-types.js";
+import { isProbablyBinarySearchText, sanitizeSearchText } from "./search-text.js";
 
 const EXA_ANSWER_URL = "https://api.exa.ai/answer";
 const EXA_SEARCH_URL = "https://api.exa.ai/search";
@@ -278,16 +279,29 @@ function dedupeResults<T extends { url?: string }>(results: T[] | undefined): T[
 }
 
 function cleanSnippet(value: string, maxLength = 1000): string {
-	const normalized = value.replace(/\s+/g, " ").trim();
+	const normalized = sanitizeSearchText(value);
 	return normalized.length > maxLength ? `${normalized.slice(0, maxLength).trimEnd()}…` : normalized;
 }
 
 function resultSnippet(item: ExaResultItem | ExaCitationItem): string {
-	if (typeof item.summary === "string" && item.summary.trim()) return cleanSnippet(item.summary);
-	const highlights = "highlights" in item ? normalizeHighlights(item.highlights) : [];
-	if (highlights.length > 0) return cleanSnippet(highlights.join(" "));
-	if (typeof item.text === "string" && item.text.trim()) return cleanSnippet(item.text);
+	const candidates = [
+		typeof item.summary === "string" ? item.summary : "",
+		"highlights" in item ? normalizeHighlights(item.highlights).join(" ") : "",
+		typeof item.text === "string" ? item.text : "",
+	];
+	for (const candidate of candidates) {
+		const snippet = cleanSnippet(candidate);
+		if (snippet) return snippet;
+	}
 	return "";
+}
+
+function sourceAttribution(item: ExaResultItem | ExaCitationItem, fallbackTitle: string): string {
+	const sourceTitle = item.title || fallbackTitle;
+	const date = typeof item.publishedDate === "string" && item.publishedDate.trim()
+		? `, published ${item.publishedDate.trim()}`
+		: "";
+	return `${sourceTitle}${date} (${item.url})`;
 }
 
 function buildAnswerFromSearchResults(results: ExaSearchResponse["results"]): string {
@@ -299,8 +313,7 @@ function buildAnswerFromSearchResults(results: ExaSearchResponse["results"]): st
 		if (!item.url) continue;
 		const snippet = resultSnippet(item);
 		if (!snippet) continue;
-		const sourceTitle = item.title || `Source ${i + 1}`;
-		parts.push(`${snippet}\nSource: ${sourceTitle} (${item.url})`);
+		parts.push(`${snippet}\nSource: ${sourceAttribution(item, `Source ${i + 1}`)}`);
 	}
 	return parts.join("\n\n");
 }
@@ -311,7 +324,13 @@ function mapResults(results: ExaSearchResponse["results"] | ExaAnswerResponse["c
 		title: item.title || `Source ${index + 1}`,
 		url: item.url!,
 		snippet: resultSnippet(item),
+		...(typeof item.publishedDate === "string" && item.publishedDate.trim() ? { publishedDate: item.publishedDate.trim() } : {}),
 	}));
+}
+
+function capExaText(text: string, maxCharacters: number): string {
+	if (text.length <= maxCharacters) return text;
+	return `${text.slice(0, maxCharacters).trimEnd()}\n\n[Truncated by Exa maxCharacters]`;
 }
 
 function mapInlineContent(results: ExaSearchResponse["results"], options: ExaSearchOptions): ExtractedContent[] {
@@ -319,11 +338,11 @@ function mapInlineContent(results: ExaSearchResponse["results"], options: ExaSea
 	const maxCharacters = clampPositiveInt(options.maxCharacters, 12000, 50000);
 	return dedupeResults(results)
 		.filter((r): r is ExaResultItem & { url: string; text: string } =>
-			!!r.url && typeof r.text === "string" && r.text.trim().length > 0)
+			!!r.url && typeof r.text === "string" && r.text.trim().length > 0 && !isProbablyBinarySearchText(r.text))
 		.map(r => ({
 			url: r.url,
 			title: r.title || "",
-			content: r.text.length > maxCharacters ? `${r.text.slice(0, maxCharacters).trimEnd()}\n\n[Truncated by Exa maxCharacters]` : r.text,
+			content: capExaText(r.text, maxCharacters),
 			error: null,
 		}));
 }
@@ -437,7 +456,7 @@ function buildAnswerFromMcpResults(results: McpParsedResult[]): string {
 	const parts: string[] = [];
 	for (let i = 0; i < results.length; i++) {
 		const result = results[i];
-		const snippet = result.content.replace(/\s+/g, " ").trim().slice(0, 500);
+		const snippet = cleanSnippet(result.content, 500);
 		if (!snippet) continue;
 		const sourceTitle = result.title || `Source ${i + 1}`;
 		parts.push(`${snippet}\nSource: ${sourceTitle} (${result.url})`);
@@ -447,7 +466,7 @@ function buildAnswerFromMcpResults(results: McpParsedResult[]): string {
 
 function mapMcpInlineContent(results: McpParsedResult[]): ExtractedContent[] {
 	return results
-		.filter(result => result.content.length > 0)
+		.filter(result => result.content.length > 0 && !isProbablyBinarySearchText(result.content))
 		.map(result => ({
 			url: result.url,
 			title: result.title,

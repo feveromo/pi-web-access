@@ -48,7 +48,7 @@ web_search({ query: "synthesize this", synthesize: true })
 | `returnMetadata` | Include provider/source metadata in `details` |
 | `provider` | `auto` or `exa` |
 
-`details.metrics` reports useful quality signals: result counts, unique domains, answer chars, and snippet chars per query. When `includeContent` is enabled, `details.contentFetch` reports provider-inline vs fallback fetch coverage and timing.
+`details.metrics` reports useful quality signals: result counts, unique domains, answer chars, and snippet chars per query. When the provider supplies publication dates they are shown next to sources, which helps spot stale current-event results. When `includeContent` is enabled, `details.contentFetch` reports provider-inline vs fallback fetch coverage and timing.
 
 ### `fetch_content`
 
@@ -79,8 +79,11 @@ Retrieve stored full content from prior `web_search(includeContent: true)` or `f
 
 ```ts
 get_search_content({ responseId: "abc123", urlIndex: 0 })
+get_search_content({ responseId: "abc123", urlIndexes: [0, 1, 2] })
+get_search_content({ responseId: "abc123", allUrls: true, maxChars: 3000 })
 get_search_content({ responseId: "abc123", url: "https://example.com" })
 get_search_content({ responseId: "abc123", queryIndex: 0 })
+get_search_content({ responseId: "abc123", queryIndexes: [0, 2] })
 ```
 
 ### `paper_search`
@@ -151,9 +154,10 @@ github_examples({ operation: "read", repo: "huggingface/trl", path: "examples/sc
 2. Prefer `docs_search` / `openapi_search` for official API details, then `fetch_content` the exact docs pages you need.
 3. Prefer `github_examples` before writing code against fast-moving libraries; read the exact example file/range that matches the task.
 4. Prefer `paper_search` for quick scholarly discovery and `paper_research` when you need OpenAlex citation graphs/topic maps, paper sections, abstract snippets, related works, or linked HF resources.
-5. Use `includeContent: true` only when source text matters immediately.
-6. Use `fetch_content` for selected pages, GitHub repos/files, and PDFs.
-7. Use `get_search_content` when inline output was truncated or content was stored.
+5. For current/news/market/status topics, use `livecrawl: "fallback"` or `"always"`, set an appropriate `recencyFilter`, and include at least one risk/status query (`halt`, `suspension`, `outage`, `recall`, `official update`, `latest filing`, etc.).
+6. Use `includeContent: true` only when source text matters immediately.
+7. Use `fetch_content` for selected pages, GitHub repos/files, and PDFs.
+8. Use `get_search_content` when inline output was truncated or content was stored; prefer `urlIndexes`/`queryIndexes` batch retrieval over many one-at-a-time calls.
 
 For code questions, the baseline approach is explicit:
 
@@ -263,6 +267,7 @@ There is intentionally no curator/browser UI in this fork.
 | `storage.ts` | Session-aware result storage with disk-backed large-content references |
 | `activity.ts` | Request activity tracking widget |
 | `search-types.ts` | Shared search option/result types |
+| `search-text.ts` | Search snippet sanitization helpers |
 
 ## Attribution
 

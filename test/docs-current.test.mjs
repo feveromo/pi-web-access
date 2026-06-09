@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
 function read(relativePath) {
@@ -19,25 +19,11 @@ test("manual regression checklist matches the lean fork", () => {
 
   assert.match(checklist, /Long content durability/);
   assert.match(checklist, /disk-backed/);
+  assert.match(checklist, /Stored-content batch retrieval/);
+  assert.match(checklist, /urlIndexes/);
+  assert.match(checklist, /Current\/status search guardrail/);
 });
 
-test("librarian skill points at native research and source-reading flows", () => {
-  const skill = read("skills/librarian/SKILL.md");
-
-  assert.match(skill, /web_search\(\{ queries: \[\.\.\.\] \}\)/);
-  assert.match(skill, /docs_search/);
-  assert.match(skill, /github_examples/);
-  assert.match(skill, /paper_research/);
-  assert.match(skill, /fetch_content/);
-  assert.equal(skill.includes("code_search"), false);
-});
-
-test("internet-research skill is packaged and references native tools", () => {
-  const skill = read("skills/internet-research/SKILL.md");
-
-  assert.match(skill, /^name: internet-research$/m);
-  assert.match(skill, /^description: Evidence-first internet research workflow/m);
-  for (const tool of ["web_search", "paper_research", "docs_search", "openapi_search", "github_examples", "fetch_content", "get_search_content"]) {
-    assert.match(skill, new RegExp(tool));
-  }
+test("package ships tools only, no bundled skills", () => {
+  assert.equal(existsSync(new URL("../skills", import.meta.url)), false);
 });
