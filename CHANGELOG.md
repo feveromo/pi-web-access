@@ -4,13 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Added `get_search_content` batch selectors (`urlIndexes`, `queryIndexes`, `allUrls`, `allQueries`) plus optional per-item `maxChars` caps so agents can retrieve selected stored sources without many one-at-a-time calls.
+
+### Changed
+- `web_search` now displays provider publication dates when available and includes stronger tool guidance for current/news/market/status research.
+
+### Fixed
+- Suppressed binary/unreadable Exa snippets before they reach tool output while keeping the affected source URLs available for follow-up fetching.
+
 ## [0.10.8] - 2026-05-29
 
 ### Added
 - Added `paper_research` as a no-key OpenAlex/arXiv/Hugging Face research flow: topic maps, citation graphs, abstract search, related works, arXiv section reading, and paper-linked HF datasets/models.
 - Added `docs_search` for official docs and `llms.txt` indexing, plus `openapi_search` for OpenAPI endpoint discovery with curl examples.
 - Added `github_examples` for GitHub API-based example discovery and remote file-range reads without cloning; it can use `GITHUB_TOKEN` or private config `githubToken` for higher API limits.
-- Added an `internet-research` skill that teaches the Pi-native evidence-first workflow across web, papers, docs, OpenAPI, GitHub examples, and fetch tools.
 - Added `paper_search` for structured scholarly search via OpenAlex with arXiv support/fallback.
 - Added Exa research controls on `web_search`: `researchDepth`, `searchType`, `contentMode`, `maxCharacters`, `livecrawl`, and `synthesize`.
 - Added parser/error regression tests for `paper_search` plus a Node 22 PDF extraction regression test and `npm test` script.
@@ -277,9 +285,6 @@ All notable changes to this project will be documented in this file.
 - `youtube-extract.ts` -- YouTube extraction orchestrator with three-tier fallback and activity logging
 
 ## [0.5.1] - 2026-02-02
-
-### Added
-- Bundled `librarian` skill -- structured research workflow for open-source libraries with GitHub permalinks, combining fetch_content (cloning), web_search (recent info), and git operations (blame, log, show)
 
 ### Fixed
 - Session fork event handler was registered as `session_branch` (non-existent event) instead of `session_fork`, meaning forks never triggered cleanup (abort pending fetches, clear clone cache, restore session data)

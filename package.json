@@ -31,7 +31,6 @@
   "homepage": "https://github.com/feveromo/pi-web-access#readme",
   "files": [
     "*.ts",
-    "skills/",
     "scripts/scan-sensitive.mjs",
     "README.md",
     "CHANGELOG.md",
@@ -53,9 +52,6 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ],
-    "skills": [
-      "./skills"
     ]
   },
   "devDependencies": {

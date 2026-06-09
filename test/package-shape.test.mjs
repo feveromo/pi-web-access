@@ -6,7 +6,7 @@ const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url),
 
 test("package stays lean and Pi-native", () => {
   assert.deepEqual(pkg.pi?.extensions, ["./index.ts"]);
-  assert.deepEqual(pkg.pi?.skills, ["./skills"]);
+  assert.equal(pkg.pi?.skills, undefined);
 
   assert.equal(pkg.scripts?.test, "node --test");
   assert.match(pkg.scripts?.syntax ?? "", /node --check/);
@@ -15,7 +15,7 @@ test("package stays lean and Pi-native", () => {
   assert.equal(pkg.scripts?.check, "npm run syntax && npm test && npm run scan:sensitive && npm run pack:dry-run");
 
   assert.ok(pkg.files.includes("*.ts"));
-  assert.ok(pkg.files.includes("skills/"));
+  assert.ok(!pkg.files.includes("skills/"));
   assert.ok(pkg.files.includes("scripts/scan-sensitive.mjs"));
   assert.ok(!pkg.files.includes("banner.png"));
   assert.ok(!pkg.files.includes("eval/"));

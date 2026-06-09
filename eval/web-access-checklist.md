@@ -19,6 +19,10 @@ Run from a Pi session after reloading the extension/tool schemas. These checks e
   - Expect: details/stored query metadata with provider API, source URLs, search type, and content mode.
 - [ ] Source text: `web_search({ query: "Pi coding agent extension docs", includeContent: true, numResults: 3 })`
   - Expect: a `fetchId`, content fetch stats, and bounded source content retrievable via `get_search_content({ responseId: fetchId, urlIndex: 0 })`.
+- [ ] Stored-content batch retrieval: use the `fetchId`/`responseId` from a multi-source search or fetch with `get_search_content({ responseId: fetchId, urlIndexes: [0, 1], maxChars: 2000 })`.
+  - Expect: both requested sources in one response, per-item truncation markers only when the cap is hit, and accurate batch details.
+- [ ] Current/status search guardrail: `web_search({ queries: ["official trading halt codes", "trading halt suspension official update"], recencyFilter: "month", livecrawl: "fallback", numResults: 3 })`
+  - Expect: fresh/official-leaning sources when available; provider publication dates are shown when supplied; stale/conflicting snippets are obvious enough to trigger `fetch_content` on primary sources.
 
 ## Fetch
 
