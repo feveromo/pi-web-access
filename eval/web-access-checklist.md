@@ -12,13 +12,13 @@ Run from a Pi session after reloading the extension/tool schemas. These checks e
 ## Search
 
 - [ ] Basic search: `web_search({ query: "OpenAI official web search docs", numResults: 3 })`
-  - Expect: sources in content, `searchId` in details, no noisy metadata by default.
+  - Expect: compact source output, `searchId` in details, a `get_search_content` retrieval hint, and no noisy metadata by default.
 - [ ] Multi-query search: `web_search({ queries: ["OpenAI web search official docs", "OpenAI responses API web search examples"], numResults: 3 })`
   - Expect: two query sections, `queryCount: 2`, partial failures do not hide successful queries.
 - [ ] Metadata: `web_search({ query: "Exa search API contents highlights", provider: "exa", returnMetadata: true })`
   - Expect: details/stored query metadata with provider API, source URLs, search type, and content mode.
 - [ ] Source text: `web_search({ query: "Pi coding agent extension docs", includeContent: true, numResults: 3 })`
-  - Expect: a `fetchId`, content fetch stats, and bounded source content retrievable via `get_search_content({ responseId: fetchId, urlIndex: 0 })`.
+  - Expect: a `fetchId`, content fetch stats, compact inline output, and bounded source content retrievable via `get_search_content({ responseId: fetchId, urlIndex: 0 })`.
 - [ ] Stored-content batch retrieval: use the `fetchId`/`responseId` from a multi-source search or fetch with `get_search_content({ responseId: fetchId, urlIndexes: [0, 1], maxChars: 2000 })`.
   - Expect: both requested sources in one response, per-item truncation markers only when the cap is hit, and accurate batch details.
 - [ ] Current/status search guardrail: `web_search({ queries: ["official trading halt codes", "trading halt suspension official update"], recencyFilter: "month", livecrawl: "fallback", numResults: 3 })`
@@ -34,8 +34,8 @@ Run from a Pi session after reloading the extension/tool schemas. These checks e
   - Expect: one success and one error in `details.perUrl`; successful URL is still stored.
 - [ ] 404 handling: `fetch_content({ url: "https://example.com/definitely-404-web-access-test", returnMetadata: true })`
   - Expect: error content, `responseId`, `details.perUrl[0].httpStatus` near 404.
-- [ ] Long content durability: fetch a page large enough to exceed 24K chars with `returnMetadata: true`.
-  - Expect: session entry remains compact; `details.perUrl[0].contentRef` appears when metadata is requested; `get_search_content` returns hydrated content while the disk cache exists.
+- [ ] Long content durability: fetch a page large enough to exceed the inline preview cap, and one large enough to exceed 24K chars with `returnMetadata: true`.
+  - Expect: single-page tool output stays preview-sized with a retrieval hint; for >24K content the session entry remains compact, `details.perUrl[0].contentRef` appears when metadata is requested, and `get_search_content` returns hydrated content while the disk cache exists.
 - [ ] PDF URL: fetch a known public PDF URL.
   - Expect: method `pdf`, content points to saved markdown, no binary dump.
 - [ ] GitHub URL: `fetch_content({ url: "https://github.com/owner/repo" })` and a `/blob/` file URL.
@@ -61,7 +61,9 @@ Run from a Pi session after reloading the extension/tool schemas. These checks e
 ## Docs / API / GitHub Examples
 
 - [ ] Docs search: `docs_search({ source: "react.dev/reference/react", query: "useEffect cleanup", maxResults: 5 })`
-  - Expect: indexed page count, ranked docs URLs, and concise snippets.
+  - Expect: indexed page count, ranked docs URLs, concise snippets, and cache metadata in details.
+- [ ] Docs cache reuse: repeat the same `docs_search` call after a quick extension reload if practical.
+  - Expect: `cacheHit: true` with `cacheStorage` of `memory` or `disk`, and no stale long-term mirror behavior beyond the short TTL.
 - [ ] OpenAPI search: `openapi_search({ query: "upload file", maxResults: 5 })`
   - Expect: endpoint method/path, parameters, and curl examples from the HF OpenAPI spec.
 - [ ] GitHub examples: `github_examples({ operation: "find", repo: "huggingface/trl", keyword: "sft", maxResults: 5 })`

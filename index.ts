@@ -29,7 +29,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const WEB_SEARCH_CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
-const MAX_INLINE_CONTENT = 30000;
+const MAX_INLINE_CONTENT = 6000;
+const SEARCH_INLINE_ANSWER_MAX_CHARS = 3500;
 const DEFAULT_SEARCH_CONTENT_MAX_CHARS = 12000;
 const SEARCH_QUERY_CONCURRENCY = 3;
 const DEFAULT_SHORTCUTS = { activity: "ctrl+shift+w" };
@@ -124,14 +125,17 @@ function normalizeRetrievalMaxChars(value: unknown): number | null {
 	return normalized > 0 ? normalized : null;
 }
 
-function capRetrievedText(content: string, maxChars: number | null): { text: string; truncated: boolean } {
+function capText(content: string, maxChars: number | null, marker: string): { text: string; truncated: boolean } {
 	if (!maxChars || content.length <= maxChars) return { text: content, truncated: false };
-	const marker = "\n\n[Truncated by get_search_content maxChars]";
 	const bodyLimit = Math.max(0, maxChars - marker.length);
 	const slice = content.slice(0, bodyLimit);
 	const breakAt = Math.max(slice.lastIndexOf("\n\n"), slice.lastIndexOf(". "), slice.lastIndexOf("\n"));
 	const text = (breakAt > Math.floor(bodyLimit * 0.5) ? slice.slice(0, breakAt + 1) : slice).trimEnd();
 	return { text: `${text}${marker}`, truncated: true };
+}
+
+function capRetrievedText(content: string, maxChars: number | null): { text: string; truncated: boolean } {
+	return capText(content, maxChars, "\n\n[Truncated by get_search_content maxChars]");
 }
 
 function extractDomain(url: string): string {
@@ -166,10 +170,14 @@ function formatSourceListItem(result: SearchResult, index: number): string {
 	return `${index + 1}. ${result.title}\n   ${result.url}${date}`;
 }
 
-function formatSearchSummary(results: SearchResult[], answer: string): string {
-	let output = answer ? `${answer}\n\n---\n\n**Sources:**\n` : "";
+function formatSearchSummary(results: SearchResult[], answer: string, searchId: string, queryIndex: number): { text: string; truncated: boolean } {
+	const cappedAnswer = capText(answer, SEARCH_INLINE_ANSWER_MAX_CHARS, "\n\n[Inline search output capped; use get_search_content for full stored result]");
+	let output = cappedAnswer.text ? `${cappedAnswer.text}\n\n---\n\n**Sources:**\n` : "";
 	output += results.map(formatSourceListItem).join("\n\n");
-	return output;
+	if (cappedAnswer.truncated) {
+		output += `\n\n---\nFull search snippets stored as responseId "${searchId}". Use get_search_content({ responseId: "${searchId}", queryIndex: ${queryIndex} }) if you need the uncapped result text.`;
+	}
+	return { text: output, truncated: cappedAnswer.truncated };
 }
 
 function formatFullResults(queryData: QueryResultData): string {
@@ -412,6 +420,7 @@ export default function (pi: ExtensionAPI) {
 	function buildSearchReturn(opts: SearchReturnOptions) {
 		const sc = opts.results.filter(r => !r.error).length;
 		const tr = opts.results.reduce((sum, r) => sum + r.results.length, 0);
+		const searchId = storeAndPublishSearch(opts.results);
 		const allDomains = new Set<string>();
 		const perQueryMetrics = opts.results.map(r => {
 			const domains = new Set(r.results.map(source => extractDomain(source.url)));
@@ -428,11 +437,17 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		let output = "";
-		for (const { query, answer, results, error } of opts.results) {
-			if (opts.queryList.length > 1) output += `## Query: "${query}"\n\n`;
+		let searchOutputTruncated = false;
+		for (let i = 0; i < opts.results.length; i++) {
+			const { query, answer, results, error } = opts.results[i];
+			if (opts.queryList.length > 1) output += `## Query ${i}: "${query}"\n\n`;
 			if (error) output += `Error: ${error}\n\n`;
 			else if (results.length === 0) output += "No results found.\n\n";
-			else output += formatSearchSummary(results, answer) + "\n\n";
+			else {
+				const rendered = formatSearchSummary(results, answer, searchId, i);
+				searchOutputTruncated ||= rendered.truncated;
+				output += rendered.text + "\n\n";
+			}
 		}
 
 		let fetchId: string | null = null;
@@ -445,7 +460,10 @@ export default function (pi: ExtensionAPI) {
 			output += "---\nFull content was requested, but no source content was available.";
 		}
 
-		const searchId = storeAndPublishSearch(opts.results);
+		if (!searchOutputTruncated && opts.results.some(r => r.results.length > 0)) {
+			output += `\n---\nSearch results stored as responseId "${searchId}". Use get_search_content({ responseId: "${searchId}", queryIndex: 0 }) only if you need the full stored result text.`;
+		}
+
 		const queryMetadata = opts.results.some(r => r.metadata)
 			? opts.results.map(r => ({ query: r.query, provider: r.provider, metadata: r.metadata }))
 			: undefined;
@@ -460,6 +478,7 @@ export default function (pi: ExtensionAPI) {
 				includeContent: opts.includeContent,
 				fetchId,
 				searchId,
+				truncated: searchOutputTruncated,
 				metrics: {
 					uniqueDomains: allDomains.size,
 					perQuery: perQueryMetrics,
@@ -501,12 +520,13 @@ export default function (pi: ExtensionAPI) {
 		name: "web_search",
 		label: "Web Search",
 		description:
-			`Lean Exa-powered web research with source snippets/citations. Use researchDepth: "deep" or contentMode: "text" only when needed; use synthesize: true for Exa answer synthesis. Published dates are shown when the provider supplies them.`,
+			`Lean Exa-powered web research with source snippets/citations. Output is compact and stored for get_search_content; use researchDepth: "deep" or contentMode: "text" only when needed. Published dates are shown when the provider supplies them.`,
 		promptSnippet:
-			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage.",
+			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles for discovery, then get_search_content only for exact stored results you need.",
 		promptGuidelines: [
 			"For current/news/market/status questions, set livecrawl to 'always' or 'fallback', use an appropriate recencyFilter, and include one query for breaking-risk/status terms such as halt, suspension, outage, recall, controversy, official update, or latest filing.",
 			"If snippets conflict, look stale, or omit the primary source, fetch_content the official/source URLs before synthesizing.",
+			"Do not request contentMode: 'text', includeContent, or large maxCharacters unless you need full source text immediately; use get_search_content later for selected sources.",
 		],
 		parameters: Type.Object({
 			query: Type.Optional(Type.String({ description: "Single search query. For research tasks, prefer 'queries' with multiple varied angles instead." })),
@@ -790,19 +810,20 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "docs_search",
 		label: "Docs Search",
-		description: "Discover and search documentation sites, llms.txt indexes, and markdown docs pages with a lightweight in-memory index. Use for current API/library docs before fetching full pages.",
+		description: "Discover and search documentation sites, llms.txt indexes, and markdown docs pages with a lightweight cached index. Returns compact snippets; fetch selected result URLs for full pages.",
 		promptSnippet:
-			"Use to search official docs/llms.txt indexes before broad web search; follow with fetch_content on selected URLs.",
+			"Use to search official docs/llms.txt indexes before broad web search; keep maxResults small and follow with fetch_content on selected URLs.",
 		promptGuidelines: [
 			"Use docs_search for official documentation lookups; use fetch_content on a docs_search result URL when exact API details or examples are needed.",
+			"Prefer maxResults 3-6 and compact snippets; do not set large maxCharacters just in case.",
 		],
 		parameters: Type.Object({
 			source: Type.String({ description: "Docs root URL/domain or llms.txt URL, e.g. react.dev/reference/react or https://docs.example.com/llms.txt" }),
 			query: Type.Optional(Type.String({ description: "Keyword query to rank docs pages. Omit to list discovered pages." })),
-			maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 25, description: "Max results to return (default 10, max 25)" })),
+			maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 25, description: "Max results to return (default 6, max 25)" })),
 			maxPages: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max docs pages to fetch/index (default 40, max 100)" })),
 			mode: Type.Optional(StringEnum(["auto", "llms", "crawl"], { description: "Discovery mode: auto tries llms.txt then root-page links; llms only uses llms.txt; crawl follows same-site links from the source page" })),
-			maxCharacters: Type.Optional(Type.Integer({ minimum: 1, maximum: 3000, description: "Max snippet characters per result" })),
+			maxCharacters: Type.Optional(Type.Integer({ minimum: 1, maximum: 1500, description: "Max snippet characters per result (default 450, max 1500)" })),
 			returnMetadata: Type.Optional(Type.Boolean({ description: "Include indexed page metadata in details" })),
 		}),
 
@@ -911,9 +932,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "fetch_content",
 		label: "Fetch Content",
-		description: "Fetch URL(s) and extract readable markdown via HTTP/Readability, GitHub cloning, PDF extraction, and Jina fallback. Content is stored for get_search_content.",
+		description: "Fetch URL(s) and extract readable markdown via HTTP/Readability, GitHub cloning, PDF extraction, and Jina fallback. Content is stored for get_search_content. Prefer one urls array when fetching several related pages.",
 		promptSnippet:
-			"Use to extract readable content from URLs, docs, PDFs, and GitHub repos.",
+			"Use to extract readable content from URLs, docs, PDFs, and GitHub repos. Prefer one urls:[...] call for several related pages.",
 		parameters: Type.Object({
 			url: Type.Optional(Type.String({ description: "Single URL to fetch" })),
 			urls: Type.Optional(Type.Array(Type.String(), { description: "Multiple URLs (parallel)" })),

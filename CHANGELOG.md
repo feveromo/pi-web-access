@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Added short-lived disk-backed `docs_search` index caching under `~/.pi/web-access/docs-cache/`, with cache-hit metadata and a 30-minute TTL to survive quick Pi reloads without turning docs into a stale local mirror.
+- Added compact-output guardrails: `web_search` caps inline synthesized snippets and stores full search text for `get_search_content`, `docs_search` uses smaller default snippets, and large single-page `fetch_content` results now return a preview plus retrieval hint.
 - Added `get_search_content` batch selectors (`urlIndexes`, `queryIndexes`, `allUrls`, `allQueries`) plus optional per-item `maxChars` caps so agents can retrieve selected stored sources without many one-at-a-time calls.
 
 ### Changed
