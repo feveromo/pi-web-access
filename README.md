@@ -121,7 +121,7 @@ Key operations: `search`, `map_topic`, `trending`, `details`, `read_paper`, `cit
 
 ### `docs_search`
 
-Search official documentation roots and `llms.txt` indexes with a lightweight in-memory page index.
+Search official documentation roots and `llms.txt` indexes with a lightweight cached page index. Results use compact snippets by default; fetch only the selected full page when needed.
 
 ```ts
 docs_search({ source: "react.dev/reference/react", query: "useEffect cleanup" })
@@ -129,6 +129,8 @@ docs_search({ source: "https://docs.example.com/llms.txt", query: "authenticatio
 ```
 
 Use `fetch_content` on a result URL when you need the full docs page.
+
+`docs_search` keeps a small query-aware docs index in memory and on disk under `~/.pi/web-access/docs-cache/` for about 30 minutes. This survives quick Pi reloads without becoming a stale long-term docs mirror.
 
 ### `openapi_search`
 
@@ -150,13 +152,13 @@ github_examples({ operation: "read", repo: "huggingface/trl", path: "examples/sc
 
 ## Recommended workflow
 
-1. Use `web_search` with 2–4 meaningfully different queries for broad discovery. Independent query searches run with small bounded concurrency for speed without API stampedes.
-2. Prefer `docs_search` / `openapi_search` for official API details, then `fetch_content` the exact docs pages you need.
+1. Use `web_search` with 2–4 meaningfully different queries for broad discovery. Independent query searches run with small bounded concurrency for speed without API stampedes; full result text is stored for later `get_search_content` retrieval.
+2. Prefer compact `docs_search` / `openapi_search` for official API details, then `fetch_content` the exact docs pages you need.
 3. Prefer `github_examples` before writing code against fast-moving libraries; read the exact example file/range that matches the task.
 4. Prefer `paper_search` for quick scholarly discovery and `paper_research` when you need OpenAlex citation graphs/topic maps, paper sections, abstract snippets, related works, or linked HF resources.
 5. For current/news/market/status topics, use `livecrawl: "fallback"` or `"always"`, set an appropriate `recencyFilter`, and include at least one risk/status query (`halt`, `suspension`, `outage`, `recall`, `official update`, `latest filing`, etc.).
-6. Use `includeContent: true` only when source text matters immediately.
-7. Use `fetch_content` for selected pages, GitHub repos/files, and PDFs.
+6. Use `includeContent: true`, `contentMode: "text"`, or large `maxCharacters` only when source text matters immediately.
+7. Use `fetch_content` for selected pages, GitHub repos/files, and PDFs; one `urls: [...]` call is better than several one-at-a-time calls.
 8. Use `get_search_content` when inline output was truncated or content was stored; prefer `urlIndexes`/`queryIndexes` batch retrieval over many one-at-a-time calls.
 
 For code questions, the baseline approach is explicit:
@@ -191,9 +193,11 @@ For Pi-runtime confidence after reloading tool schemas, also run the manual regr
 Long research sessions should stay useful without stuffing giant blobs into Pi's session log.
 
 - Search/fetch metadata is still persisted with `pi.appendEntry()` so `/search` and `get_search_content` survive reloads and tree navigation.
+- `docs_search` stores short-lived docs indexes under `~/.pi/web-access/docs-cache/` for quick reuse across reloads; the TTL is about 30 minutes to limit staleness.
 - Large fetched source bodies are stored outside the session under `~/.pi/web-access/content/`; the session entry keeps a compact preview plus a content reference.
 - `get_search_content` hydrates from that disk cache when available, while current-session calls also keep full content in memory.
 - Session restore keeps recent web-access entries for 24 hours; disk-backed large content is pruned after about 7 days.
+- Tool outputs are intentionally compact: `web_search` caps inline synthesized snippets and `fetch_content` previews large single pages, while full stored results remain available through `get_search_content`.
 - For tight context work, prefer `mode: "highlights"` / `"summary"` and set `maxChars` explicitly.
 
 ## GitHub behavior

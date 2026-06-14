@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import pLimit from "p-limit";
@@ -40,6 +44,17 @@ interface CachedDocs {
 	mode: DocsSearchMode;
 }
 
+interface DocsCacheInfo {
+	hit: boolean;
+	storage: "memory" | "disk" | "fresh";
+	expiresAt: number;
+}
+
+interface DiskCachedDocs extends CachedDocs {
+	version: number;
+	savedAt: number;
+}
+
 interface OpenApiEndpoint {
 	method: string;
 	path: string;
@@ -55,17 +70,23 @@ interface OpenApiEndpoint {
 
 const DOCS_CACHE_TTL_MS = 30 * 60 * 1000;
 const DOCS_CACHE_MAX = 30;
+const DOCS_CACHE_VERSION = 1;
+const DOCS_DISK_CACHE_MAX_BYTES = 5 * 1024 * 1024;
+const DOCS_CACHE_DIR = process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR?.trim() || join(homedir(), ".pi", "web-access", "docs-cache");
 const DEFAULT_MAX_PAGES = 40;
 const MAX_PAGES_CAP = 100;
-const DEFAULT_MAX_RESULTS = 10;
+const DEFAULT_MAX_RESULTS = 6;
 const MAX_RESULTS_CAP = 25;
-const DEFAULT_MAX_CHARS = 700;
+const DEFAULT_MAX_CHARS = 450;
+const MAX_SNIPPET_CHARS = 1500;
 const DISCOVERY_LINK_CAP = 300;
 const REQUEST_TIMEOUT_MS = 25000;
 const DEFAULT_OPENAPI_URL = "https://huggingface.co/.well-known/openapi.json";
 
 const docsCache = new Map<string, CachedDocs>();
+const inFlightDocs = new Map<string, Promise<{ pages: DocsPage[]; source: URL; mode: DocsSearchMode; cache: DocsCacheInfo }>>();
 const openApiCache = new Map<string, { expiresAt: number; endpoints: OpenApiEndpoint[]; tags: string[] }>();
+let lastDocsCachePrune = 0;
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
 const fetchLimit = pLimit(5);
@@ -118,6 +139,86 @@ function titleFromUrl(url: string): string {
 function truncate(text: string, max = DEFAULT_MAX_CHARS): string {
 	const normalized = textContent(text);
 	return normalized.length > max ? `${normalized.slice(0, max).trimEnd()}…` : normalized;
+}
+
+function docsDiskCacheFile(key: string): string {
+	const digest = createHash("sha256").update(key).digest("hex");
+	return join(DOCS_CACHE_DIR, `${digest}.json`);
+}
+
+function isDocsPage(value: unknown): value is DocsPage {
+	if (!value || typeof value !== "object") return false;
+	const page = value as Record<string, unknown>;
+	return typeof page.title === "string"
+		&& typeof page.url === "string"
+		&& typeof page.fetchUrl === "string"
+		&& typeof page.content === "string"
+		&& typeof page.glimpse === "string"
+		&& typeof page.contentType === "string";
+}
+
+function isDiskCachedDocs(value: unknown): value is DiskCachedDocs {
+	if (!value || typeof value !== "object") return false;
+	const data = value as Record<string, unknown>;
+	return data.version === DOCS_CACHE_VERSION
+		&& typeof data.expiresAt === "number"
+		&& typeof data.savedAt === "number"
+		&& typeof data.source === "string"
+		&& (data.mode === "auto" || data.mode === "llms" || data.mode === "crawl")
+		&& Array.isArray(data.pages)
+		&& data.pages.every(isDocsPage);
+}
+
+function pruneDocsDiskCache(): void {
+	const now = Date.now();
+	if (now - lastDocsCachePrune < 60 * 60 * 1000) return;
+	lastDocsCachePrune = now;
+	if (!existsSync(DOCS_CACHE_DIR)) return;
+
+	let files: string[];
+	try {
+		files = readdirSync(DOCS_CACHE_DIR);
+	} catch {
+		return;
+	}
+
+	for (const file of files) {
+		if (!file.endsWith(".json")) continue;
+		const path = join(DOCS_CACHE_DIR, file);
+		try {
+			const stat = statSync(path);
+			if (now - stat.mtimeMs <= DOCS_CACHE_TTL_MS * 2) continue;
+			rmSync(path, { force: true });
+		} catch {
+		}
+	}
+}
+
+function readDocsDiskCache(key: string): CachedDocs | null {
+	try {
+		const path = docsDiskCacheFile(key);
+		if (!existsSync(path)) return null;
+		const data = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+		if (!isDiskCachedDocs(data) || data.expiresAt <= Date.now()) {
+			rmSync(path, { force: true });
+			return null;
+		}
+		return { expiresAt: data.expiresAt, pages: data.pages, source: data.source, mode: data.mode };
+	} catch {
+		return null;
+	}
+}
+
+function writeDocsDiskCache(key: string, value: CachedDocs): void {
+	try {
+		pruneDocsDiskCache();
+		const payload: DiskCachedDocs = { version: DOCS_CACHE_VERSION, savedAt: Date.now(), ...value };
+		const body = JSON.stringify(payload);
+		if (body.length > DOCS_DISK_CACHE_MAX_BYTES) return;
+		mkdirSync(DOCS_CACHE_DIR, { recursive: true });
+		writeFileSync(docsDiskCacheFile(key), body, "utf-8");
+	} catch {
+	}
 }
 
 async function fetchText(url: string, signal?: AbortSignal): Promise<{ text: string; url: string; contentType: string; status: number }> {
@@ -299,19 +400,45 @@ function cacheKeyForDocs(source: URL, mode: DocsSearchMode, maxPages: number, qu
 	return `${source.toString()}|${mode}|${maxPages}|${query?.trim().toLowerCase() ?? ""}`;
 }
 
-async function getDocsPages(params: DocsSearchParams, signal?: AbortSignal): Promise<{ pages: DocsPage[]; source: URL; mode: DocsSearchMode }> {
+async function getDocsPages(params: DocsSearchParams, signal?: AbortSignal): Promise<{ pages: DocsPage[]; source: URL; mode: DocsSearchMode; cache: DocsCacheInfo }> {
 	const source = normalizeSource(params.source);
 	const mode = normalizeMode(params.mode);
 	const maxPages = clampInt(params.maxPages, DEFAULT_MAX_PAGES, MAX_PAGES_CAP);
 	const key = cacheKeyForDocs(source, mode, maxPages, params.query);
+	const now = Date.now();
 	const cached = docsCache.get(key);
-	if (cached && cached.expiresAt > Date.now()) return { pages: cached.pages, source, mode };
+	if (cached && cached.expiresAt > now) {
+		return { pages: cached.pages, source, mode, cache: { hit: true, storage: "memory", expiresAt: cached.expiresAt } };
+	}
+	if (cached) docsCache.delete(key);
 
-	const discovered = await discoverDocsPages(source, mode, maxPages, signal, params.query);
-	const pages = (await Promise.all(discovered.map(item => fetchLimit(() => fetchDocsPage(item, signal))))).filter((page): page is DocsPage => !!page);
-	if (docsCache.size >= DOCS_CACHE_MAX) docsCache.delete(docsCache.keys().next().value as string);
-	docsCache.set(key, { expiresAt: Date.now() + DOCS_CACHE_TTL_MS, pages, source: source.toString(), mode });
-	return { pages, source, mode };
+	const diskCached = readDocsDiskCache(key);
+	if (diskCached) {
+		if (docsCache.size >= DOCS_CACHE_MAX) docsCache.delete(docsCache.keys().next().value as string);
+		docsCache.set(key, diskCached);
+		return { pages: diskCached.pages, source, mode, cache: { hit: true, storage: "disk", expiresAt: diskCached.expiresAt } };
+	}
+
+	const inFlight = inFlightDocs.get(key);
+	if (inFlight) return inFlight;
+
+	const request = (async () => {
+		try {
+			const discovered = await discoverDocsPages(source, mode, maxPages, signal, params.query);
+			const pages = (await Promise.all(discovered.map(item => fetchLimit(() => fetchDocsPage(item, signal))))).filter((page): page is DocsPage => !!page);
+			const expiresAt = Date.now() + DOCS_CACHE_TTL_MS;
+			const value = { expiresAt, pages, source: source.toString(), mode };
+			if (docsCache.size >= DOCS_CACHE_MAX) docsCache.delete(docsCache.keys().next().value as string);
+			docsCache.set(key, value);
+			writeDocsDiskCache(key, value);
+			const cache: DocsCacheInfo = { hit: false, storage: "fresh", expiresAt };
+			return { pages, source, mode, cache };
+		} finally {
+			inFlightDocs.delete(key);
+		}
+	})();
+	inFlightDocs.set(key, request);
+	return request;
 }
 
 function tokenize(value: string): string[] {
@@ -357,15 +484,18 @@ export async function executeDocsSearch(params: DocsSearchParams, signal?: Abort
 	try {
 		const query = params.query?.trim() ?? "";
 		const maxResults = clampInt(params.maxResults, DEFAULT_MAX_RESULTS, MAX_RESULTS_CAP);
-		const maxCharacters = clampInt(params.maxCharacters, DEFAULT_MAX_CHARS, 3000);
-		const { pages, source, mode } = await getDocsPages(params, signal);
+		const maxCharacters = clampInt(params.maxCharacters, DEFAULT_MAX_CHARS, MAX_SNIPPET_CHARS);
+		const { pages, source, mode, cache } = await getDocsPages(params, signal);
 		const ranked = pages
 			.map((page, index) => ({ page, index, score: query ? scorePage(page, query) : Math.max(1, pages.length - index) }))
 			.filter(item => !query || item.score > 0)
 			.sort((a, b) => b.score - a.score || a.index - b.index)
 			.slice(0, maxResults);
 
-		const lines = [`# Docs search: ${source.toString()}`, query ? `Query: "${query}"` : "No query provided — showing discovered pages.", `Indexed ${pages.length} page(s); showing ${ranked.length}.`, ""];
+		const cacheSummary = cache.hit
+			? `Cache: ${cache.storage} hit; expires ${new Date(cache.expiresAt).toISOString()}.`
+			: `Cache: refreshed; cached until ${new Date(cache.expiresAt).toISOString()}.`;
+		const lines = [`# Docs search: ${source.toString()}`, query ? `Query: "${query}"` : "No query provided — showing discovered pages.", `Indexed ${pages.length} page(s); showing ${ranked.length}.`, cacheSummary, ""];
 		for (let i = 0; i < ranked.length; i++) {
 			const { page, score } = ranked[i];
 			lines.push(`## ${i + 1}. ${page.title}`);
@@ -379,6 +509,9 @@ export async function executeDocsSearch(params: DocsSearchParams, signal?: Abort
 			content: [{ type: "text", text: lines.join("\n") }],
 			details: {
 				source: source.toString(), mode, query, pagesIndexed: pages.length, count: ranked.length,
+				cacheHit: cache.hit,
+				cacheStorage: cache.storage,
+				cacheExpiresAt: new Date(cache.expiresAt).toISOString(),
 				results: ranked.map(({ page, score }) => ({ title: page.title, url: page.url, fetchUrl: page.fetchUrl, score, contentLength: page.content.length })),
 				...(params.returnMetadata ? { pages: pages.map(p => ({ title: p.title, url: p.url, fetchUrl: p.fetchUrl, contentType: p.contentType, contentLength: p.content.length })) } : {}),
 			},
