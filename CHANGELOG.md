@@ -4,16 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Changed
-- **`web_search` is now keyless** and backed by a self-hosted local SearXNG meta-search instance (Google, Bing, DuckDuckGo, Brave, and more) on `127.0.0.1:8888`, started on demand via `start-web-search` / `stop-web-search`. The Exa provider, API key, MCP fallback, usage metering, and all Exa-specific options (`researchDepth`, `searchType`, `contentMode`, `maxCharacters`, `livecrawl`, `synthesize`, `includeContent`, `provider`) have been removed. `web_search` now takes only `query`/`queries`, `numResults`, `recencyFilter`, and `domainFilter`. Use `fetch_content` for full source text. Files removed: `exa.ts`, `search.ts`, `search-text.ts`.
-
 ### Added
+- Added mocked SearXNG, snippet-formatting, bounded-response, PDF-wrapper, and session-restore regression coverage for the primary research path.
+- Added shared response streaming guards that enforce actual body limits for chunked/compressed responses instead of trusting `Content-Length`.
 - Added short-lived disk-backed `docs_search` index caching under `~/.pi/web-access/docs-cache/`, with cache-hit metadata and a 30-minute TTL to survive quick Pi reloads without turning docs into a stale local mirror.
 - Added compact-output guardrails: `web_search` caps inline synthesized snippets and stores full search text for `get_search_content`, `docs_search` uses smaller default snippets, and large single-page `fetch_content` results now return a preview plus retrieval hint.
 - Added `get_search_content` batch selectors (`urlIndexes`, `queryIndexes`, `allUrls`, `allQueries`) plus optional per-item `maxChars` caps so agents can retrieve selected stored sources without many one-at-a-time calls.
 
 ### Changed
-- `web_search` now displays provider publication dates when available and includes stronger tool guidance for current/news/market/status research.
+- **`web_search` is now keyless** and backed by a self-hosted SearXNG meta-search instance (Google, Bing, DuckDuckGo, Brave, and more). The Exa provider, API key, MCP fallback, usage metering, and Exa-specific options (`researchDepth`, `searchType`, `contentMode`, `maxCharacters`, `livecrawl`, `synthesize`, `includeContent`, `provider`) have been removed. Configure an existing instance with `SEARXNG_URL`; the default local endpoint can use `start-web-search` or `SEARXNG_START_HELPER` when installed. Use `fetch_content` for full source text.
+- `web_search` now limits query fan-out, collapses concurrent duplicates, caches repeated searches briefly, reports progress, propagates cancellation, and bounds startup/health/search waits.
+- `fetch_content` now limits URL batches, normalizes timeouts, stream-limits HTML/PDF/Jina bodies, and avoids sending syntactically obvious private-address or credential-bearing URLs to Jina.
+- `get_search_content` now applies safe default per-item and total caps to batch retrieval while preserving uncapped single-item retrieval.
+- PDF extraction now returns bounded markdown content, cleans up pdf.js resources, reuses identical output, honors cancellation through persistence, and never overwrites a differing download.
+- `paper_research` topic maps and two-way citation graphs fetch independent branches concurrently through one request limiter; its JSON cache is now TTL- and byte-bounded.
+- Release checks now scan all tracked package files for sensitive residue and ignore local `.pi-subagents/` runtime artifacts.
+
+### Fixed
+- Updated `@mozilla/readability` to 0.6.0, which includes upstream performance improvements and fixes the published regex denial-of-service advisory affecting older releases.
+- Fixed the SearXNG migration regression that collected source snippets but omitted them from both `web_search` and `get_search_content` output.
+- Fixed URL result deduplication so case-sensitive paths remain distinct while fragments/tracking parameters collapse correctly.
+- Fixed malformed session entries being restored and dereferenced later.
 
 ## [0.10.8] - 2026-05-29
 

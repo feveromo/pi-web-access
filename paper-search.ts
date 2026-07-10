@@ -1,3 +1,5 @@
+import { readErrorSnippet, readResponseJson, readResponseText } from "./http-response.js";
+
 export type PaperSearchSource = "auto" | "openalex" | "arxiv";
 
 export interface PaperSearchParams {
@@ -46,6 +48,7 @@ function clampMaxResults(value: unknown): number {
 }
 
 const REQUEST_TIMEOUT_MS = 20000;
+const MAX_PAPER_SEARCH_BYTES = 5 * 1024 * 1024;
 const OPENALEX_BASE_SELECT_FIELDS = [
 	"id",
 	"title",
@@ -161,8 +164,8 @@ async function searchOpenAlex(params: PaperSearchParams, signal?: AbortSignal): 
 		headers: { "User-Agent": "pi-web-access/0.10 (mailto:openalex@example.com)" },
 		signal: requestSignal(signal),
 	});
-	if (!res.ok) throw new Error(`OpenAlex error ${res.status}: ${(await res.text()).slice(0, 200)}`);
-	const data = await res.json() as { results?: OpenAlexWork[] };
+	if (!res.ok) throw new Error(`OpenAlex error ${res.status}: ${await readErrorSnippet(res, 200)}`);
+	const data = await readResponseJson<{ results?: OpenAlexWork[] }>(res, MAX_PAPER_SEARCH_BYTES);
 	return (data.results ?? []).map(work => {
 		const doi = typeof work.doi === "string" ? work.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "") : undefined;
 		const abstract = params.includeAbstracts ? reconstructAbstract(work.abstract_inverted_index) : undefined;
@@ -214,8 +217,8 @@ async function searchArxiv(params: PaperSearchParams, signal?: AbortSignal): Pro
 	url.searchParams.set("sortOrder", "descending");
 
 	const res = await fetch(url, { signal: requestSignal(signal) });
-	if (!res.ok) throw new Error(`arXiv error ${res.status}: ${(await res.text()).slice(0, 200)}`);
-	const xml = await res.text();
+	if (!res.ok) throw new Error(`arXiv error ${res.status}: ${await readErrorSnippet(res, 200)}`);
+	const xml = await readResponseText(res, MAX_PAPER_SEARCH_BYTES);
 	const entries = Array.from(xml.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)).map(match => match[1]);
 	const records: PaperRecord[] = [];
 	for (const entry of entries) {

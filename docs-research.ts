@@ -6,6 +6,7 @@ import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import pLimit from "p-limit";
 import TurndownService from "turndown";
+import { readErrorSnippet, readResponseJson, readResponseText } from "./http-response.js";
 
 export type DocsSearchMode = "auto" | "llms" | "crawl";
 
@@ -81,6 +82,8 @@ const DEFAULT_MAX_CHARS = 450;
 const MAX_SNIPPET_CHARS = 1500;
 const DISCOVERY_LINK_CAP = 300;
 const REQUEST_TIMEOUT_MS = 25000;
+const MAX_DOCS_PAGE_BYTES = 2 * 1024 * 1024;
+const MAX_OPENAPI_BYTES = 20 * 1024 * 1024;
 const DEFAULT_OPENAPI_URL = "https://huggingface.co/.well-known/openapi.json";
 
 const docsCache = new Map<string, CachedDocs>();
@@ -229,8 +232,8 @@ async function fetchText(url: string, signal?: AbortSignal): Promise<{ text: str
 		},
 		signal: requestSignal(signal),
 	});
-	if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-	return { text: await res.text(), url: res.url || url, contentType: res.headers.get("content-type") || "", status: res.status };
+	if (!res.ok) throw new Error(`HTTP ${res.status}: ${await readErrorSnippet(res, 200)}`);
+	return { text: await readResponseText(res, MAX_DOCS_PAGE_BYTES), url: res.url || url, contentType: res.headers.get("content-type") || "", status: res.status };
 }
 
 function isLikelyMarkdown(url: string, contentType: string, text: string): boolean {
@@ -527,8 +530,8 @@ async function fetchOpenApi(url: string, signal?: AbortSignal): Promise<{ endpoi
 	const cached = openApiCache.get(normalized);
 	if (cached && cached.expiresAt > Date.now()) return cached;
 	const res = await fetch(normalized, { headers: { "Accept": "application/json", "User-Agent": "pi-web-access/0.10" }, signal: requestSignal(signal) });
-	if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-	const spec = await res.json() as Record<string, unknown>;
+	if (!res.ok) throw new Error(`HTTP ${res.status}: ${await readErrorSnippet(res, 200)}`);
+	const spec = await readResponseJson<Record<string, unknown>>(res, MAX_OPENAPI_BYTES);
 	const servers = Array.isArray(spec.servers) ? spec.servers as Array<Record<string, unknown>> : [];
 	const baseUrl = typeof servers[0]?.url === "string" ? servers[0].url : new URL(normalized).origin;
 	const endpoints: OpenApiEndpoint[] = [];

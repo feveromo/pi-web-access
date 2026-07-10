@@ -11,10 +11,10 @@ Run from a Pi session after reloading the extension/tool schemas. These checks e
 
 ## Search
 
-Start the local SearXNG instance first: run `start-web-search` (or rely on `web_search` auto-starting it on first call).
+Start the configured SearXNG instance first, or ensure `start-web-search`/`SEARXNG_START_HELPER` is installed for on-demand startup. Use `SEARXNG_URL` for a non-default endpoint.
 
 - [ ] Basic search: `web_search({ query: "OpenAI official web search docs", numResults: 3 })`
-  - Expect: compact source output, `searchId` in details, a `get_search_content` retrieval hint, and no noisy metadata by default.
+  - Expect: compact titles, URLs, and source snippets; `searchId` in details; a `get_search_content` retrieval hint; and no noisy raw metadata by default.
 - [ ] Multi-query search: `web_search({ queries: ["OpenAI web search official docs", "OpenAI responses API web search examples"], numResults: 3 })`
   - Expect: two query sections, `queryCount: 2`, partial failures do not hide successful queries.
 - [ ] Domain filter: `web_search({ query: "React useEffect cleanup", domainFilter: ["react.dev"], numResults: 3 })`
@@ -38,8 +38,10 @@ Start the local SearXNG instance first: run `start-web-search` (or rely on `web_
   - Expect: error content, `responseId`, `details.perUrl[0].httpStatus` near 404.
 - [ ] Long content durability: fetch a page large enough to exceed the inline preview cap, and one large enough to exceed 24K chars with `returnMetadata: true`.
   - Expect: single-page tool output stays preview-sized with a retrieval hint; for >24K content the session entry remains compact, `details.perUrl[0].contentRef` appears when metadata is requested, and `get_search_content` returns hydrated content while the disk cache exists.
+- [ ] Oversized/chunked response: fetch a controlled endpoint that streams more than 5 MiB without `Content-Length`.
+  - Expect: a `Response too large` error, method `http-size-limit`, early stream cancellation, and no Jina retry.
 - [ ] PDF URL: fetch a known public PDF URL.
-  - Expect: method `pdf`, content points to saved markdown, no binary dump.
+  - Expect: method `pdf`, readable markdown content is returned/stored, and `returnMetadata: true` exposes the collision-safe saved path under `metadata.pdf.outputPath`.
 - [ ] GitHub URL: `fetch_content({ url: "https://github.com/owner/repo" })` and a `/blob/` file URL.
   - Expect: repo/tree/file content and `fallbackPath` including `github` when metadata is requested.
 - [ ] JS-heavy fallback: fetch a known SPA or blocked page with `returnMetadata: true`.
@@ -77,7 +79,7 @@ Start the local SearXNG instance first: run `start-web-search` (or rely on `web_
 
 - Every fetch result includes a `responseId`.
 - Search calls include `searchId`; `fetch_content` calls include a `fetchId`/`responseId`.
-- Fetch details include `perUrl`/`results` status entries for single and multi-URL calls.
+- Fetch details include one canonical `perUrl` status array for single and multi-URL calls.
 - Partial failures do not hide successful URLs or queries.
 - Metadata is absent from normal search/fetch output unless `returnMetadata` is true.
 - Large source bodies are disk-backed instead of fully embedded in Pi's session log.

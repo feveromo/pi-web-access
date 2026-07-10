@@ -49,6 +49,32 @@ test("paper_research searches OpenAlex with filters and abstracts", async () => 
   }
 });
 
+test("paper_research rejects a pre-aborted caller even when data is cached", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    let fetches = 0;
+    globalThis.fetch = async () => {
+      fetches++;
+      return jsonResponse({ id: "https://openalex.org/W999", title: "Cached Paper" });
+    };
+
+    const { executePaperResearch } = await import(`../paper-research.ts?abort-cache=${Date.now()}`);
+    const params = { operation: "details", openAlexId: "W999" };
+    const warm = await executePaperResearch(params);
+    assert.match(warm.content[0].text, /Cached Paper/);
+
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      executePaperResearch(params, controller.signal),
+      err => err?.name === "AbortError",
+    );
+    assert.equal(fetches, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("paper_research verifies arXiv IDs before binding OpenAlex works", async () => {
   const originalFetch = globalThis.fetch;
   try {

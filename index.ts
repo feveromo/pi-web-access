@@ -1,16 +1,16 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import pLimit from "p-limit";
-import { fetchAllContent, type ExtractedContent, type ExtractOptions } from "./extract.js";
+import { fetchAllContent, type ExtractedContent } from "./extract.js";
 import { clearCloneCache } from "./github-extract.js";
 import { searxngSearch } from "./searxng.js";
 import { executePaperSearch } from "./paper-search.js";
 import { executePaperResearch } from "./paper-research.js";
 import { executeDocsSearch, executeOpenApiSearch } from "./docs-research.js";
 import { executeGitHubExamples } from "./github-examples.js";
-import type { SearchResult } from "./search-types.js";
+import { formatFullResults, formatSearchSummary } from "./search-output.js";
+import { createSearchScheduler, runSearchQueries } from "./web-search-runner.js";
 import {
 	clearResults,
 	deleteResult,
@@ -30,32 +30,22 @@ import { join } from "node:path";
 
 const WEB_SEARCH_CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
 const MAX_INLINE_CONTENT = 6000;
-const SEARCH_INLINE_ANSWER_MAX_CHARS = 3500;
-const DEFAULT_SEARCH_CONTENT_MAX_CHARS = 12000;
+const MAX_SEARCH_QUERIES = 8;
+const MAX_FETCH_URLS = 20;
+const DEFAULT_BATCH_CONTENT_MAX_CHARS = 12000;
+const MAX_BATCH_OUTPUT_CHARS = 60000;
 const SEARCH_QUERY_CONCURRENCY = 3;
 const DEFAULT_SHORTCUTS = { activity: "ctrl+shift+w" };
+const searchSchedule = createSearchScheduler(SEARCH_QUERY_CONCURRENCY);
 
 interface WebSearchConfig {
 	shortcuts?: { activity?: string };
 }
 
-interface ContentFetchStats {
-	totalUrls: number;
-	providerInlineUrls: number;
-	fallbackFetchedUrls: number;
-	successfulUrls: number;
-	failedUrls: number;
-	durationMs: number;
-}
-
 interface SearchReturnOptions {
 	queryList: string[];
 	results: QueryResultData[];
-	urls: string[];
-	includeContent: boolean;
-	inlineContent?: ExtractedContent[];
-	contentFetch?: ContentFetchStats;
-	contentFetchOptions?: ExtractOptions;
+	returnMetadata: boolean;
 }
 
 let widgetVisible = false;
@@ -84,10 +74,27 @@ function loadConfigForExtensionInit(): WebSearchConfig {
 
 function normalizeQueryList(queryList: unknown[]): string[] {
 	const normalized: string[] = [];
+	const seen = new Set<string>();
 	for (const query of queryList) {
 		if (typeof query !== "string") continue;
 		const trimmed = query.trim();
-		if (trimmed.length > 0) normalized.push(trimmed);
+		const key = trimmed.toLowerCase();
+		if (!trimmed || seen.has(key)) continue;
+		seen.add(key);
+		normalized.push(trimmed);
+	}
+	return normalized;
+}
+
+function normalizeUrlList(urlList: unknown[]): string[] {
+	const normalized: string[] = [];
+	const seen = new Set<string>();
+	for (const url of urlList) {
+		if (typeof url !== "string") continue;
+		const trimmed = url.trim();
+		if (!trimmed || seen.has(trimmed)) continue;
+		seen.add(trimmed);
+		normalized.push(trimmed);
 	}
 	return normalized;
 }
@@ -114,7 +121,7 @@ function normalizeContentIndexes(value: unknown): number[] {
 function normalizeRetrievalMaxChars(value: unknown): number | null {
 	if (typeof value !== "number" || !Number.isFinite(value)) return null;
 	const normalized = Math.floor(value);
-	return normalized > 0 ? normalized : null;
+	return normalized > 0 ? Math.min(normalized, 1_000_000) : null;
 }
 
 function capText(content: string, maxChars: number | null, marker: string): { text: string; truncated: boolean } {
@@ -155,34 +162,6 @@ function buildFetchDetail(result: ExtractedContent, index: number, includeMetada
 		contentRef: includeMetadata ? result.contentRef : undefined,
 		metadata: includeMetadata ? result.metadata : undefined,
 	};
-}
-
-function formatSourceListItem(result: SearchResult, index: number): string {
-	const date = result.publishedDate ? `\n   Published: ${result.publishedDate}` : "";
-	return `${index + 1}. ${result.title}\n   ${result.url}${date}`;
-}
-
-function formatSearchSummary(results: SearchResult[], answer: string, searchId: string, queryIndex: number): { text: string; truncated: boolean } {
-	const cappedAnswer = capText(answer, SEARCH_INLINE_ANSWER_MAX_CHARS, "\n\n[Inline search output capped; use get_search_content for full stored result]");
-	let output = cappedAnswer.text ? `${cappedAnswer.text}\n\n---\n\n**Sources:**\n` : "";
-	output += results.map(formatSourceListItem).join("\n\n");
-	if (cappedAnswer.truncated) {
-		output += `\n\n---\nFull search snippets stored as responseId "${searchId}". Use get_search_content({ responseId: "${searchId}", queryIndex: ${queryIndex} }) if you need the uncapped result text.`;
-	}
-	return { text: output, truncated: cappedAnswer.truncated };
-}
-
-function formatFullResults(queryData: QueryResultData): string {
-	let output = `## Results for: "${queryData.query}"\n\n`;
-	if (queryData.answer) {
-		output += `${queryData.answer}\n\n---\n\n`;
-	}
-	for (const r of queryData.results) {
-		output += `### ${r.title}\n${r.url}\n`;
-		if (r.publishedDate) output += `Published: ${r.publishedDate}\n`;
-		output += "\n";
-	}
-	return output;
 }
 
 function normalizeHeadingText(value: string): string {
@@ -241,73 +220,12 @@ function formatRetrievedFetch(item: ExtractedContent, maxChars: number | null): 
 	return capRetrievedText(formatFetchedContentForDisplay(item), maxChars);
 }
 
-function hasFullInlineCoverage(urls: string[], inlineContent: ExtractedContent[] | undefined): boolean {
-	if (!inlineContent || inlineContent.length === 0) return false;
-	const coveredUrls = new Set(inlineContent.map(c => c.url));
-	return urls.every(url => coveredUrls.has(url));
-}
-
-function dedupeExtractedContent(contents: ExtractedContent[]): ExtractedContent[] {
-	const byUrl = new Map<string, ExtractedContent>();
-	for (const item of contents) {
-		const previous = byUrl.get(item.url);
-		if (!previous) {
-			byUrl.set(item.url, item);
-			continue;
-		}
-		if (previous.error && !item.error) {
-			byUrl.set(item.url, item);
-			continue;
-		}
-		if ((previous.error === null) === (item.error === null) && item.content.length > previous.content.length) {
-			byUrl.set(item.url, item);
-		}
-	}
-	return [...byUrl.values()];
-}
-
-async function ensureRequestedContent(
-	opts: SearchReturnOptions,
-	signal?: AbortSignal,
-	onUpdate?: (update: { content: Array<{ type: string; text: string }>; details?: Record<string, unknown> }) => void,
-): Promise<SearchReturnOptions> {
-	if (!opts.includeContent || opts.urls.length === 0) return opts;
-
-	const startedAt = Date.now();
-	const providerInline = dedupeExtractedContent(opts.inlineContent ?? []);
-	const covered = new Set(providerInline.map(c => c.url));
-	const missingUrls = opts.urls.filter(url => !covered.has(url));
-	let fallbackFetched: ExtractedContent[] = [];
-
-	if (missingUrls.length > 0) {
-		onUpdate?.({
-			content: [{ type: "text", text: `Fetching full content for ${missingUrls.length}/${opts.urls.length} source(s)...` }],
-			details: { phase: "fetching-content", progress: 0.95, urlCount: missingUrls.length },
-		});
-		fallbackFetched = await fetchAllContent(missingUrls, signal, opts.contentFetchOptions);
-	}
-
-	const inlineContent = dedupeExtractedContent([...providerInline, ...fallbackFetched]);
-	return {
-		...opts,
-		inlineContent: inlineContent.length > 0 ? inlineContent : undefined,
-		contentFetch: {
-			totalUrls: opts.urls.length,
-			providerInlineUrls: providerInline.length,
-			fallbackFetchedUrls: fallbackFetched.length,
-			successfulUrls: inlineContent.filter(c => !c.error).length,
-			failedUrls: inlineContent.filter(c => c.error).length,
-			durationMs: Date.now() - startedAt,
-		},
-	};
-}
-
 function updateWidget(ctx: ExtensionContext): void {
 	const theme = ctx.ui.theme;
 	const entries = activityMonitor.getEntries();
 	const lines: string[] = [];
 
-	lines.push(theme.fg("accent", "─── Web Search Activity " + "─".repeat(36)));
+	lines.push(theme.fg("accent", "─── Web Access Activity " + "─".repeat(36)));
 
 	if (entries.length === 0) {
 		lines.push(theme.fg("muted", "  No activity yet"));
@@ -318,15 +236,6 @@ function updateWidget(ctx: ExtensionContext): void {
 	}
 
 	lines.push(theme.fg("accent", "─".repeat(60)));
-
-	const rateInfo = activityMonitor.getRateLimitInfo();
-	const resetMs = rateInfo.oldestTimestamp ? Math.max(0, rateInfo.oldestTimestamp + rateInfo.windowMs - Date.now()) : 0;
-	const resetSec = Math.ceil(resetMs / 1000);
-	lines.push(
-		theme.fg("muted", `Rate: ${rateInfo.used}/${rateInfo.max}`) +
-			(resetMs > 0 ? theme.fg("dim", ` (resets in ${resetSec}s)`) : ""),
-	);
-
 	ctx.ui.setWidget("web-activity", new Text(lines.join("\n"), 0, 0));
 }
 
@@ -334,11 +243,11 @@ function formatEntryLine(
 	entry: ActivityEntry,
 	theme: { fg: (color: string, text: string) => string },
 ): string {
-	const typeStr = entry.type === "api" ? "API" : "GET";
+	const typeStr = entry.type === "search" ? "SRCH" : entry.type === "api" ? "API" : "GET";
 	const target =
-		entry.type === "api"
-			? `"${truncateToWidth(entry.query || "", 28, "")}"`
-			: truncateToWidth(entry.url?.replace(/^https?:\/\//, "") || "", 30, "");
+		entry.type === "fetch"
+			? truncateToWidth(entry.url?.replace(/^https?:\/\//, "") || "", 30, "")
+			: `"${truncateToWidth(entry.query || "", 28, "")}"`;
 
 	const duration = entry.endTime
 		? `${((entry.endTime - entry.startTime) / 1000).toFixed(1)}s`
@@ -410,72 +319,61 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function buildSearchReturn(opts: SearchReturnOptions) {
-		const sc = opts.results.filter(r => !r.error).length;
-		const tr = opts.results.reduce((sum, r) => sum + r.results.length, 0);
+		const successfulQueries = opts.results.filter(result => !result.error).length;
+		const totalResults = opts.results.reduce((sum, result) => sum + result.results.length, 0);
 		const searchId = storeAndPublishSearch(opts.results);
 		const allDomains = new Set<string>();
-		const perQueryMetrics = opts.results.map(r => {
-			const domains = new Set(r.results.map(source => extractDomain(source.url)));
+		const perQueryMetrics = opts.results.map(result => {
+			const domains = new Set(result.results.map(source => extractDomain(source.url)));
 			for (const domain of domains) allDomains.add(domain);
+			const metadata = result.metadata ?? {};
 			return {
-				query: r.query,
-				provider: r.provider ?? null,
-				resultCount: r.results.length,
+				query: result.query,
+				provider: result.provider ?? null,
+				resultCount: result.results.length,
 				uniqueDomains: domains.size,
-				answerChars: r.answer.length,
-				snippetChars: r.results.reduce((sum, source) => sum + (source.snippet?.length ?? 0), 0),
-				error: r.error,
+				snippetChars: result.results.reduce((sum, source) => sum + source.snippet.length, 0),
+				durationMs: typeof metadata.tookMs === "number" ? metadata.tookMs : undefined,
+				engineCount: Array.isArray(metadata.engines) ? metadata.engines.length : undefined,
+				unresponsiveEngines: typeof metadata.unresponsiveEngines === "number" ? metadata.unresponsiveEngines : undefined,
+				cacheHit: metadata.cacheHit === true,
+				error: result.error,
 			};
 		});
 
 		let output = "";
-		let searchOutputTruncated = false;
+		let truncated = false;
 		for (let i = 0; i < opts.results.length; i++) {
 			const { query, answer, results, error } = opts.results[i];
-			if (opts.queryList.length > 1) output += `## Query ${i}: "${query}"\n\n`;
+			if (opts.queryList.length > 1) output += `## Query ${i + 1}: "${query}"\n\n`;
 			if (error) output += `Error: ${error}\n\n`;
 			else if (results.length === 0) output += "No results found.\n\n";
 			else {
 				const rendered = formatSearchSummary(results, answer, searchId, i);
-				searchOutputTruncated ||= rendered.truncated;
-				output += rendered.text + "\n\n";
+				truncated ||= rendered.truncated;
+				output += `${rendered.text}\n\n`;
 			}
 		}
-
-		let fetchId: string | null = null;
-		const hasInlineReady = hasFullInlineCoverage(opts.urls, opts.inlineContent);
-		if (hasInlineReady && opts.inlineContent) {
-			fetchId = storeAndPublishFetch(opts.inlineContent);
-			const batchHint = opts.inlineContent.length > 1 ? ` For multiple sources, use get_search_content({ responseId: "${fetchId}", urlIndexes: [0, 1] }).` : "";
-			output += `---\nFull content for ${opts.inlineContent.length} source(s) stored as responseId "${fetchId}". Use get_search_content({ responseId: "${fetchId}", urlIndex: 0 }) to retrieve one source.${batchHint}`;
-		} else if (opts.includeContent && opts.urls.length > 0) {
-			output += "---\nFull content was requested, but no source content was available.";
+		if (!truncated && totalResults > 0) {
+			output += `---\nSearch snippets stored as responseId "${searchId}". Use get_search_content({ responseId: "${searchId}", queryIndex: 0 }) only if you need the complete stored result set.`;
 		}
 
-		if (!searchOutputTruncated && opts.results.some(r => r.results.length > 0)) {
-			output += `\n---\nSearch results stored as responseId "${searchId}". Use get_search_content({ responseId: "${searchId}", queryIndex: 0 }) only if you need the full stored result text.`;
-		}
-
-		const queryMetadata = opts.results.some(r => r.metadata)
-			? opts.results.map(r => ({ query: r.query, provider: r.provider, metadata: r.metadata }))
+		const errors = [...new Set(opts.results.map(result => result.error).filter((error): error is string => !!error))];
+		const error = successfulQueries === 0 && errors.length > 0 ? errors.join("; ") : undefined;
+		const queryMetadata = opts.returnMetadata
+			? opts.results.map(result => ({ query: result.query, provider: result.provider, metadata: result.metadata }))
 			: undefined;
-
 		return {
 			content: [{ type: "text", text: output.trim() }],
 			details: {
 				queries: opts.queryList,
 				queryCount: opts.queryList.length,
-				successfulQueries: sc,
-				totalResults: tr,
-				includeContent: opts.includeContent,
-				fetchId,
+				successfulQueries,
+				totalResults,
 				searchId,
-				truncated: searchOutputTruncated,
-				metrics: {
-					uniqueDomains: allDomains.size,
-					perQuery: perQueryMetrics,
-				},
-				...(opts.contentFetch ? { contentFetch: opts.contentFetch } : {}),
+				truncated,
+				...(error ? { error } : {}),
+				metrics: { uniqueDomains: allDomains.size, perQuery: perQueryMetrics },
 				...(queryMetadata ? { metadata: queryMetadata } : {}),
 			},
 		};
@@ -512,71 +410,65 @@ export default function (pi: ExtensionAPI) {
 		name: "web_search",
 		label: "Web Search",
 		description:
-			"Keyless web research via a local self-hosted SearXNG meta-search (Google, Bing, DuckDuckGo, and more). Returns source titles, URLs, and snippets, stored for get_search_content. Use fetch_content for full page text. The instance auto-starts on first use (start-web-search / stop-web-search).",
+			"Keyless web research via a self-hosted SearXNG meta-search. Returns bounded source titles, URLs, and snippets, stored for get_search_content; use fetch_content for full pages. Uses SEARXNG_URL or attempts SEARXNG_START_HELPER/start-web-search for the default local endpoint.",
 		promptSnippet:
-			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles for discovery, then get_search_content / fetch_content only for exact stored results you need.",
+			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles for discovery, then fetch only the exact sources you need.",
 		promptGuidelines: [
-			"Backed by a local SearXNG instance aggregating many engines; no API key, unlimited calls. Results are snippets — use fetch_content on official/source URLs for full text before synthesizing.",
+			"SearXNG has no extension-enforced API quota, but upstream engines can throttle. Results are snippets — fetch official/source URLs before synthesizing important claims.",
 			"For current/news/status questions, set recencyFilter ('day'/'week'/'month') and include one query for breaking-risk/status terms such as halt, suspension, outage, recall, controversy, or latest filing.",
 		],
 		parameters: Type.Object({
-			query: Type.Optional(Type.String({ description: "Single search query. For research tasks, prefer 'queries' with multiple varied angles instead." })),
-			queries: Type.Optional(Type.Array(Type.String(), { description: "Multiple queries searched in sequence, each returning its own result set. Prefer varied angles, scope, and phrasing." })),
-			numResults: Type.Optional(Type.Number({ description: "Results per query (default: 5, max: 20)" })),
+			query: Type.Optional(Type.String({ maxLength: 1000, description: "Single search query. For research tasks, prefer 'queries' with multiple varied angles instead." })),
+			queries: Type.Optional(Type.Array(Type.String({ maxLength: 1000 }), { maxItems: MAX_SEARCH_QUERIES, description: `Up to ${MAX_SEARCH_QUERIES} queries searched with bounded concurrency. Prefer varied angles, scope, and phrasing.` })),
+			numResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Results per query (default: 5, max: 20)" })),
 			recencyFilter: Type.Optional(
 				StringEnum(["day", "week", "month", "year"], { description: "Filter by recency (mapped to SearXNG time_range)" }),
 			),
-			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude); mapped to site:/-site: query terms" })),
+			domainFilter: Type.Optional(Type.Array(Type.String({ maxLength: 255 }), { maxItems: 20, description: "Limit to domains (prefix with - to exclude); mapped to site:/-site: query terms" })),
+			returnMetadata: Type.Optional(Type.Boolean({ description: "Include raw per-query SearXNG provider/debug metadata in details" })),
 		}),
 
-		async execute(_toolCallId, params, signal) {
+		async execute(_toolCallId, params, signal, onUpdate) {
 			const rawQueryList: unknown[] = Array.isArray(params.queries)
 				? params.queries
 				: (params.query !== undefined ? [params.query] : []);
 			const queryList = normalizeQueryList(rawQueryList);
-
 			if (queryList.length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: No query provided. Use 'query' or 'queries' parameter." }],
 					details: { error: "No query provided", queries: [], queryCount: 0, successfulQueries: 0, totalResults: 0 },
 				};
 			}
+			if (queryList.length > MAX_SEARCH_QUERIES) {
+				const error = `Too many queries: ${queryList.length} provided, maximum ${MAX_SEARCH_QUERIES}.`;
+				return { content: [{ type: "text", text: `Error: ${error}` }], details: { error, queryCount: queryList.length } };
+			}
 
-			const perQuery = await Promise.all(
-				queryList.map(async (q) => {
+			const perQuery = await runSearchQueries({
+				queries: queryList,
+				schedule: searchSchedule,
+				signal,
+				onUpdate,
+				search: async (query: string) => {
+					const activityId = activityMonitor.logStart({ type: "search", query });
 					try {
-						const res = await searxngSearch(q, {
+						const response = await searxngSearch(query, {
 							numResults: params.numResults as number | undefined,
 							recencyFilter: params.recencyFilter as "day" | "week" | "month" | "year" | undefined,
 							domainFilter: params.domainFilter as string[] | undefined,
 							signal,
 						});
-						return {
-							query: q,
-							answer: res.answer,
-							results: res.results,
-							error: null as string | null,
-							provider: "searxng",
-							metadata: res.metadata,
-						};
-					} catch (e) {
-						return {
-							query: q,
-							answer: "",
-							results: [],
-							error: (e as Error).message,
-							provider: "searxng",
-						};
+						activityMonitor.logComplete(activityId, 200);
+						return response;
+					} catch (err) {
+						if (signal?.aborted) activityMonitor.logComplete(activityId, 0);
+						else activityMonitor.logError(activityId, err instanceof Error ? err.message : String(err));
+						throw err;
 					}
-				}),
-			);
-
-			return buildSearchReturn({
-				queryList,
-				results: perQuery,
-				urls: perQuery.flatMap((r) => r.results.map((s) => s.url)),
-				includeContent: false,
+				},
 			});
+
+			return buildSearchReturn({ queryList, results: perQuery, returnMetadata: params.returnMetadata === true });
 		},
 
 		renderCall(args, theme) {
@@ -586,14 +478,34 @@ export default function (pi: ExtensionAPI) {
 			return new Text(theme.fg("toolTitle", theme.bold("web_search ")) + theme.fg("accent", display), 0, 0);
 		},
 
-		renderResult(result, { expanded }, theme) {
-			const details = result.details as { totalResults?: number; error?: string; queryCount?: number; metrics?: { perQuery?: { provider?: string }[] } };
+		renderResult(result, { expanded, isPartial }, theme) {
+			const details = result.details as {
+				totalResults?: number;
+				error?: string;
+				queryCount?: number;
+				successfulQueries?: number;
+				phase?: string;
+				progress?: number;
+				currentQuery?: string;
+				metrics?: { uniqueDomains?: number };
+			};
+			if (isPartial) {
+				const progress = Math.max(0, Math.min(1, details?.progress ?? 0));
+				const filled = Math.floor(progress * 10);
+				const bar = "█".repeat(filled) + "░".repeat(10 - filled);
+				const label = details.currentQuery || details.phase || "searching";
+				return new Text(theme.fg("accent", `[${bar}] ${truncateToWidth(label, 50, "...")}`), 0, 0);
+			}
 			if (details?.error && (details.totalResults ?? 0) === 0) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
-			const summary = theme.fg("success", `${details?.totalResults ?? 0} results`) + theme.fg("muted", ` · searxng · ${details?.queryCount ?? 0} query(s)`);
+			const querySummary = details.queryCount && details.queryCount > 1
+				? `${details.successfulQueries ?? 0}/${details.queryCount} queries · `
+				: "";
+			let summary = theme.fg("success", `${querySummary}${details?.totalResults ?? 0} results`);
+			if (details.metrics?.uniqueDomains) summary += theme.fg("muted", ` · ${details.metrics.uniqueDomains} domains`);
 			if (!expanded) return new Text(summary, 0, 0);
 			const textContent = result.content.find((c) => c.type === "text")?.text || "";
-			const preview = textContent.length > 1000 ? textContent.slice(0, 1000) + "..." : textContent;
-			return new Text(summary + "\n" + theme.fg("dim", preview), 0, 0);
+			const preview = textContent.length > 1000 ? `${textContent.slice(0, 1000)}...` : textContent;
+			return new Text(`${summary}\n${theme.fg("dim", preview)}`, 0, 0);
 		},
 	});
 
@@ -816,26 +728,31 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet:
 			"Use to extract readable content from URLs, docs, PDFs, and GitHub repos. Prefer one urls:[...] call for several related pages.",
 		parameters: Type.Object({
-			url: Type.Optional(Type.String({ description: "Single URL to fetch" })),
-			urls: Type.Optional(Type.Array(Type.String(), { description: "Multiple URLs (parallel)" })),
+			url: Type.Optional(Type.String({ maxLength: 8000, description: "Single URL to fetch" })),
+			urls: Type.Optional(Type.Array(Type.String({ maxLength: 8000 }), { maxItems: MAX_FETCH_URLS, description: `Up to ${MAX_FETCH_URLS} URLs fetched with bounded concurrency` })),
 			forceClone: Type.Optional(Type.Boolean({
 				description: "Force cloning large GitHub repositories that exceed the size threshold",
 			})),
-			objective: Type.Optional(Type.String({ description: "Focus objective for highlights/summary extraction" })),
-			queries: Type.Optional(Type.Array(Type.String(), { description: "Related search queries/objectives used to rank highlights" })),
+			objective: Type.Optional(Type.String({ maxLength: 4000, description: "Focus objective for highlights/summary extraction" })),
+			queries: Type.Optional(Type.Array(Type.String({ maxLength: 1000 }), { maxItems: 20, description: "Related search queries/objectives used to rank highlights" })),
 			mode: Type.Optional(StringEnum(["full", "highlights", "summary"], { description: "Content shaping mode: full (default), highlights, or summary" })),
-			maxChars: Type.Optional(Type.Number({ description: "Maximum characters to return/store after content shaping" })),
-			timeoutMs: Type.Optional(Type.Number({ description: "Per-request timeout in milliseconds" })),
-			returnMetadata: Type.Optional(Type.Boolean({ description: "Include extraction metadata/status in details.perUrl" })),
+			maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000, description: "Maximum characters to return/store after content shaping" })),
+			timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 120_000, description: "Per-attempt timeout in milliseconds (default 30000)" })),
+			returnMetadata: Type.Optional(Type.Boolean({ description: "Include content references and nested shaping metadata in details.perUrl" })),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate) {
-			const urlList = params.urls ?? (params.url ? [params.url] : []);
+			const rawUrlList: unknown[] = Array.isArray(params.urls) ? params.urls : (params.url ? [params.url] : []);
+			const urlList = normalizeUrlList(rawUrlList);
 			if (urlList.length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: No URL provided." }],
 					details: { error: "No URL provided" },
 				};
+			}
+			if (urlList.length > MAX_FETCH_URLS) {
+				const error = `Too many URLs: ${urlList.length} provided, maximum ${MAX_FETCH_URLS}.`;
+				return { content: [{ type: "text", text: `Error: ${error}` }], details: { error, urlCount: urlList.length } };
 			}
 
 			onUpdate?.({
@@ -862,7 +779,7 @@ export default function (pi: ExtensionAPI) {
 				if (result.error) {
 					return {
 						content: [{ type: "text", text: `Error: ${result.error}` }],
-						details: { urls: urlList, urlCount: 1, successful: 0, error: result.error, responseId, perUrl, results: perUrl },
+						details: { urls: urlList, urlCount: 1, successful: 0, error: result.error, responseId, perUrl },
 					};
 				}
 
@@ -897,7 +814,6 @@ export default function (pi: ExtensionAPI) {
 						contentRef: params.returnMetadata ? result.contentRef : undefined,
 						metadata: params.returnMetadata ? result.metadata : undefined,
 						perUrl,
-						results: perUrl,
 					},
 				};
 			}
@@ -914,7 +830,7 @@ export default function (pi: ExtensionAPI) {
 
 			return {
 				content: [{ type: "text", text: output }],
-				details: { urls: urlList, urlCount: urlList.length, successful, totalChars, responseId, perUrl, results: perUrl },
+				details: { urls: urlList, urlCount: urlList.length, successful, totalChars, responseId, perUrl },
 			};
 		},
 
@@ -997,16 +913,16 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet:
 			"Use after web_search/fetch_content when full stored content is needed via responseId plus query/url selectors. Use urlIndexes/queryIndexes or allUrls/allQueries to retrieve batches in one call.",
 		parameters: Type.Object({
-			responseId: Type.String({ description: "The responseId from web_search or fetch_content" }),
-			query: Type.Optional(Type.String({ description: "Get content for this query (web_search)" })),
-			queryIndex: Type.Optional(Type.Number({ description: "Get content for query at index" })),
-			queryIndexes: Type.Optional(Type.Array(Type.Number(), { description: "Get content for multiple query indexes" })),
+			responseId: Type.String({ maxLength: 128, description: "The responseId from web_search or fetch_content" }),
+			query: Type.Optional(Type.String({ maxLength: 1000, description: "Get content for this query (web_search)" })),
+			queryIndex: Type.Optional(Type.Integer({ minimum: 0, description: "Get content for query at index" })),
+			queryIndexes: Type.Optional(Type.Array(Type.Integer({ minimum: 0 }), { maxItems: MAX_SEARCH_QUERIES, description: "Get content for multiple query indexes" })),
 			allQueries: Type.Optional(Type.Boolean({ description: "Get content for all queries in a stored web_search result" })),
-			url: Type.Optional(Type.String({ description: "Get content for this URL" })),
-			urlIndex: Type.Optional(Type.Number({ description: "Get content for URL at index" })),
-			urlIndexes: Type.Optional(Type.Array(Type.Number(), { description: "Get content for multiple URL indexes" })),
+			url: Type.Optional(Type.String({ maxLength: 8000, description: "Get content for this URL" })),
+			urlIndex: Type.Optional(Type.Integer({ minimum: 0, description: "Get content for URL at index" })),
+			urlIndexes: Type.Optional(Type.Array(Type.Integer({ minimum: 0 }), { maxItems: MAX_FETCH_URLS, description: "Get content for multiple URL indexes" })),
 			allUrls: Type.Optional(Type.Boolean({ description: "Get content for all URLs in a stored fetch result" })),
-			maxChars: Type.Optional(Type.Number({ description: "Optional per-item character cap for retrieved content" })),
+			maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000, description: `Optional per-item cap; batches default to ${DEFAULT_BATCH_CONTENT_MAX_CHARS} characters per item` })),
 		}),
 
 		async execute(_toolCallId, params) {
@@ -1078,17 +994,23 @@ export default function (pi: ExtensionAPI) {
 
 				let truncated = false;
 				let resultCount = 0;
+				const batchMaxChars = maxChars ?? DEFAULT_BATCH_CONTENT_MAX_CHARS;
 				const sections = selected.map(({ index, queryData }) => {
 					if (queryData.error) return `## Query ${index}: "${queryData.query}"\n\nError: ${queryData.error}`;
 					resultCount += queryData.results.length;
-					const rendered = formatRetrievedSearch(queryData, maxChars);
+					const rendered = formatRetrievedSearch(queryData, batchMaxChars);
 					truncated ||= rendered.truncated;
 					return rendered.text.trim();
 				});
-				const output = sections.join("\n\n---\n\n");
+				const capped = capText(
+					sections.join("\n\n---\n\n"),
+					MAX_BATCH_OUTPUT_CHARS,
+					"\n\n[Batch output capped; retrieve fewer items or lower maxChars.]",
+				);
+				truncated ||= capped.truncated;
 				return {
-					content: [{ type: "text", text: output }],
-					details: { queryCount: selected.length, queryIndexes: selected.map(item => item.index), resultCount, contentLength: output.length, truncated },
+					content: [{ type: "text", text: capped.text }],
+					details: { queryCount: selected.length, queryIndexes: selected.map(item => item.index), resultCount, contentLength: capped.text.length, truncated, batchMaxChars },
 				};
 			}
 
@@ -1152,6 +1074,7 @@ export default function (pi: ExtensionAPI) {
 				let successful = 0;
 				let failed = 0;
 				let totalChars = 0;
+				const batchMaxChars = maxChars ?? DEFAULT_BATCH_CONTENT_MAX_CHARS;
 				const sections = selected.map(({ index, urlData }) => {
 					if (urlData.error) {
 						failed++;
@@ -1159,14 +1082,19 @@ export default function (pi: ExtensionAPI) {
 					}
 					successful++;
 					totalChars += urlData.content.length;
-					const rendered = formatRetrievedFetch(urlData, maxChars);
+					const rendered = formatRetrievedFetch(urlData, batchMaxChars);
 					truncated ||= rendered.truncated;
 					return `## URL ${index}: ${urlData.url}\n\n${rendered.text.trim()}`;
 				});
-				const output = sections.join("\n\n---\n\n");
+				const capped = capText(
+					sections.join("\n\n---\n\n"),
+					MAX_BATCH_OUTPUT_CHARS,
+					"\n\n[Batch output capped; retrieve fewer items or lower maxChars.]",
+				);
+				truncated ||= capped.truncated;
 				return {
-					content: [{ type: "text", text: output }],
-					details: { urlCount: selected.length, urlIndexes: selected.map(item => item.index), successful, failed, totalChars, contentLength: output.length, truncated },
+					content: [{ type: "text", text: capped.text }],
+					details: { urlCount: selected.length, urlIndexes: selected.map(item => item.index), successful, failed, totalChars, contentLength: capped.text.length, truncated, batchMaxChars },
 				};
 			}
 

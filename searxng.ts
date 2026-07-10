@@ -1,19 +1,27 @@
-// ponytail: keyless local web search via a self-hosted SearXNG instance.
-// Hits the JSON API on 127.0.0.1:8888 (see start-web-search / stop-web-search).
-// Auto-starts the instance on first use; one HTTP call per query. The power
-// (Google/Bing/DDG/70+ engines, maintained by the SearXNG project) lives in the
-// running instance, not this file.
+// Keyless local web search via a self-hosted SearXNG JSON API.
+// The extension can use an already-running SEARXNG_URL and, for the default
+// local endpoint, attempts the configurable SEARXNG_START_HELPER when needed.
 import { spawn } from "node:child_process";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbortError, readErrorSnippet, readResponseJson, requestSignal } from "./http-response.js";
+import { sanitizeSearchText } from "./search-output.js";
 import type { SearchResult } from "./search-types.js";
 
 const HOST = "127.0.0.1";
-const PORT = Number(process.env.SEARXNG_PORT ?? "8888");
-const BASE = `http://${HOST}:${PORT}`;
+const rawPort = Number(process.env.SEARXNG_PORT ?? "8888");
+const PORT = Number.isInteger(rawPort) && rawPort > 0 && rawPort <= 65535 ? rawPort : 8888;
+const CONFIGURED_URL = process.env.SEARXNG_URL?.trim() || "";
+const CONFIGURED_START_HELPER = process.env.SEARXNG_START_HELPER?.trim() || "";
+const BASE = normalizeBaseUrl(CONFIGURED_URL || `http://${HOST}:${PORT}`);
+const START_HELPER = CONFIGURED_START_HELPER || "start-web-search";
 const BROWSER_UA =
 	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-const START_HELPER = join(homedir(), ".local", "bin", "start-web-search");
+const HEALTH_TIMEOUT_MS = 2500;
+const HEALTH_TTL_MS = 15_000;
+const START_TIMEOUT_MS = 30_000;
+const SEARCH_TIMEOUT_MS = 30_000;
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const SEARCH_CACHE_TTL_MS = 2 * 60 * 1000;
+const MAX_SEARCH_CACHE_ENTRIES = 100;
 
 export interface SearxngSearchOptions {
 	numResults?: number;
@@ -28,64 +36,10 @@ export interface SearxngSearchResponse {
 	metadata?: Record<string, unknown>;
 }
 
-let startPromise: Promise<void> | null = null;
-
-async function isUp(signal?: AbortSignal): Promise<boolean> {
-	try {
-		const res = await fetch(`${BASE}/`, {
-			method: "GET",
-			signal,
-			headers: { "User-Agent": BROWSER_UA },
-		});
-		return res.ok;
-	} catch {
-		return false;
-	}
-}
-
-/** Ensure the local SearXNG instance is reachable; start it if not. Idempotent + dedup'd. */
-export async function ensureSearxngRunning(signal?: AbortSignal): Promise<void> {
-	if (await isUp(signal)) return;
-	if (!startPromise) {
-		startPromise = (async () => {
-			await new Promise<void>((resolve, reject) => {
-				const child = spawn(START_HELPER, [], {
-					stdio: ["ignore", "inherit", "inherit"],
-					detached: false,
-				});
-				child.on("exit", (code) => {
-					if (code === 0) resolve();
-					else reject(new Error(`start-web-search exited with code ${code}`));
-				});
-				child.on("error", reject);
-			});
-			// start-web-search blocks until its own readiness curl succeeds, so one
-			// confirm here is enough; no separate poll loop needed.
-			if (!(await isUp(signal))) {
-				throw new Error(
-					"SearXNG did not respond after start-web-search. Run it manually or check ~/.local/share/searxng/run.log.",
-			);
-			}
-		})().finally(() => {
-			startPromise = null;
-		});
-	}
-	await startPromise;
-}
-
-function buildQuery(rawQuery: string, domainFilter?: string[]): string {
-	let q = rawQuery.trim();
-	if (domainFilter && domainFilter.length > 0) {
-		const terms = domainFilter
-			.map((d) => d.trim())
-			.filter(Boolean)
-			.map((d) => {
-				if (d.startsWith("-")) return `-site:${d.slice(1)}`;
-				return `site:${d}`;
-			});
-		if (terms.length > 0) q = `${q} ${terms.join(" ")}`.trim();
-	}
-	return q;
+interface SharedTask<T> {
+	controller: AbortController;
+	promise: Promise<T>;
+	waiters: number;
 }
 
 interface SearxngRawResult {
@@ -97,138 +51,365 @@ interface SearxngRawResult {
 	publishedDate?: string;
 }
 
-function dedupAndLimit(results: SearchResult[], limit: number): SearchResult[] {
-	const seen = new Set<string>();
-	const out: SearchResult[] = [];
-	for (const r of results) {
-		const key = r.url.replace(/\/+$/, "").toLowerCase();
-		if (!key || seen.has(key)) continue;
-		seen.add(key);
-		out.push(r);
-		if (out.length >= limit) break;
+const searchCache = new Map<string, { expiresAt: number; response: SearxngSearchResponse }>();
+const inFlightSearches = new Map<string, SharedTask<SearxngSearchResponse>>();
+let readinessTask: SharedTask<void> | null = null;
+let healthyUntil = 0;
+
+function normalizeBaseUrl(value: string): string {
+	const parsed = new URL(value);
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+		throw new Error(`SEARXNG_URL must use http or https, got ${parsed.protocol}`);
 	}
-	return out;
+	return parsed.toString().replace(/\/+$/, "");
 }
 
-export async function searxngSearch(
-	query: string,
-	opts: SearxngSearchOptions = {},
-): Promise<SearxngSearchResponse> {
-	await ensureSearxngRunning(opts.signal);
-	const fullQuery = buildQuery(query, opts.domainFilter);
-	const numResults = Math.min(Math.max(opts.numResults ?? 5, 1), 20);
+function normalizeNumResults(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
+	return Math.min(20, Math.max(1, Math.floor(value)));
+}
 
-	const params = new URLSearchParams({
-		q: fullQuery,
-		format: "json",
-		safesearch: "0",
+function normalizeDomainFilter(value: string[] | undefined): string[] {
+	if (!Array.isArray(value)) return [];
+	const domains: string[] = [];
+	const seen = new Set<string>();
+	for (const raw of value) {
+		if (typeof raw !== "string") continue;
+		const domain = raw.trim();
+		if (!domain || domain === "-" || seen.has(domain)) continue;
+		seen.add(domain);
+		domains.push(domain);
+		if (domains.length >= 20) break;
+	}
+	return domains;
+}
+
+function buildQuery(rawQuery: string, domainFilter?: string[]): string {
+	let query = rawQuery.trim();
+	const terms = normalizeDomainFilter(domainFilter).map(domain =>
+		domain.startsWith("-") ? `-site:${domain.slice(1)}` : `site:${domain}`,
+	);
+	if (terms.length > 0) query = `${query} ${terms.join(" ")}`.trim();
+	return query;
+}
+
+function searchCacheKey(query: string, opts: SearxngSearchOptions): string {
+	return JSON.stringify({
+		query: query.trim().replace(/\s+/g, " ").toLowerCase(),
+		numResults: normalizeNumResults(opts.numResults),
+		recencyFilter: opts.recencyFilter,
+		domainFilter: normalizeDomainFilter(opts.domainFilter).sort(),
 	});
+}
+
+function cloneResponse(response: SearxngSearchResponse, cacheHit = false): SearxngSearchResponse {
+	return {
+		...response,
+		results: response.results.map(result => ({ ...result })),
+		metadata: response.metadata || cacheHit
+			? { ...(response.metadata ?? {}), ...(cacheHit ? { cacheHit: true } : {}) }
+			: undefined,
+	};
+}
+
+function cachedResponse(key: string): SearxngSearchResponse | null {
+	const cached = searchCache.get(key);
+	if (!cached) return null;
+	if (cached.expiresAt <= Date.now()) {
+		searchCache.delete(key);
+		return null;
+	}
+	searchCache.delete(key);
+	searchCache.set(key, cached);
+	return cloneResponse(cached.response, true);
+}
+
+function storeCachedResponse(key: string, response: SearxngSearchResponse): void {
+	if (searchCache.size >= MAX_SEARCH_CACHE_ENTRIES) {
+		const oldest = searchCache.keys().next().value as string | undefined;
+		if (oldest) searchCache.delete(oldest);
+	}
+	searchCache.set(key, { expiresAt: Date.now() + SEARCH_CACHE_TTL_MS, response: cloneResponse(response) });
+}
+
+async function waitForTask<T>(task: SharedTask<T>, signal?: AbortSignal): Promise<T> {
+	signal?.throwIfAborted();
+	task.waiters++;
+	try {
+		return await abortable(task.promise, signal);
+	} finally {
+		task.waiters--;
+		if (task.waiters === 0) task.controller.abort();
+	}
+}
+
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	signal.throwIfAborted();
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+	});
+}
+
+async function isUp(signal?: AbortSignal): Promise<boolean> {
+	signal?.throwIfAborted();
+	try {
+		const response = await fetch(`${BASE}/`, {
+			method: "GET",
+			signal: requestSignal(signal, HEALTH_TIMEOUT_MS),
+			headers: { "User-Agent": BROWSER_UA },
+		});
+		await response.body?.cancel().catch(() => {});
+		return response.ok;
+	} catch (err) {
+		if (signal?.aborted) throw signal.reason ?? err;
+		return false;
+	}
+}
+
+function startLocalSearxng(signal: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		signal.throwIfAborted();
+		let settled = false;
+		let stderr = "";
+		let terminationError: Error | null = null;
+		let forceTimer: ReturnType<typeof setTimeout> | undefined;
+		let settleTimer: ReturnType<typeof setTimeout> | undefined;
+		const detached = process.platform !== "win32";
+		const child = spawn(START_HELPER, [], {
+			stdio: ["ignore", "ignore", "pipe"],
+			detached,
+		});
+		const killChild = (killSignal: NodeJS.Signals) => {
+			try {
+				if (detached && child.pid) process.kill(-child.pid, killSignal);
+				else child.kill(killSignal);
+			} catch {
+			}
+		};
+		const finish = (err?: Error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(startTimer);
+			if (forceTimer) clearTimeout(forceTimer);
+			if (settleTimer) clearTimeout(settleTimer);
+			signal.removeEventListener("abort", onAbort);
+			if (err) reject(err);
+			else resolve();
+		};
+		const terminate = (err: Error) => {
+			if (terminationError || settled) return;
+			terminationError = err;
+			killChild("SIGTERM");
+			forceTimer = setTimeout(() => killChild("SIGKILL"), 1000);
+			settleTimer = setTimeout(() => finish(err), 2500);
+		};
+		const onAbort = () => terminate(
+			signal.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError"),
+		);
+		const startTimer = setTimeout(() => {
+			terminate(new Error(`SearXNG start helper timed out after ${START_TIMEOUT_MS / 1000}s`));
+		}, START_TIMEOUT_MS);
+		signal.addEventListener("abort", onAbort, { once: true });
+		child.stderr?.on("data", chunk => {
+			if (stderr.length < 4000) stderr += String(chunk).slice(0, 4000 - stderr.length);
+		});
+		child.once("error", err => {
+			const missing = (err as NodeJS.ErrnoException).code === "ENOENT";
+			finish(new Error(missing
+				? `SearXNG is unavailable at ${BASE}, and start helper "${START_HELPER}" was not found. Start SearXNG yourself or set SEARXNG_URL/SEARXNG_START_HELPER.`
+				: `Failed to run SearXNG start helper: ${err.message}`));
+		});
+		child.once("exit", (code, childSignal) => {
+			if (terminationError) {
+				finish(terminationError);
+			} else if (code === 0) {
+				finish();
+			} else {
+				const detail = stderr.trim() ? `: ${stderr.trim().replace(/\s+/g, " ").slice(0, 500)}` : "";
+				finish(new Error(`SearXNG start helper exited with ${code ?? childSignal ?? "unknown status"}${detail}`));
+			}
+		});
+	});
+}
+
+async function establishReadiness(signal: AbortSignal): Promise<void> {
+	if (await isUp(signal)) {
+		healthyUntil = Date.now() + HEALTH_TTL_MS;
+		return;
+	}
+	signal.throwIfAborted();
+	if (CONFIGURED_URL && !CONFIGURED_START_HELPER) {
+		throw new Error(`Configured SearXNG endpoint ${BASE} is unavailable. Start it or set SEARXNG_START_HELPER.`);
+	}
+	await startLocalSearxng(signal);
+	if (!(await isUp(signal))) {
+		throw new Error(`SearXNG did not respond at ${BASE} after the start helper completed.`);
+	}
+	healthyUntil = Date.now() + HEALTH_TTL_MS;
+}
+
+/** Ensure SearXNG is reachable. Concurrent callers share one cancellable startup task. */
+export async function ensureSearxngRunning(signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
+	if (healthyUntil > Date.now()) return;
+	if (!readinessTask) {
+		const controller = new AbortController();
+		const task = { controller, waiters: 0, promise: Promise.resolve() } as SharedTask<void>;
+		task.promise = establishReadiness(controller.signal).finally(() => {
+			if (readinessTask === task) readinessTask = null;
+		});
+		task.promise.catch(() => {});
+		readinessTask = task;
+	}
+	await waitForTask(readinessTask, signal);
+}
+
+function resultKey(rawUrl: string): string | null {
+	try {
+		const parsed = new URL(rawUrl);
+		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+		parsed.hash = "";
+		for (const key of [...parsed.searchParams.keys()]) {
+			if (/^(utm_|fbclid$|gclid$|mc_cid$|mc_eid$)/i.test(key)) parsed.searchParams.delete(key);
+		}
+		if (parsed.pathname.length > 1) parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+		return parsed.toString();
+	} catch {
+		return null;
+	}
+}
+
+function dedupeAndLimit(results: SearchResult[], limit: number): SearchResult[] {
+	const seen = new Set<string>();
+	const output: SearchResult[] = [];
+	for (const result of results) {
+		const key = resultKey(result.url);
+		if (!key || seen.has(key)) continue;
+		seen.add(key);
+		output.push(result);
+		if (output.length >= limit) break;
+	}
+	return output;
+}
+
+async function performSearch(query: string, opts: SearxngSearchOptions, signal: AbortSignal): Promise<SearxngSearchResponse> {
+	await ensureSearxngRunning(signal);
+	const fullQuery = buildQuery(query, opts.domainFilter);
+	const numResults = normalizeNumResults(opts.numResults);
+	const params = new URLSearchParams({ q: fullQuery, format: "json", safesearch: "0" });
 	if (opts.recencyFilter) {
-		// Recency = the user wants fresh results, so also pull SearXNG's news
-		// engines alongside general. News engines (duckduckgo/startpage/reuters)
-		// are the only sources that reliably return publishedDate for display.
 		params.set("time_range", opts.recencyFilter);
 		params.set("categories", "general,news");
 	}
 
 	const started = Date.now();
-	const res = await fetch(`${BASE}/search?${params.toString()}`, {
-		method: "GET",
-		signal: opts.signal,
-		headers: {
-			"User-Agent": BROWSER_UA,
-			Accept: "application/json",
-		},
-	});
-	if (!res.ok) {
-		const body = await res.text().catch(() => "");
-		throw new Error(`SearXNG search failed: HTTP ${res.status} ${body.slice(0, 200)}`);
+	let response: Response;
+	try {
+		response = await fetch(`${BASE}/search?${params.toString()}`, {
+			method: "GET",
+			signal: requestSignal(signal, SEARCH_TIMEOUT_MS),
+			headers: { "User-Agent": BROWSER_UA, Accept: "application/json" },
+		});
+	} catch (err) {
+		healthyUntil = 0;
+		throw err;
 	}
-	const data = (await res.json()) as { results?: SearxngRawResult[]; unresponsive_engines?: unknown[] };
-	const took = Date.now() - started;
+	if (!response.ok) {
+		const body = await readErrorSnippet(response, 200);
+		throw new Error(`SearXNG search failed: HTTP ${response.status}${body ? ` ${body}` : ""}`);
+	}
+	const data = await readResponseJson<{ results?: SearxngRawResult[]; unresponsive_engines?: unknown[] }>(response, MAX_RESPONSE_BYTES);
+	if (!data || typeof data !== "object" || !Array.isArray(data.results)) {
+		throw new Error("SearXNG returned malformed JSON: missing results array");
+	}
+	healthyUntil = Date.now() + HEALTH_TTL_MS;
 
 	const engineSet = new Set<string>();
-	const results: SearchResult[] = (data.results ?? [])
-		.filter((r) => r && r.url && r.title)
-		.map((r) => {
-			for (const e of r.engines ?? (r.engine ? [r.engine] : [])) engineSet.add(e);
-			return {
-				title: r.title!.trim(),
-				url: r.url!,
-				snippet: (r.content ?? "").trim(),
-				...(r.publishedDate ? { publishedDate: r.publishedDate } : {}),
-			};
+	const results: SearchResult[] = [];
+	for (const raw of data.results) {
+		if (!raw || typeof raw.url !== "string" || typeof raw.title !== "string") continue;
+		if (!resultKey(raw.url)) continue;
+		for (const engine of raw.engines ?? (typeof raw.engine === "string" ? [raw.engine] : [])) {
+			if (typeof engine === "string" && engine) engineSet.add(engine);
+		}
+		results.push({
+			title: sanitizeSearchText(raw.title),
+			url: raw.url.trim(),
+			snippet: sanitizeSearchText(typeof raw.content === "string" ? raw.content : ""),
+			...(typeof raw.publishedDate === "string" && raw.publishedDate.trim() ? { publishedDate: raw.publishedDate.trim() } : {}),
 		});
-
-	// When the user filtered by recency, time matters: stable-sort so dated
-	// results survive the limit (SearXNG otherwise ranks undated general/news
-	// items above the dated ones, cutting them off before display).
+	}
 	const pool = opts.recencyFilter
-		? [...results].sort((a, b) => (a.publishedDate ? 0 : 1) - (b.publishedDate ? 0 : 1))
+		? [...results].sort((a, b) => Number(!a.publishedDate) - Number(!b.publishedDate))
 		: results;
-
 	return {
 		answer: "",
-		results: dedupAndLimit(pool, numResults),
+		results: dedupeAndLimit(pool, numResults),
 		metadata: {
 			provider: "searxng",
-			engines: Array.from(engineSet).sort(),
-			tookMs: took,
+			engines: [...engineSet].sort(),
+			tookMs: Date.now() - started,
 			fullQuery,
 			unresponsiveEngines: Array.isArray(data.unresponsive_engines) ? data.unresponsive_engines.length : 0,
 		},
 	};
 }
 
-// --- self-check: node --experimental-vm-modules n/a; run directly ---
-// ponytail: one runnable check that fails if the parser/instance breaks.
-// Skips gracefully if SearXNG is down OR all engines are upstream-rate-limited
-// (e.g. after a big research run / stress test), so syntax checks don't false-fail.
+export async function searxngSearch(query: string, opts: SearxngSearchOptions = {}): Promise<SearxngSearchResponse> {
+	const normalizedQuery = typeof query === "string" ? query.trim() : "";
+	if (!normalizedQuery) throw new Error("No SearXNG query provided");
+	opts.signal?.throwIfAborted();
+	const key = searchCacheKey(normalizedQuery, opts);
+	const cached = cachedResponse(key);
+	if (cached) return cached;
+
+	let task = inFlightSearches.get(key);
+	if (!task) {
+		const controller = new AbortController();
+		task = { controller, waiters: 0, promise: Promise.resolve(null as never) };
+		const currentTask = task;
+		task.promise = performSearch(normalizedQuery, opts, controller.signal)
+			.then(response => {
+				storeCachedResponse(key, response);
+				return response;
+			})
+			.finally(() => {
+				if (inFlightSearches.get(key) === currentTask) inFlightSearches.delete(key);
+			});
+		task.promise.catch(() => {});
+		inFlightSearches.set(key, task);
+	}
+	return cloneResponse(await waitForTask(task, opts.signal));
+}
+
 async function main() {
-	const q = process.argv[2] ?? "rust async runtime";
-	console.log(`searxng self-check: "${q}"`);
+	const query = process.argv[2] ?? "rust async runtime";
+	console.log(`searxng self-check: "${query}"`);
 	try {
-		await ensureSearxngRunning();
-	} catch (e) {
-		console.log(`SKIP (instance not running): ${(e as Error).message}`);
-		return;
-	}
-	const r = await searxngSearch(q, { numResults: 5 });
-	console.log(`results: ${r.results.length}`);
-	console.log(`engines: ${(r.metadata?.engines as string[])?.join(", ") ?? "?"} (${r.metadata?.tookMs}ms)`);
-	for (const s of r.results) {
-		console.log(`  - ${s.title.slice(0, 64)}`);
-		console.log(`    ${s.url}`);
-	}
-	// synthetic parser invariant (does not depend on live results)
-	assert(dedupAndLimit([{ title: "a", url: "http://x.com/", snippet: "" }, { title: "b", url: "http://x.com", snippet: "" }], 5).length === 1, "dedup must collapse trailing-slash variants");
-	if (r.results.length === 0) {
-		// 0 results with engines unresponsive = upstream rate-limit/ban from bulk use
-		// (stress tests, large research runs). Instance + plumbing are fine; skip.
-		const unresponsive = (r.metadata?.unresponsiveEngines as number) ?? 0;
-		if (unresponsive > 0) {
-			console.log(`SKIP: 0 results, ${unresponsive} engine(s) unresponsive (upstream rate-limited). HTTP + parser OK.`);
-			return;
+		const response = await searxngSearch(query, { numResults: 5 });
+		console.log(`results: ${response.results.length}`);
+		console.log(`engines: ${(response.metadata?.engines as string[])?.join(", ") ?? "?"} (${response.metadata?.tookMs}ms)`);
+		for (const result of response.results) {
+			console.log(`  - ${result.title.slice(0, 64)}`);
+			console.log(`    ${result.url}`);
 		}
-		console.error("FAIL: 0 results and no engine reported unresponsive — possible parser breakage");
-		process.exit(1);
-	}
-	assert(r.results.every((s) => s.url.startsWith("http")), "all results must have absolute URLs");
-	console.log("OK");
-}
-
-function assert(cond: unknown, msg: string): asserts cond {
-	if (!cond) {
-		console.error(`ASSERT FAIL: ${msg}`);
-		process.exit(1);
+		assert(response.results.length > 0, "search must return at least one result");
+		assert(response.results.every(result => /^https?:\/\//.test(result.url)), "all results must use HTTP(S)");
+		console.log("OK");
+	} catch (err) {
+		if (isAbortError(err)) throw err;
+		console.error(err);
+		process.exitCode = 1;
 	}
 }
 
-// Run self-check when executed directly (not when imported).
-// node treats this as ESM ("type": "module"); import.meta.url is defined.
+function assert(condition: unknown, message: string): asserts condition {
+	if (!condition) throw new Error(`ASSERT FAIL: ${message}`);
+}
+
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
-	main().catch((e) => {
-		console.error(e);
-		process.exit(1);
-	});
+	void main();
 }

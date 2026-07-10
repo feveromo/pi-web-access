@@ -8,7 +8,7 @@ This fork removes the heavier/less predictable parts of the original extension:
 
 - **No curator UI** — `web_search` returns results directly. No browser page, no summary-review workflow, no `/curator`, no `/websearch`.
 - **No background follow-up turns** — `fetch_content` stores content before the tool returns; `web_search` returns snippets and stores full result text for later retrieval.
-- **Keyless local web search** — runs a self-hosted SearXNG meta-search instance (Google, Bing, DuckDuckGo, Brave, and more) on `127.0.0.1:8888`. No API key, no quota, unlimited calls; the instance auto-starts on first use via `start-web-search` / `stop-web-search` helpers.
+- **Keyless local web search** — uses a self-hosted SearXNG meta-search instance (Google, Bing, DuckDuckGo, Brave, and more). There is no extension-enforced API quota, though upstream engines can throttle. Set `SEARXNG_URL` for an existing instance; the default local endpoint is `127.0.0.1:8888` and can be started on demand when a `start-web-search` (or `SEARXNG_START_HELPER`) executable is installed.
 - **No legacy multi-provider paths** — fewer auth modes, fewer fallbacks, less latency variance.
 - **No video / YouTube / frame extraction** — this is research/content extraction only.
 - **No opaque `code_search` wrapper** — use explicit `docs_search`, `openapi_search`, `github_examples`, and `fetch_content` flows for docs/API/code evidence.
@@ -20,7 +20,7 @@ The goal is a clean baseline: small surface area, fewer surprises, and easier qu
 
 ### `web_search`
 
-Keyless web research via the local SearXNG meta-search instance. Returns source titles, URLs, and snippets; use `fetch_content` for full page text. The instance auto-starts on first use (`start-web-search` / `stop-web-search`).
+Keyless web research via SearXNG. Returns bounded source titles, URLs, and snippets; use `fetch_content` for full page text. Repeated identical searches use a short in-memory cache, and concurrent duplicates collapse into one backend request.
 
 ```ts
 web_search({ query: "TypeScript generics official docs" })
@@ -32,12 +32,13 @@ web_search({ query: "exclude noisy domain", domainFilter: ["-pinterest.com"] })
 
 | Parameter | Description |
 | --- | --- |
-| `query` / `queries` | Single query or multiple varied queries |
+| `query` / `queries` | Single query or up to 8 varied queries; duplicates are removed and active requests are limited to 3 |
 | `numResults` | Results per query, default 5, max 20 |
 | `recencyFilter` | `day`, `week`, `month`, `year` (mapped to SearXNG `time_range`); when set, also pulls SearXNG's news engines and surfaces `publishedDate` next to dated sources, since news engines are the ones that reliably return dates |
 | `domainFilter` | Include/exclude domains; prefix exclusions with `-` (mapped to `site:` / `-site:`) |
+| `returnMetadata` | Include raw SearXNG engine/debug metadata; compact timing/count signals are always in `details.metrics` |
 
-`details.metrics` reports result counts, unique domains, and per-query signals. For full source text, follow `web_search` with `fetch_content` on the official/source URLs. The instance aggregates many engines; when one engine is upstream-rate-limited, the rest keep contributing, so results stay useful even under load. General web engines (Google/DuckDuckGo/Startpage) do not return publication dates; dates appear only for `news`-category results, so they show up mainly when `recencyFilter` is set.
+`details.metrics` reports result counts, unique domains, timing, cache, engine, and partial-failure signals. For full source text, follow `web_search` with `fetch_content` on the official/source URLs. The instance aggregates many engines; when one engine is upstream-rate-limited, the rest can keep contributing. General web engines do not reliably return publication dates; dates show up mainly when `recencyFilter` enables news results.
 
 ### `fetch_content`
 
@@ -53,18 +54,20 @@ fetch_content({ url: "https://example.com/article", mode: "highlights", objectiv
 
 | Parameter | Description |
 | --- | --- |
-| `url` / `urls` | Single URL/path or multiple URLs |
+| `url` / `urls` | Single URL or up to 20 URLs; duplicates are removed and active requests are limited to 3 |
 | `forceClone` | Force clone GitHub repos over the size threshold |
 | `objective` | Focus objective for `highlights` / `summary` extraction |
 | `queries` | Related terms used for focused extraction |
 | `mode` | `full`, `highlights`, `summary` |
-| `maxChars` | Character cap for returned/stored content |
-| `timeoutMs` | Per-request timeout |
-| `returnMetadata` | Include method, fallback path, HTTP status/type, truncation info |
+| `maxChars` | Character cap for shaped/stored content, max 1,000,000 |
+| `timeoutMs` | Per-attempt timeout, 100–120,000 ms; default 30,000 |
+| `returnMetadata` | Include content references and nested extraction/shaping metadata; compact status fields are always returned |
+
+HTTP/text bodies are stream-limited to 5 MiB and PDFs to 20 MiB even when a server omits or lies about `Content-Length`. Jina fallback is skipped for syntactically obvious private-address, credential-bearing, or signed URLs so those URLs are not sent to a third party.
 
 ### `get_search_content`
 
-Retrieve stored full content from prior `web_search` or `fetch_content` calls.
+Retrieve stored content from prior `web_search` or `fetch_content` calls. Single-item retrieval is full by default; batches default to 12,000 characters per item and a 60,000-character total response cap.
 
 ```ts
 get_search_content({ responseId: "abc123", urlIndex: 0 })
@@ -170,9 +173,9 @@ npm run check
 
 That wraps:
 
-- `npm run syntax` — parses every root `*.ts` file with Node.
+- `npm run syntax` — parses every root `*.ts` and `*.js` file with Node.
 - `npm test` — runs the regression tests.
-- `npm run scan:sensitive` — scans changed/untracked files for common credential patterns, private local paths, and accidental personal identifiers.
+- `npm run scan:sensitive -- --all` — scans tracked files plus untracked package candidates for common credential patterns, private local paths, and accidental personal identifiers.
 - `npm run pack:dry-run` — verifies the packed extension stays small and only ships intended files.
 
 For Pi-runtime confidence after reloading tool schemas, also run the manual regression checklist in `eval/web-access-checklist.md`. If `npm ls` reports missing `@earendil-works/*` or `typebox` peer dependencies in a plain checkout, that is expected: Pi supplies those packages when loading the extension.
@@ -184,7 +187,7 @@ Long research sessions should stay useful without stuffing giant blobs into Pi's
 - Search/fetch metadata is still persisted with `pi.appendEntry()` so `/search` and `get_search_content` survive reloads and tree navigation.
 - `docs_search` stores short-lived docs indexes under `~/.pi/web-access/docs-cache/` for quick reuse across reloads; the TTL is about 30 minutes to limit staleness.
 - Large fetched source bodies are stored outside the session under `~/.pi/web-access/content/`; the session entry keeps a compact preview plus a content reference.
-- `get_search_content` hydrates from that disk cache when available, while current-session calls also keep full content in memory.
+- `get_search_content` hydrates large bodies from that disk cache on demand, keeping the in-memory/session representation compact.
 - Session restore keeps recent web-access entries for 24 hours; disk-backed large content is pruned after about 7 days.
 - Tool outputs are intentionally compact: `web_search` returns snippets and stores full result text, and `fetch_content` previews large single pages, while full stored results remain available through `get_search_content`.
 - For tight context work, prefer `mode: "highlights"` / `"summary"` and set `maxChars` explicitly.
@@ -199,7 +202,7 @@ Long research sessions should stay useful without stuffing giant blobs into Pi's
 
 ## PDF behavior
 
-PDF URLs are text-extracted and saved as markdown in `~/Downloads/`. No OCR is performed.
+PDF URLs are text-extracted, returned/stored as markdown, and also saved under `~/Downloads/`. Identical output is reused; differing existing files are never overwritten and receive a numeric suffix. Extraction defaults to at most 100 pages and 2,000,000 markdown characters, cleans up pdf.js resources, and honors cancellation before persistence and between pages. No OCR is performed.
 
 ## Configuration
 
@@ -220,7 +223,7 @@ Config lives at `~/.pi/web-search.json` and every field is optional.
 }
 ```
 
-`web_search` is keyless: it talks to the local SearXNG instance (see `start-web-search` / `stop-web-search`), so no search API key is configured here. `GITHUB_TOKEN` takes precedence over `githubToken`; either one raises GitHub API limits for `github_examples`. No scholarly API key is required: `paper_research` uses OpenAlex, arXiv/ar5iv, and Hugging Face public endpoints.
+`web_search` is keyless, so no search API key is configured here. By default it targets `http://127.0.0.1:8888` (override the port with `SEARXNG_PORT`). Set `SEARXNG_URL` to use another HTTP(S) instance and `SEARXNG_START_HELPER` to choose the executable used when the default endpoint is down. The package does not install SearXNG itself; if no helper is available, start the configured instance separately and the tool returns a precise setup error. `GITHUB_TOKEN` takes precedence over `githubToken`; either one raises GitHub API limits for `github_examples`. No scholarly API key is required.
 
 Keep `~/.pi/web-search.json` private (`chmod 600 ~/.pi/web-search.json`) and never commit it. If a key is pasted into chat, shell history, logs, or a public issue, rotate it with the provider even if the repository scan is clean.
 
@@ -257,6 +260,8 @@ There is intentionally no curator/browser UI in this fork.
 | `storage.ts` | Session-aware result storage with disk-backed large-content references |
 | `activity.ts` | Request activity tracking widget |
 | `search-types.ts` | Shared `SearchResult` type |
+| `search-output.js` | Bounded, sanitized search snippet formatting |
+| `http-response.js` | Shared timeout/body-size/error-response guards |
 
 ## Attribution
 

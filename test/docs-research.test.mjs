@@ -52,6 +52,29 @@ test("docs_search indexes llms.txt links and ranks docs pages", async () => {
   }
 });
 
+test("docs_search extracts HTML pages with Readability", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async url => {
+      const href = String(url);
+      if (href === "https://docs.html/") {
+        return textResponse(`<html><body><nav><a href="/guide">Guide</a></nav><main><h1>Docs Home</h1><p>Documentation landing page content.</p></main></body></html>`, "text/html");
+      }
+      if (href === "https://docs.html/guide") {
+        return textResponse(`<html><head><title>HTML Guide</title></head><body><article><h1>HTML Guide</h1><p>Configure the HTML client with a bounded timeout and cleanup handler.</p></article></body></html>`, "text/html");
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    };
+
+    const { executeDocsSearch } = await import(`../docs-research.ts?html=${Date.now()}`);
+    const result = await executeDocsSearch({ source: "https://docs.html/", mode: "crawl", query: "bounded timeout", maxPages: 2 });
+    assert.match(result.content[0].text, /HTML Guide/);
+    assert.match(result.content[0].text, /bounded timeout/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("docs_search defaults to compact result counts and snippets", async () => {
   const originalFetch = globalThis.fetch;
   try {

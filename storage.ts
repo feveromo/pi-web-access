@@ -9,7 +9,7 @@ import type { SearchResult } from "./search-types.js";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const CONTENT_STORE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SESSION_CONTENT_CHARS = 24_000;
-const CONTENT_STORE_PATH = join(homedir(), ".pi", "web-access", "content");
+const CONTENT_STORE_PATH = process.env.PI_WEB_ACCESS_CONTENT_DIR?.trim() || join(homedir(), ".pi", "web-access", "content");
 const CONTENT_REF_VERSION = 1;
 
 let lastContentPrune = 0;
@@ -192,6 +192,12 @@ export function getAllResults(): StoredSearchData[] {
 }
 
 export function deleteResult(id: string): boolean {
+	if (!storedResults.has(id)) return false;
+	try {
+		rmSync(resultDir(id), { recursive: true, force: true });
+	} catch {
+		return false;
+	}
 	return storedResults.delete(id);
 }
 
@@ -201,13 +207,33 @@ export function clearResults(): void {
 
 function isValidStoredData(data: unknown): data is StoredSearchData {
 	if (!data || typeof data !== "object") return false;
-	const d = data as Record<string, unknown>;
-	if (typeof d.id !== "string" || !d.id) return false;
-	if (d.type !== "search" && d.type !== "fetch") return false;
-	if (typeof d.timestamp !== "number") return false;
-	if (d.type === "search" && !Array.isArray(d.queries)) return false;
-	if (d.type === "fetch" && !Array.isArray(d.urls)) return false;
-	return true;
+	const stored = data as Record<string, unknown>;
+	if (typeof stored.id !== "string" || !/^[a-z0-9_-]{1,128}$/i.test(stored.id)) return false;
+	if (stored.type !== "search" && stored.type !== "fetch") return false;
+	if (typeof stored.timestamp !== "number" || !Number.isFinite(stored.timestamp)) return false;
+	if (stored.type === "search") {
+		if (!Array.isArray(stored.queries)) return false;
+		return stored.queries.every(query => {
+			if (!query || typeof query !== "object") return false;
+			const item = query as Record<string, unknown>;
+			if (typeof item.query !== "string" || typeof item.answer !== "string" || !Array.isArray(item.results)) return false;
+			if (item.error !== null && typeof item.error !== "string") return false;
+			return item.results.every(result => {
+				if (!result || typeof result !== "object") return false;
+				const source = result as Record<string, unknown>;
+				return typeof source.title === "string" && typeof source.url === "string" && typeof source.snippet === "string";
+			});
+		});
+	}
+	if (!Array.isArray(stored.urls)) return false;
+	return stored.urls.every(url => {
+		if (!url || typeof url !== "object") return false;
+		const item = url as Record<string, unknown>;
+		return typeof item.url === "string"
+			&& typeof item.title === "string"
+			&& typeof item.content === "string"
+			&& (item.error === null || typeof item.error === "string");
+	});
 }
 
 export function restoreFromSession(ctx: ExtensionContext): void {
@@ -217,7 +243,7 @@ export function restoreFromSession(ctx: ExtensionContext): void {
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type === "custom" && entry.customType === "web-search-results") {
 			const data = entry.data;
-			if (isValidStoredData(data) && now - data.timestamp < CACHE_TTL_MS) {
+			if (isValidStoredData(data) && data.timestamp <= now + 60_000 && now - data.timestamp < CACHE_TTL_MS) {
 				storedResults.set(data.id, data);
 			}
 		}

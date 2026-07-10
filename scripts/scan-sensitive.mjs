@@ -19,7 +19,10 @@ function gitLines(args) {
 
 const all = process.argv.includes("--all");
 const files = all
-  ? gitLines(["ls-files"])
+  ? [...new Set([
+      ...gitLines(["ls-files"]),
+      ...gitLines(["ls-files", "--others", "--exclude-standard"]),
+    ])]
   : [...new Set([
       ...gitLines(["diff", "--name-only"]),
       ...gitLines(["ls-files", "--others", "--exclude-standard"]),
@@ -57,4 +60,4 @@ if (findings.length > 0) {
   process.exit(1);
 }
 
-console.log(`Sensitive-residue scan passed (${files.length} ${all ? "tracked" : "changed/untracked"} file(s) checked).`);
+console.log(`Sensitive-residue scan passed (${files.length} ${all ? "tracked/untracked" : "changed/untracked"} file(s) checked).`);
