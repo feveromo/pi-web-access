@@ -5,7 +5,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import pLimit from "p-limit";
 import { fetchAllContent, type ExtractedContent, type ExtractOptions } from "./extract.js";
 import { clearCloneCache } from "./github-extract.js";
-import { search, type SearchProvider } from "./search.js";
+import { searxngSearch } from "./searxng.js";
 import { executePaperSearch } from "./paper-search.js";
 import { executePaperResearch } from "./paper-research.js";
 import { executeDocsSearch, executeOpenApiSearch } from "./docs-research.js";
@@ -36,7 +36,6 @@ const SEARCH_QUERY_CONCURRENCY = 3;
 const DEFAULT_SHORTCUTS = { activity: "ctrl+shift+w" };
 
 interface WebSearchConfig {
-	provider?: string;
 	shortcuts?: { activity?: string };
 }
 
@@ -81,13 +80,6 @@ function loadConfigForExtensionInit(): WebSearchConfig {
 		console.error(`[pi-web-access] ${message}`);
 		return {};
 	}
-}
-
-function normalizeProviderInput(value: unknown): SearchProvider | undefined {
-	if (value === undefined) return undefined;
-	if (typeof value !== "string") return "auto";
-	const normalized = value.trim().toLowerCase();
-	return normalized === "auto" || normalized === "exa" ? normalized : "auto";
 }
 
 function normalizeQueryList(queryList: unknown[]): string[] {
@@ -520,36 +512,24 @@ export default function (pi: ExtensionAPI) {
 		name: "web_search",
 		label: "Web Search",
 		description:
-			`Lean Exa-powered web research with source snippets/citations. Output is compact and stored for get_search_content; use researchDepth: "deep" or contentMode: "text" only when needed. Published dates are shown when the provider supplies them.`,
+			"Keyless web research via a local self-hosted SearXNG meta-search (Google, Bing, DuckDuckGo, and more). Returns source titles, URLs, and snippets, stored for get_search_content. Use fetch_content for full page text. The instance auto-starts on first use (start-web-search / stop-web-search).",
 		promptSnippet:
-			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles for discovery, then get_search_content only for exact stored results you need.",
+			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles for discovery, then get_search_content / fetch_content only for exact stored results you need.",
 		promptGuidelines: [
-			"For current/news/market/status questions, set livecrawl to 'always' or 'fallback', use an appropriate recencyFilter, and include one query for breaking-risk/status terms such as halt, suspension, outage, recall, controversy, official update, or latest filing.",
-			"If snippets conflict, look stale, or omit the primary source, fetch_content the official/source URLs before synthesizing.",
-			"Do not request contentMode: 'text', includeContent, or large maxCharacters unless you need full source text immediately; use get_search_content later for selected sources.",
+			"Backed by a local SearXNG instance aggregating many engines; no API key, unlimited calls. Results are snippets — use fetch_content on official/source URLs for full text before synthesizing.",
+			"For current/news/status questions, set recencyFilter ('day'/'week'/'month') and include one query for breaking-risk/status terms such as halt, suspension, outage, recall, controversy, or latest filing.",
 		],
 		parameters: Type.Object({
 			query: Type.Optional(Type.String({ description: "Single search query. For research tasks, prefer 'queries' with multiple varied angles instead." })),
-			queries: Type.Optional(Type.Array(Type.String(), { description: "Multiple queries searched in sequence, each returning its own source-backed result set. Prefer varied angles, scope, and phrasing." })),
+			queries: Type.Optional(Type.Array(Type.String(), { description: "Multiple queries searched in sequence, each returning its own result set. Prefer varied angles, scope, and phrasing." })),
 			numResults: Type.Optional(Type.Number({ description: "Results per query (default: 5, max: 20)" })),
-			includeContent: Type.Optional(Type.Boolean({ description: "Fetch and store bounded full text before returning" })),
 			recencyFilter: Type.Optional(
-				StringEnum(["day", "week", "month", "year"], { description: "Filter by recency" }),
+				StringEnum(["day", "week", "month", "year"], { description: "Filter by recency (mapped to SearXNG time_range)" }),
 			),
-			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude)" })),
-			researchDepth: Type.Optional(StringEnum(["quick", "standard", "deep"], { description: "Exa retrieval depth: quick=fast default, standard=auto, deep=deeper retrieval" })),
-			searchType: Type.Optional(StringEnum(["fast", "auto", "deep-lite", "deep", "deep-reasoning"], { description: "Explicit Exa search type override" })),
-			contentMode: Type.Optional(StringEnum(["none", "highlights", "summary", "text"], { description: "Exa content returned with results (default highlights; text is larger)" })),
-			maxCharacters: Type.Optional(Type.Number({ description: "Maximum source text characters per result for Exa text/includeContent fallback" })),
-			livecrawl: Type.Optional(StringEnum(["never", "fallback", "always"], { description: "Exa livecrawl mode for fresher pages" })),
-			synthesize: Type.Optional(Type.Boolean({ description: "Use Exa answer synthesis instead of source-passage search" })),
-			returnMetadata: Type.Optional(Type.Boolean({ description: "Include provider/debug metadata in details and stored results" })),
-			provider: Type.Optional(
-				StringEnum(["auto", "exa"], { description: "Search provider (default: auto)" }),
-			),
+			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude); mapped to site:/-site: query terms" })),
 		}),
 
-		async execute(_toolCallId, params, signal, onUpdate) {
+		async execute(_toolCallId, params, signal) {
 			const rawQueryList: unknown[] = Array.isArray(params.queries)
 				? params.queries
 				: (params.query !== undefined ? [params.query] : []);
@@ -558,162 +538,62 @@ export default function (pi: ExtensionAPI) {
 			if (queryList.length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: No query provided. Use 'query' or 'queries' parameter." }],
-					details: { error: "No query provided" },
+					details: { error: "No query provided", queries: [], queryCount: 0, successfulQueries: 0, totalResults: 0 },
 				};
 			}
 
-			const allUrls: string[] = [];
-			const allInlineContent: ExtractedContent[] = [];
-			const resolvedProvider = normalizeProviderInput(params.provider ?? loadConfig().provider);
-			const queryLimit = pLimit(SEARCH_QUERY_CONCURRENCY);
-			let completedQueries = 0;
+			const perQuery = await Promise.all(
+				queryList.map(async (q) => {
+					try {
+						const res = await searxngSearch(q, {
+							numResults: params.numResults as number | undefined,
+							recencyFilter: params.recencyFilter as "day" | "week" | "month" | "year" | undefined,
+							domainFilter: params.domainFilter as string[] | undefined,
+							signal,
+						});
+						return {
+							query: q,
+							answer: res.answer,
+							results: res.results,
+							error: null as string | null,
+							provider: "searxng",
+							metadata: res.metadata,
+						};
+					} catch (e) {
+						return {
+							query: q,
+							answer: "",
+							results: [],
+							error: (e as Error).message,
+							provider: "searxng",
+						};
+					}
+				}),
+			);
 
-			const queryOutcomes = await Promise.all(queryList.map((query, index) => queryLimit(async () => {
-				onUpdate?.({
-					content: [{ type: "text", text: `Searching ${index + 1}/${queryList.length}: "${query}"...` }],
-					details: { phase: "search", progress: Math.min(0.9, completedQueries / queryList.length * 0.9), currentQuery: query },
-				});
-
-				try {
-					const { answer, results, inlineContent, provider, metadata } = await search(query, {
-						provider: resolvedProvider,
-						numResults: params.numResults,
-						recencyFilter: params.recencyFilter,
-						domainFilter: params.domainFilter,
-						includeContent: params.includeContent,
-						researchDepth: params.researchDepth,
-						searchType: params.searchType,
-						contentMode: params.contentMode,
-						maxCharacters: params.maxCharacters,
-						livecrawl: params.livecrawl,
-						synthesize: params.synthesize,
-						returnMetadata: params.returnMetadata,
-						signal,
-					});
-
-					return {
-						data: { query, answer, results, error: null, provider, metadata } satisfies QueryResultData,
-						urls: results.map(r => r.url),
-						inlineContent: inlineContent ?? [],
-					};
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					const requestedProvider = typeof resolvedProvider === "string" && resolvedProvider !== "auto"
-						? resolvedProvider
-						: undefined;
-					return {
-						data: { query, answer: "", results: [], error: message, provider: requestedProvider } satisfies QueryResultData,
-						urls: [],
-						inlineContent: [],
-					};
-				} finally {
-					completedQueries++;
-					onUpdate?.({
-						content: [{ type: "text", text: `Completed ${completedQueries}/${queryList.length} search(es)...` }],
-						details: { phase: "search", progress: Math.min(0.9, completedQueries / queryList.length * 0.9) },
-					});
-				}
-			})));
-
-			const searchResults = queryOutcomes.map(outcome => outcome.data);
-			for (const outcome of queryOutcomes) {
-				for (const url of outcome.urls) {
-					if (!allUrls.includes(url)) allUrls.push(url);
-				}
-				allInlineContent.push(...outcome.inlineContent);
-			}
-
-			const searchContentMaxChars = typeof params.maxCharacters === "number" && Number.isFinite(params.maxCharacters) && params.maxCharacters > 0
-				? Math.floor(params.maxCharacters)
-				: DEFAULT_SEARCH_CONTENT_MAX_CHARS;
-			const returnOptions = await ensureRequestedContent({
+			return buildSearchReturn({
 				queryList,
-				results: searchResults,
-				urls: allUrls,
-				includeContent: params.includeContent ?? false,
-				inlineContent: allInlineContent.length > 0 ? allInlineContent : undefined,
-				contentFetchOptions: { maxChars: searchContentMaxChars, queries: queryList },
-			}, signal, onUpdate as Parameters<typeof ensureRequestedContent>[2]);
-
-			return buildSearchReturn(returnOptions);
+				results: perQuery,
+				urls: perQuery.flatMap((r) => r.results.map((s) => s.url)),
+				includeContent: false,
+			});
 		},
 
 		renderCall(args, theme) {
-			const input = args as { query?: unknown; queries?: unknown };
-			const rawQueryList: unknown[] = Array.isArray(input.queries)
-				? input.queries
-				: (input.query !== undefined ? [input.query] : []);
-			const queryList = normalizeQueryList(rawQueryList);
-			if (queryList.length === 0) {
-				return new Text(theme.fg("toolTitle", theme.bold("search ")) + theme.fg("error", "(no query)"), 0, 0);
-			}
-			if (queryList.length === 1) {
-				const q = queryList[0];
-				const display = q.length > 60 ? q.slice(0, 57) + "..." : q;
-				return new Text(theme.fg("toolTitle", theme.bold("search ")) + theme.fg("accent", `"${display}"`), 0, 0);
-			}
-			const lines = [theme.fg("toolTitle", theme.bold("search ")) + theme.fg("accent", `${queryList.length} queries`)];
-			for (const q of queryList.slice(0, 5)) {
-				const display = q.length > 50 ? q.slice(0, 47) + "..." : q;
-				lines.push(theme.fg("muted", `  "${display}"`));
-			}
-			if (queryList.length > 5) {
-				lines.push(theme.fg("muted", `  ... and ${queryList.length - 5} more`));
-			}
-			return new Text(lines.join("\n"), 0, 0);
+			const { query, queries } = args as { query?: string; queries?: string[] };
+			const list = Array.isArray(queries) && queries.length ? queries : query ? [query] : [];
+			const display = list.length === 0 ? "(no query)" : list.length === 1 ? (list[0].length > 70 ? list[0].slice(0, 67) + "..." : list[0]) : `${list.length} queries`;
+			return new Text(theme.fg("toolTitle", theme.bold("web_search ")) + theme.fg("accent", display), 0, 0);
 		},
 
-		renderResult(result, { expanded, isPartial }, theme) {
-			const details = result.details as {
-				queryCount?: number;
-				successfulQueries?: number;
-				totalResults?: number;
-				error?: string;
-				fetchId?: string;
-				phase?: string;
-				progress?: number;
-				currentQuery?: string;
-				metrics?: { uniqueDomains?: number };
-			};
-
-			if (isPartial) {
-				const progress = details?.progress ?? 0;
-				const bar = "\u2588".repeat(Math.floor(progress * 10)) + "\u2591".repeat(10 - Math.floor(progress * 10));
-				const query = details?.currentQuery || details?.phase || "searching";
-				const display = query.length > 40 ? query.slice(0, 37) + "..." : query;
-				return new Text(theme.fg("accent", `[${bar}] ${display}`), 0, 0);
-			}
-
-			if (details?.error) {
-				return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
-			}
-
-			const queryInfo = details?.queryCount === 1 ? "" : `${details?.successfulQueries}/${details?.queryCount} queries, `;
-			let statusLine = theme.fg("success", `${queryInfo}${details?.totalResults ?? 0} sources`);
-			if (details?.metrics?.uniqueDomains) {
-				statusLine += theme.fg("muted", ` · ${details.metrics.uniqueDomains} domains`);
-			}
-			if (details?.fetchId) {
-				statusLine += theme.fg("muted", " (content ready)");
-			}
-
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as { totalResults?: number; error?: string; queryCount?: number; metrics?: { perQuery?: { provider?: string }[] } };
+			if (details?.error && (details.totalResults ?? 0) === 0) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
+			const summary = theme.fg("success", `${details?.totalResults ?? 0} results`) + theme.fg("muted", ` · searxng · ${details?.queryCount ?? 0} query(s)`);
+			if (!expanded) return new Text(summary, 0, 0);
 			const textContent = result.content.find((c) => c.type === "text")?.text || "";
-			if (!expanded) {
-				const firstContentLine = textContent.split("\n").find(l => {
-					const t = l.trim();
-					return t && !t.startsWith("#") && !t.startsWith("---");
-				});
-				const fallbackLine = (firstContentLine?.trim() || "").replace(/\*\*/g, "");
-				if (!fallbackLine) return new Text(statusLine, 0, 0);
-				const preview = fallbackLine.length > 120 ? fallbackLine.slice(0, 117) + "..." : fallbackLine;
-				const box = new Box(1, 0, (t) => theme.bg("toolSuccessBg", t));
-				box.addChild(new Text(statusLine, 0, 0));
-				box.addChild(new Text(theme.fg("dim", preview), 0, 0));
-				return box;
-			}
-
 			const preview = textContent.length > 1000 ? textContent.slice(0, 1000) + "..." : textContent;
-			return new Text(statusLine + "\n" + theme.fg("dim", preview), 0, 0);
+			return new Text(summary + "\n" + theme.fg("dim", preview), 0, 0);
 		},
 	});
 

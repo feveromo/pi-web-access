@@ -7,8 +7,8 @@ A slimmed-down fork of [`pi-web-access`](https://github.com/nicobailon/pi-web-ac
 This fork removes the heavier/less predictable parts of the original extension:
 
 - **No curator UI** — `web_search` returns results directly. No browser page, no summary-review workflow, no `/curator`, no `/websearch`.
-- **No background follow-up turns** — if `includeContent` is requested, content is fetched/stored before the tool returns.
-- **Exa-only web search** — direct Exa API when configured, otherwise Exa MCP fallback.
+- **No background follow-up turns** — `fetch_content` stores content before the tool returns; `web_search` returns snippets and stores full result text for later retrieval.
+- **Keyless local web search** — runs a self-hosted SearXNG meta-search instance (Google, Bing, DuckDuckGo, Brave, and more) on `127.0.0.1:8888`. No API key, no quota, unlimited calls; the instance auto-starts on first use via `start-web-search` / `stop-web-search` helpers.
 - **No legacy multi-provider paths** — fewer auth modes, fewer fallbacks, less latency variance.
 - **No video / YouTube / frame extraction** — this is research/content extraction only.
 - **No opaque `code_search` wrapper** — use explicit `docs_search`, `openapi_search`, `github_examples`, and `fetch_content` flows for docs/API/code evidence.
@@ -20,35 +20,24 @@ The goal is a clean baseline: small surface area, fewer surprises, and easier qu
 
 ### `web_search`
 
-Exa-powered web research with source snippets/citations.
+Keyless web research via the local SearXNG meta-search instance. Returns source titles, URLs, and snippets; use `fetch_content` for full page text. The instance auto-starts on first use (`start-web-search` / `stop-web-search`).
 
 ```ts
 web_search({ query: "TypeScript generics official docs" })
 web_search({ queries: ["React useEffect cleanup", "React effect cleanup fetch ignore"] })
 web_search({ query: "latest Node.js release", recencyFilter: "month" })
 web_search({ query: "site-specific docs", domainFilter: ["react.dev"] })
-web_search({ query: "deep topic", researchDepth: "deep" })
-web_search({ query: "need full source text", includeContent: true, contentMode: "text" })
-web_search({ query: "synthesize this", synthesize: true })
+web_search({ query: "exclude noisy domain", domainFilter: ["-pinterest.com"] })
 ```
 
 | Parameter | Description |
 | --- | --- |
 | `query` / `queries` | Single query or multiple varied queries |
 | `numResults` | Results per query, default 5, max 20 |
-| `includeContent` | Fetch/store bounded source text before returning; fallback fetches default to 12K chars per source unless `maxCharacters` is set |
-| `recencyFilter` | `day`, `week`, `month`, `year` |
-| `domainFilter` | Include/exclude domains; prefix exclusions with `-` |
-| `researchDepth` | `quick`, `standard`, `deep` |
-| `searchType` | Exa type override: `fast`, `auto`, `deep-lite`, `deep`, `deep-reasoning` |
-| `contentMode` | `none`, `highlights`, `summary`, `text` |
-| `maxCharacters` | Per-result source text cap when requesting text content or `includeContent` fallback fetching |
-| `livecrawl` | `never`, `fallback`, `always` |
-| `synthesize` | Use Exa answer synthesis instead of source-passage output |
-| `returnMetadata` | Include provider/source metadata in `details` |
-| `provider` | `auto` or `exa` |
+| `recencyFilter` | `day`, `week`, `month`, `year` (mapped to SearXNG `time_range`); when set, also pulls SearXNG's news engines and surfaces `publishedDate` next to dated sources, since news engines are the ones that reliably return dates |
+| `domainFilter` | Include/exclude domains; prefix exclusions with `-` (mapped to `site:` / `-site:`) |
 
-`details.metrics` reports useful quality signals: result counts, unique domains, answer chars, and snippet chars per query. When the provider supplies publication dates they are shown next to sources, which helps spot stale current-event results. When `includeContent` is enabled, `details.contentFetch` reports provider-inline vs fallback fetch coverage and timing.
+`details.metrics` reports result counts, unique domains, and per-query signals. For full source text, follow `web_search` with `fetch_content` on the official/source URLs. The instance aggregates many engines; when one engine is upstream-rate-limited, the rest keep contributing, so results stay useful even under load. General web engines (Google/DuckDuckGo/Startpage) do not return publication dates; dates appear only for `news`-category results, so they show up mainly when `recencyFilter` is set.
 
 ### `fetch_content`
 
@@ -75,7 +64,7 @@ fetch_content({ url: "https://example.com/article", mode: "highlights", objectiv
 
 ### `get_search_content`
 
-Retrieve stored full content from prior `web_search(includeContent: true)` or `fetch_content` calls.
+Retrieve stored full content from prior `web_search` or `fetch_content` calls.
 
 ```ts
 get_search_content({ responseId: "abc123", urlIndex: 0 })
@@ -152,12 +141,12 @@ github_examples({ operation: "read", repo: "huggingface/trl", path: "examples/sc
 
 ## Recommended workflow
 
-1. Use `web_search` with 2–4 meaningfully different queries for broad discovery. Independent query searches run with small bounded concurrency for speed without API stampedes; full result text is stored for later `get_search_content` retrieval.
+1. Use `web_search` with 2–4 meaningfully different queries for broad discovery; full result text is stored for later `get_search_content` retrieval.
 2. Prefer compact `docs_search` / `openapi_search` for official API details, then `fetch_content` the exact docs pages you need.
 3. Prefer `github_examples` before writing code against fast-moving libraries; read the exact example file/range that matches the task.
 4. Prefer `paper_search` for quick scholarly discovery and `paper_research` when you need OpenAlex citation graphs/topic maps, paper sections, abstract snippets, related works, or linked HF resources.
-5. For current/news/market/status topics, use `livecrawl: "fallback"` or `"always"`, set an appropriate `recencyFilter`, and include at least one risk/status query (`halt`, `suspension`, `outage`, `recall`, `official update`, `latest filing`, etc.).
-6. Use `includeContent: true`, `contentMode: "text"`, or large `maxCharacters` only when source text matters immediately.
+5. For current/news/market/status topics, set an appropriate `recencyFilter` (`day`/`week`/`month`/`year`) and include at least one risk/status query (`halt`, `suspension`, `outage`, `recall`, `official update`, `latest filing`, etc.).
+6. Use `fetch_content` (not `web_search`) when you need full source text from a known URL.
 7. Use `fetch_content` for selected pages, GitHub repos/files, and PDFs; one `urls: [...]` call is better than several one-at-a-time calls.
 8. Use `get_search_content` when inline output was truncated or content was stored; prefer `urlIndexes`/`queryIndexes` batch retrieval over many one-at-a-time calls.
 
@@ -197,7 +186,7 @@ Long research sessions should stay useful without stuffing giant blobs into Pi's
 - Large fetched source bodies are stored outside the session under `~/.pi/web-access/content/`; the session entry keeps a compact preview plus a content reference.
 - `get_search_content` hydrates from that disk cache when available, while current-session calls also keep full content in memory.
 - Session restore keeps recent web-access entries for 24 hours; disk-backed large content is pruned after about 7 days.
-- Tool outputs are intentionally compact: `web_search` caps inline synthesized snippets and `fetch_content` previews large single pages, while full stored results remain available through `get_search_content`.
+- Tool outputs are intentionally compact: `web_search` returns snippets and stores full result text, and `fetch_content` previews large single pages, while full stored results remain available through `get_search_content`.
 - For tight context work, prefer `mode: "highlights"` / `"summary"` and set `maxChars` explicitly.
 
 ## GitHub behavior
@@ -218,9 +207,7 @@ Config lives at `~/.pi/web-search.json` and every field is optional.
 
 ```json
 {
-  "exaApiKey": "exa-...",
   "githubToken": "github_pat_...",
-  "provider": "exa",
   "githubClone": {
     "enabled": true,
     "maxRepoSizeMB": 350,
@@ -233,7 +220,7 @@ Config lives at `~/.pi/web-search.json` and every field is optional.
 }
 ```
 
-`EXA_API_KEY` env var takes precedence over `exaApiKey`. If no Exa key is configured, the extension uses Exa MCP fallback. `GITHUB_TOKEN` takes precedence over `githubToken`; either one raises GitHub API limits for `github_examples`. No scholarly API key is required: `paper_research` uses OpenAlex, arXiv/ar5iv, and Hugging Face public endpoints.
+`web_search` is keyless: it talks to the local SearXNG instance (see `start-web-search` / `stop-web-search`), so no search API key is configured here. `GITHUB_TOKEN` takes precedence over `githubToken`; either one raises GitHub API limits for `github_examples`. No scholarly API key is required: `paper_research` uses OpenAlex, arXiv/ar5iv, and Hugging Face public endpoints.
 
 Keep `~/.pi/web-search.json` private (`chmod 600 ~/.pi/web-search.json`) and never commit it. If a key is pasted into chat, shell history, logs, or a public issue, rotate it with the provider even if the repository scan is clean.
 
@@ -258,8 +245,7 @@ There is intentionally no curator/browser UI in this fork.
 | File | Purpose |
 | --- | --- |
 | `index.ts` | Extension entry, tool definitions, `/search`, activity widget |
-| `search.ts` | Lean Exa search routing and cache |
-| `exa.ts` | Exa direct API and MCP fallback |
+| `searxng.ts` | Local SearXNG client + auto-start and self-check |
 | `extract.ts` | URL routing and HTTP/Jina extraction orchestration |
 | `github-extract.ts` | GitHub URL parsing, clone cache, repo/file extraction |
 | `github-api.ts` | GitHub API fallback for large repos and commit/blob views |
@@ -270,8 +256,7 @@ There is intentionally no curator/browser UI in this fork.
 | `github-examples.ts` | GitHub API example discovery and remote file-range reads |
 | `storage.ts` | Session-aware result storage with disk-backed large-content references |
 | `activity.ts` | Request activity tracking widget |
-| `search-types.ts` | Shared search option/result types |
-| `search-text.ts` | Search snippet sanitization helpers |
+| `search-types.ts` | Shared `SearchResult` type |
 
 ## Attribution
 

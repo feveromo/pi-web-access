@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **`web_search` is now keyless** and backed by a self-hosted local SearXNG meta-search instance (Google, Bing, DuckDuckGo, Brave, and more) on `127.0.0.1:8888`, started on demand via `start-web-search` / `stop-web-search`. The Exa provider, API key, MCP fallback, usage metering, and all Exa-specific options (`researchDepth`, `searchType`, `contentMode`, `maxCharacters`, `livecrawl`, `synthesize`, `includeContent`, `provider`) have been removed. `web_search` now takes only `query`/`queries`, `numResults`, `recencyFilter`, and `domainFilter`. Use `fetch_content` for full source text. Files removed: `exa.ts`, `search.ts`, `search-text.ts`.
+
 ### Added
 - Added short-lived disk-backed `docs_search` index caching under `~/.pi/web-access/docs-cache/`, with cache-hit metadata and a 30-minute TTL to survive quick Pi reloads without turning docs into a stale local mirror.
 - Added compact-output guardrails: `web_search` caps inline synthesized snippets and stores full search text for `get_search_content`, `docs_search` uses smaller default snippets, and large single-page `fetch_content` results now return a preview plus retrieval hint.
@@ -11,9 +14,6 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - `web_search` now displays provider publication dates when available and includes stronger tool guidance for current/news/market/status research.
-
-### Fixed
-- Suppressed binary/unreadable Exa snippets before they reach tool output while keeping the affected source URLs available for follow-up fetching.
 
 ## [0.10.8] - 2026-05-29
 

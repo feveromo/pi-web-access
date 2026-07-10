@@ -1,7 +1,7 @@
 {
   "name": "pi-web-access",
   "version": "0.10.8",
-  "description": "Lean Exa-powered web research, docs/API search, GitHub examples, URL fetching, PDF extraction, and scholarly research for Pi coding agent",
+  "description": "Keyless local-first web research via self-hosted SearXNG, docs/API search, GitHub examples, URL fetching, PDF extraction, and scholarly research for Pi coding agent",
   "type": "module",
   "scripts": {
     "test": "node --test",

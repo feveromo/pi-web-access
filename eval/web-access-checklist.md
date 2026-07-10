@@ -1,6 +1,6 @@
 # Web Access Manual Regression Checklist
 
-Run from a Pi session after reloading the extension/tool schemas. These checks exercise the lean Exa/OpenAlex/arXiv/Hugging Face/docs/OpenAPI/GitHub/HTTP/PDF paths that this fork intentionally keeps.
+Run from a Pi session after reloading the extension/tool schemas. These checks exercise the keyless SearXNG/OpenAlex/arXiv/Hugging Face/docs/OpenAPI/GitHub/HTTP/PDF paths that this fork intentionally keeps.
 
 ## Before manual runs
 
@@ -11,18 +11,20 @@ Run from a Pi session after reloading the extension/tool schemas. These checks e
 
 ## Search
 
+Start the local SearXNG instance first: run `start-web-search` (or rely on `web_search` auto-starting it on first call).
+
 - [ ] Basic search: `web_search({ query: "OpenAI official web search docs", numResults: 3 })`
   - Expect: compact source output, `searchId` in details, a `get_search_content` retrieval hint, and no noisy metadata by default.
 - [ ] Multi-query search: `web_search({ queries: ["OpenAI web search official docs", "OpenAI responses API web search examples"], numResults: 3 })`
   - Expect: two query sections, `queryCount: 2`, partial failures do not hide successful queries.
-- [ ] Metadata: `web_search({ query: "Exa search API contents highlights", provider: "exa", returnMetadata: true })`
-  - Expect: details/stored query metadata with provider API, source URLs, search type, and content mode.
-- [ ] Source text: `web_search({ query: "Pi coding agent extension docs", includeContent: true, numResults: 3 })`
-  - Expect: a `fetchId`, content fetch stats, compact inline output, and bounded source content retrievable via `get_search_content({ responseId: fetchId, urlIndex: 0 })`.
-- [ ] Stored-content batch retrieval: use the `fetchId`/`responseId` from a multi-source search or fetch with `get_search_content({ responseId: fetchId, urlIndexes: [0, 1], maxChars: 2000 })`.
+- [ ] Domain filter: `web_search({ query: "React useEffect cleanup", domainFilter: ["react.dev"], numResults: 3 })`
+  - Expect: results restricted to the included domain (mapped to `site:`). Exclusions use a `-` prefix.
+- [ ] Source text via fetch: run a `web_search`, then `fetch_content({ url: "<a result URL>" })`.
+  - Expect: full source text with a `responseId`, retrievable via `get_search_content({ responseId, urlIndex: 0 })`.
+- [ ] Stored-content batch retrieval: use the `fetchId`/`responseId` from a multi-source fetch with `get_search_content({ responseId: fetchId, urlIndexes: [0, 1], maxChars: 2000 })`.
   - Expect: both requested sources in one response, per-item truncation markers only when the cap is hit, and accurate batch details.
-- [ ] Current/status search guardrail: `web_search({ queries: ["official trading halt codes", "trading halt suspension official update"], recencyFilter: "month", livecrawl: "fallback", numResults: 3 })`
-  - Expect: fresh/official-leaning sources when available; provider publication dates are shown when supplied; stale/conflicting snippets are obvious enough to trigger `fetch_content` on primary sources.
+- [ ] Current/status search guardrail: `web_search({ queries: ["official trading halt codes", "trading halt suspension official update"], recencyFilter: "month", numResults: 3 })`
+  - Expect: fresh/official-leaning sources when available; when engines return dates, `publishedDate` is shown next to the source and dated results are surfaced; stale/conflicting snippets are obvious enough to trigger `fetch_content` on primary sources.
 
 ## Fetch
 
@@ -74,7 +76,7 @@ Run from a Pi session after reloading the extension/tool schemas. These checks e
 ## General expectations
 
 - Every fetch result includes a `responseId`.
-- Search calls include `searchId`; `includeContent` search calls also include a `fetchId` when source text is available.
+- Search calls include `searchId`; `fetch_content` calls include a `fetchId`/`responseId`.
 - Fetch details include `perUrl`/`results` status entries for single and multi-URL calls.
 - Partial failures do not hide successful URLs or queries.
 - Metadata is absent from normal search/fetch output unless `returnMetadata` is true.
