@@ -30,7 +30,7 @@ const homePattern = home ? new RegExp(`${escapeRegExp(home)}(?:/|$)`) : null;
 
 const patterns = [
   ["github token", /github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+/],
-  ["exa uuid key", /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i],
+  ["uuid-format key", /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i],
   ["secret assignment", /\b(api[_-]?key|token|secret|password)\b\s*[:=]\s*["']?[A-Za-z0-9_./+\-]{24,}/i],
   ...(homePattern ? [["local home path", homePattern]] : []),
   ["macOS user path", /\/Users\/[^\s`"']+/],

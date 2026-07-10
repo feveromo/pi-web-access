@@ -21,7 +21,7 @@ test("package stays lean and Pi-native", () => {
   assert.ok(!pkg.files.includes("eval/"));
   assert.ok(!pkg.files.includes("test/"));
 
-  assert.match(pkg.description, /Lean Exa-powered/);
+  assert.match(pkg.description, /Keyless local-first web research via self-hosted SearXNG/);
   assert.match(pkg.repository?.url, /github\.com\/feveromo\/pi-web-access/);
   assert.match(pkg.homepage, /github\.com\/feveromo\/pi-web-access/);
   assert.match(pkg.bugs?.url, /github\.com\/feveromo\/pi-web-access/);
