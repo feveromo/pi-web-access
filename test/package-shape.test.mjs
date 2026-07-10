@@ -10,11 +10,13 @@ test("package stays lean and Pi-native", () => {
 
   assert.equal(pkg.scripts?.test, "node --test");
   assert.match(pkg.scripts?.syntax ?? "", /node --check/);
+  assert.match(pkg.scripts?.syntax ?? "", /\*\.js/);
   assert.equal(pkg.scripts?.["pack:dry-run"], "npm pack --dry-run");
   assert.equal(pkg.scripts?.["scan:sensitive"], "node scripts/scan-sensitive.mjs");
-  assert.equal(pkg.scripts?.check, "npm run syntax && npm test && npm run scan:sensitive && npm run pack:dry-run");
+  assert.equal(pkg.scripts?.check, "npm run syntax && npm test && npm run scan:sensitive -- --all && npm run pack:dry-run");
 
   assert.ok(pkg.files.includes("*.ts"));
+  assert.ok(pkg.files.includes("*.js"));
   assert.ok(!pkg.files.includes("skills/"));
   assert.ok(pkg.files.includes("scripts/scan-sensitive.mjs"));
   assert.ok(!pkg.files.includes("banner.png"));

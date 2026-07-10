@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readErrorSnippet, readResponseJson, readResponseText } from "./http-response.js";
 
 export type GitHubExamplesOperation = "find" | "read";
 
@@ -49,6 +50,8 @@ const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
 const REQUEST_TIMEOUT_MS = 20000;
 const DEFAULT_MAX_RESULTS = 12;
 const MAX_RESULTS = 50;
+const MAX_GITHUB_JSON_BYTES = 20 * 1024 * 1024;
+const MAX_GITHUB_FILE_BYTES = 5 * 1024 * 1024;
 
 const EXAMPLE_PATTERNS = [
 	"scripts", "script", "examples", "example", "notebooks", "notebook",
@@ -145,14 +148,14 @@ function repoParts(repo: string): { owner: string; name: string } {
 
 async function fetchGitHubJson<T>(path: string, signal?: AbortSignal): Promise<T> {
 	const res = await fetch(`${GITHUB_API}${path}`, { headers: githubHeaders(), signal: requestSignal(signal) });
-	if (!res.ok) throw new Error(`GitHub API ${res.status}: ${(await res.text()).slice(0, 250)}`);
-	return await res.json() as T;
+	if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await readErrorSnippet(res, 250)}`);
+	return await readResponseJson<T>(res, MAX_GITHUB_JSON_BYTES);
 }
 
 async function fetchGitHubText(path: string, signal?: AbortSignal): Promise<string> {
 	const res = await fetch(`${GITHUB_API}${path}`, { headers: githubHeaders(true), signal: requestSignal(signal) });
-	if (!res.ok) throw new Error(`GitHub API ${res.status}: ${(await res.text()).slice(0, 250)}`);
-	return await res.text();
+	if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await readErrorSnippet(res, 250)}`);
+	return await readResponseText(res, MAX_GITHUB_FILE_BYTES);
 }
 
 async function findSimilarRepos(repo: string, signal?: AbortSignal): Promise<Array<{ full_name?: string; description?: string; stargazers_count?: number; html_url?: string }>> {

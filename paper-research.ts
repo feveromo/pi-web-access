@@ -1,5 +1,6 @@
 import { parseHTML } from "linkedom";
 import pLimit from "p-limit";
+import { readErrorSnippet, readResponseJson, readResponseText } from "./http-response.js";
 
 export type PaperResearchOperation =
 	| "search"
@@ -89,6 +90,10 @@ const REQUEST_TIMEOUT_MS = 20000;
 const MAX_RESULTS = 50;
 const MAX_SECTION_CHARS = 12000;
 const FETCH_CONCURRENCY = 5;
+const MAX_JSON_RESPONSE_BYTES = 5 * 1024 * 1024;
+const MAX_PAPER_HTML_BYTES = 10 * 1024 * 1024;
+const JSON_CACHE_TTL_MS = 30 * 60 * 1000;
+const JSON_CACHE_MAX_BYTES = 20 * 1024 * 1024;
 
 const OPENALEX_FIELDS = [
 	"id",
@@ -110,7 +115,9 @@ const OPENALEX_FIELDS = [
 ].join(",");
 
 const fetchLimit = pLimit(FETCH_CONCURRENCY);
-const jsonCache = new Map<string, unknown>();
+const graphLimit = pLimit(3);
+const jsonCache = new Map<string, { value: unknown; expiresAt: number; bytes: number }>();
+let jsonCacheBytes = 0;
 
 function clampInt(value: unknown, fallback: number, max: number): number {
 	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -125,6 +132,10 @@ function requestSignal(signal?: AbortSignal, timeoutMs = REQUEST_TIMEOUT_MS): Ab
 function errorMessage(err: unknown): string {
 	if (err instanceof Error && err.name === "TimeoutError") return `Timed out after ${REQUEST_TIMEOUT_MS / 1000}s`;
 	return err instanceof Error ? err.message : String(err);
+}
+
+function throwIfCallerAborted(signal: AbortSignal | undefined, err: unknown): void {
+	if (signal?.aborted) throw signal.reason ?? err;
 }
 
 function truncate(text: string | undefined, max = 500): string {
@@ -246,16 +257,56 @@ function topicNames(work: OpenAlexWork): string[] {
 	return [...topics, ...concepts].slice(0, 6);
 }
 
+function getCachedJson<T>(key: string): T | null {
+	const cached = jsonCache.get(key);
+	if (!cached) return null;
+	if (cached.expiresAt <= Date.now()) {
+		jsonCache.delete(key);
+		jsonCacheBytes -= cached.bytes;
+		return null;
+	}
+	jsonCache.delete(key);
+	jsonCache.set(key, cached);
+	return cached.value as T;
+}
+
+function storeCachedJson(key: string, value: unknown): void {
+	let bytes: number;
+	try {
+		bytes = Buffer.byteLength(JSON.stringify(value), "utf-8");
+	} catch {
+		return;
+	}
+	if (bytes > JSON_CACHE_MAX_BYTES) return;
+	const existing = jsonCache.get(key);
+	if (existing) {
+		jsonCache.delete(key);
+		jsonCacheBytes -= existing.bytes;
+	}
+	while (jsonCache.size > 0 && jsonCacheBytes + bytes > JSON_CACHE_MAX_BYTES) {
+		const oldestKey = jsonCache.keys().next().value as string;
+		const oldest = jsonCache.get(oldestKey);
+		jsonCache.delete(oldestKey);
+		if (oldest) jsonCacheBytes -= oldest.bytes;
+	}
+	jsonCache.set(key, { value, bytes, expiresAt: Date.now() + JSON_CACHE_TTL_MS });
+	jsonCacheBytes += bytes;
+}
+
 async function fetchJson<T>(url: URL, signal?: AbortSignal, useCache = true): Promise<T> {
+	signal?.throwIfAborted();
 	const key = url.toString();
-	if (useCache && jsonCache.has(key)) return jsonCache.get(key) as T;
+	if (useCache) {
+		const cached = getCachedJson<T>(key);
+		if (cached !== null) return cached;
+	}
 	const res = await fetch(url, {
 		headers: { "User-Agent": "pi-web-access/0.10 (https://github.com/feveromo/pi-web-access)" },
 		signal: requestSignal(signal),
 	});
-	if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 250)}`);
-	const data = await res.json() as T;
-	if (useCache && jsonCache.size < 500) jsonCache.set(key, data);
+	if (!res.ok) throw new Error(`HTTP ${res.status}: ${await readErrorSnippet(res, 250)}`);
+	const data = await readResponseJson<T>(res, MAX_JSON_RESPONSE_BYTES);
+	if (useCache) storeCachedJson(key, data);
 	return data;
 }
 
@@ -264,8 +315,8 @@ async function fetchText(url: string, signal?: AbortSignal): Promise<{ text: str
 		headers: { "Accept": "text/html,text/markdown,text/plain,*/*", "User-Agent": "pi-web-access/0.10" },
 		signal: requestSignal(signal, 30000),
 	});
-	if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-	return { text: await res.text(), url: res.url || url };
+	if (!res.ok) throw new Error(`HTTP ${res.status}: ${await readErrorSnippet(res, 200)}`);
+	return { text: await readResponseText(res, MAX_PAPER_HTML_BYTES), url: res.url || url };
 }
 
 function addOpenAlexFilters(url: URL, params: PaperResearchParams): void {
@@ -328,7 +379,8 @@ async function fetchOpenAlexWork(id: string, signal?: AbortSignal): Promise<Open
 	url.searchParams.set("select", OPENALEX_FIELDS);
 	try {
 		return await fetchJson<OpenAlexWork>(url, signal);
-	} catch {
+	} catch (err) {
+		throwIfCallerAborted(signal, err);
 		return null;
 	}
 }
@@ -338,13 +390,19 @@ async function fetchOpenAlexByDoi(doi: string, signal?: AbortSignal): Promise<Op
 	url.searchParams.set("select", OPENALEX_FIELDS);
 	try {
 		return await fetchJson<OpenAlexWork>(url, signal);
-	} catch {
+	} catch (err) {
+		throwIfCallerAborted(signal, err);
 		const searchUrl = new URL(`${OPENALEX_API}/works`);
 		searchUrl.searchParams.set("filter", `doi:${doi}`);
 		searchUrl.searchParams.set("per-page", "1");
 		searchUrl.searchParams.set("select", OPENALEX_FIELDS);
-		const data = await fetchJson<{ results?: OpenAlexWork[] }>(searchUrl, signal).catch(() => null);
-		return data?.results?.[0] ?? null;
+		try {
+			const data = await fetchJson<{ results?: OpenAlexWork[] }>(searchUrl, signal);
+			return data.results?.[0] ?? null;
+		} catch (fallbackErr) {
+			throwIfCallerAborted(signal, fallbackErr);
+			return null;
+		}
 	}
 }
 
@@ -352,7 +410,8 @@ async function fetchHfPaper(arxivId: string, signal?: AbortSignal): Promise<HfPa
 	try {
 		const url = new URL(`${HF_API}/papers/${arxivId}`);
 		return await fetchJson<HfPaper>(url, signal, false);
-	} catch {
+	} catch (err) {
+		throwIfCallerAborted(signal, err);
 		return null;
 	}
 }
@@ -370,6 +429,7 @@ async function resolveWork(params: PaperResearchParams, signal?: AbortSignal): P
 		const hfPaper = await fetchHfPaper(arxivId, signal);
 		const query = hfPaper?.title || arxivId;
 		const works = await searchOpenAlex({ ...params, query, maxResults: 5, includeAbstracts: true }, signal, true).catch(err => {
+			throwIfCallerAborted(signal, err);
 			warnings.push(`OpenAlex lookup by arXiv title failed: ${errorMessage(err)}`);
 			return [];
 		});
@@ -430,14 +490,24 @@ async function opMapTopic(params: PaperResearchParams, signal?: AbortSignal): Pr
 	const anchorCount = Math.min(clampInt(params.maxResults, 3, 8), 8);
 	const anchors = await searchOpenAlex({ ...params, maxResults: anchorCount, sortBy: params.sortBy ?? "citationCount" }, signal, true);
 	const lines = [`# Research map: "${query}"`, "", "This is a compact evidence graph: anchors → downstream citations / nearby related work. Treat it as a starting map, not a final survey.", ""];
-	const graph: Array<Record<string, unknown>> = [];
-	for (const anchor of anchors) {
+	const graph = await Promise.all(anchors.map(anchor => graphLimit(async () => {
+		const id = openAlexShortId(anchor);
+		const related = (anchor.related_works ?? []).slice(0, 3);
+		const [citations, relatedWorks] = await Promise.all([
+			id ? fetchLimit(() => searchCitedBy(id, 3, signal)).catch(err => {
+				throwIfCallerAborted(signal, err);
+				return [];
+			}) : Promise.resolve([]),
+			Promise.all(related.map(ref => fetchLimit(() => fetchOpenAlexWork(ref, signal))))
+				.then(works => works.filter((work): work is OpenAlexWork => !!work)),
+		]);
+		return { anchor, citations, related: relatedWorks };
+	})));
+	for (const branch of graph) {
+		const { anchor, citations, related: relatedWorks } = branch;
 		const id = openAlexShortId(anchor);
 		lines.push(`## Anchor: ${workTitle(anchor)}`);
 		lines.push([id ? `OpenAlex ${id}` : null, metadataBits(anchor)].filter(Boolean).join(" | "));
-		const citations = id ? await searchCitedBy(id, 3, signal).catch(() => []) : [];
-		const related = (anchor.related_works ?? []).slice(0, 3);
-		const relatedWorks = (await Promise.all(related.map(r => fetchLimit(() => fetchOpenAlexWork(r, signal))))).filter((work): work is OpenAlexWork => !!work);
 		if (citations.length) {
 			lines.push("**Downstream citing work:**");
 			for (const work of citations) lines.push(`- ${workTitle(work)} (${metadataBits(work)})${openAlexShortId(work) ? ` — ${openAlexShortId(work)}` : ""}`);
@@ -447,7 +517,6 @@ async function opMapTopic(params: PaperResearchParams, signal?: AbortSignal): Pr
 			for (const work of relatedWorks) lines.push(`- ${workTitle(work)} (${metadataBits(work)})${openAlexShortId(work) ? ` — ${openAlexShortId(work)}` : ""}`);
 		}
 		lines.push("");
-		graph.push({ anchor, citations, related: relatedWorks });
 	}
 	lines.push("Suggested loop: pick an anchor, inspect `citation_graph`, read methodology sections with `read_paper` when an arXiv ID exists, then fetch PDFs/project pages for missing full text.");
 	return { content: [{ type: "text", text: lines.join("\n") }], details: { operation: "map_topic", query, count: anchors.length, graph } };
@@ -517,18 +586,20 @@ async function opCitationGraph(params: PaperResearchParams, signal?: AbortSignal
 	if (!id) return failure("citation_graph", "Resolved paper has no OpenAlex ID.", params);
 	const limit = clampInt(params.maxResults, 10, MAX_RESULTS);
 	const direction = params.direction ?? "both";
-	let references: OpenAlexWork[] = [];
-	let citations: OpenAlexWork[] = [];
-	if (direction === "references" || direction === "both") {
-		const refIds = (work.referenced_works ?? []).slice(0, limit);
-		references = (await Promise.all(refIds.map(ref => fetchLimit(() => fetchOpenAlexWork(ref, signal))))).filter((w): w is OpenAlexWork => !!w);
-	}
-	if (direction === "citations" || direction === "both") {
-		citations = await searchCitedBy(id, limit, signal).catch(err => {
-			warnings.push(`cited-by lookup failed: ${errorMessage(err)}`);
-			return [];
-		});
-	}
+	const refIds = direction === "references" || direction === "both"
+		? (work.referenced_works ?? []).slice(0, limit)
+		: [];
+	const [references, citations] = await Promise.all([
+		Promise.all(refIds.map(ref => fetchLimit(() => fetchOpenAlexWork(ref, signal))))
+			.then(works => works.filter((candidate): candidate is OpenAlexWork => !!candidate)),
+		direction === "citations" || direction === "both"
+			? fetchLimit(() => searchCitedBy(id, limit, signal)).catch(err => {
+				throwIfCallerAborted(signal, err);
+				warnings.push(`cited-by lookup failed: ${errorMessage(err)}`);
+				return [];
+			})
+			: Promise.resolve([]),
+	]);
 	const lines = [`# Citation graph for ${workTitle(work)}`, `OpenAlex: ${id}`, workUrl(work), ""];
 	if (references.length || direction !== "citations") {
 		lines.push(`## References (${references.length}${work.referenced_works ? ` of ${work.referenced_works.length}` : ""})`);
@@ -697,6 +768,7 @@ async function opReadPaper(params: PaperResearchParams, signal?: AbortSignal): P
 			}
 			errors.push(`${base}: no sections found`);
 		} catch (err) {
+			throwIfCallerAborted(signal, err);
 			errors.push(`${base}: ${errorMessage(err)}`);
 		}
 	}
@@ -772,10 +844,14 @@ async function opLinkedResources(params: PaperResearchParams, signal?: AbortSign
 	if (!arxivId) return failure("linked_resources", "Provide an arXiv ID or a resolvable paper with arXiv metadata.", params);
 	const limit = String(clampInt(params.maxResults, 10, 25));
 	const sort = sortToHF(params.resourceSort);
+	const failedResource = (err: unknown) => {
+		throwIfCallerAborted(signal, err);
+		return [`Error: ${errorMessage(err)}`];
+	};
 	const [datasets, models, collections] = await Promise.all([
-		fetchHfList("datasets", { filter: `arxiv:${arxivId}`, limit, sort, direction: "-1" }, signal).catch(err => [`Error: ${errorMessage(err)}`]),
-		fetchHfList("models", { filter: `arxiv:${arxivId}`, limit, sort, direction: "-1" }, signal).catch(err => [`Error: ${errorMessage(err)}`]),
-		fetchHfList("collections", { paper: arxivId, limit }, signal).catch(err => [`Error: ${errorMessage(err)}`]),
+		fetchHfList("datasets", { filter: `arxiv:${arxivId}`, limit, sort, direction: "-1" }, signal).catch(failedResource),
+		fetchHfList("models", { filter: `arxiv:${arxivId}`, limit, sort, direction: "-1" }, signal).catch(failedResource),
+		fetchHfList("collections", { paper: arxivId, limit }, signal).catch(failedResource),
 	]);
 	const text = [`# Hugging Face resources linked to ${arxivId}`, `https://huggingface.co/papers/${arxivId}`, "", compactHfList("Datasets", datasets, "datasets"), "", compactHfList("Models", models, "models"), "", compactHfList("Collections", collections, "collections")].join("\n");
 	return { content: [{ type: "text", text }], details: { operation: "linked_resources", provider: "huggingface", arxivId, count: countHfResults(datasets) + countHfResults(models) + countHfResults(collections), datasets, models, collections } };
@@ -788,6 +864,7 @@ function failure(operation: string, message: string, params: PaperResearchParams
 export async function executePaperResearch(params: PaperResearchParams, signal?: AbortSignal): Promise<ToolReturn> {
 	const operation = params.operation;
 	try {
+		signal?.throwIfAborted();
 		switch (operation) {
 			case "search": return await opSearch(params, signal);
 			case "map_topic": return await opMapTopic(params, signal);
@@ -801,6 +878,7 @@ export async function executePaperResearch(params: PaperResearchParams, signal?:
 			default: return failure("unknown", `Unknown operation: ${String(operation)}`, params);
 		}
 	} catch (err) {
+		throwIfCallerAborted(signal, err);
 		return failure(operation ?? "unknown", errorMessage(err), params);
 	}
 }

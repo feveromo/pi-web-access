@@ -5,8 +5,21 @@ import pLimit from "p-limit";
 import { activityMonitor } from "./activity.js";
 import { extractPDFToMarkdown, isPDF } from "./pdf-extract.js";
 import { extractGitHub } from "./github-extract.js";
+import {
+	ResponseTooLargeError,
+	isSafeForThirdPartyFetch,
+	readErrorSnippet,
+	readResponseBytes,
+	readResponseText,
+	requestSignal,
+	uint8ArrayToArrayBuffer,
+} from "./http-response.js";
 
 const DEFAULT_TIMEOUT_MS = 30000;
+const MIN_TIMEOUT_MS = 100;
+const MAX_TIMEOUT_MS = 120000;
+const MAX_HTML_RESPONSE_BYTES = 5 * 1024 * 1024;
+const MAX_PDF_RESPONSE_BYTES = 20 * 1024 * 1024;
 const CONCURRENT_LIMIT = 3;
 
 const NON_RECOVERABLE_ERRORS = ["Unsupported content type", "Response too large"];
@@ -35,7 +48,12 @@ function normalizeMode(mode: unknown): ExtractMode {
 function normalizeMaxChars(value: unknown): number | null {
 	if (typeof value !== "number" || !Number.isFinite(value)) return null;
 	const rounded = Math.floor(value);
-	return rounded > 0 ? rounded : null;
+	return rounded > 0 ? Math.min(rounded, 1_000_000) : null;
+}
+
+function normalizeTimeoutMs(value: unknown, fallback = DEFAULT_TIMEOUT_MS): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.floor(value)));
 }
 
 function objectiveTokens(options?: ExtractOptions): Set<string> {
@@ -199,6 +217,7 @@ const JINA_TIMEOUT_MS = 30000;
 async function extractWithJinaReader(
 	url: string,
 	signal?: AbortSignal,
+	timeoutMs = JINA_TIMEOUT_MS,
 ): Promise<ExtractedContent | null> {
 	const jinaUrl = JINA_READER_BASE + url;
 
@@ -210,18 +229,16 @@ async function extractWithJinaReader(
 				"Accept": "text/markdown",
 				"X-No-Cache": "true",
 			},
-			signal: AbortSignal.any([
-				AbortSignal.timeout(JINA_TIMEOUT_MS),
-				...(signal ? [signal] : []),
-			]),
+			signal: requestSignal(signal, normalizeTimeoutMs(timeoutMs, JINA_TIMEOUT_MS)),
 		});
 
 		if (!res.ok) {
 			activityMonitor.logComplete(activityId, res.status);
+			await readErrorSnippet(res);
 			return null;
 		}
 
-		const content = await res.text();
+		const content = await readResponseText(res, MAX_HTML_RESPONSE_BYTES);
 		activityMonitor.logComplete(activityId, res.status);
 
 		const contentStart = content.indexOf("Markdown Content:");
@@ -262,10 +279,14 @@ export async function extractContent(
 	}
 
 
+	let parsedUrl: URL;
 	try {
-		new URL(url);
+		parsedUrl = new URL(url);
 	} catch {
 		return { url, title: "", content: "", error: "Invalid URL" };
+	}
+	if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+		return { url, title: "", content: "", error: `Unsupported URL protocol: ${parsedUrl.protocol}` };
 	}
 
 	fallbackPath.push("github");
@@ -293,10 +314,14 @@ export async function extractContent(
 		return finalizeResult(httpResult, options, httpResult.method ?? "http", fallbackPath);
 	}
 
-	fallbackPath.push("jina");
-	const jinaResult = await extractWithJinaReader(url, signal);
-	if (jinaResult) return finalizeResult(jinaResult, options, "jina", fallbackPath);
-	if (signal?.aborted) return abortedResult(url, fallbackPath);
+	if (isSafeForThirdPartyFetch(url)) {
+		fallbackPath.push("jina");
+		const jinaResult = await extractWithJinaReader(url, signal, options?.timeoutMs);
+		if (jinaResult) return finalizeResult(jinaResult, options, "jina", fallbackPath);
+		if (signal?.aborted) return abortedResult(url, fallbackPath);
+	} else {
+		fallbackPath.push("jina-skipped-sensitive-url");
+	}
 
 	const guidance = [
 		httpResult.error,
@@ -304,6 +329,9 @@ export async function extractContent(
 		"Fallback options:",
 		"  \u2022 Use web_search to find content about this topic",
 		"  \u2022 Fetch a more specific source URL, raw file, PDF, or official docs page",
+		...(fallbackPath.includes("jina-skipped-sensitive-url")
+			? ["  \u2022 Jina fallback was skipped to avoid sending a private or credential-bearing URL to a third party"]
+			: []),
 	].join("\n");
 	return finalizeResult({ ...httpResult, error: guidance }, options, httpResult.method ?? "http", fallbackPath);
 }
@@ -335,18 +363,13 @@ async function extractViaHttp(
 	signal?: AbortSignal,
 	options?: ExtractOptions,
 ): Promise<ExtractedContent> {
-	const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+	const timeoutMs = normalizeTimeoutMs(options?.timeoutMs);
+	const operationSignal = requestSignal(signal, timeoutMs);
 	const activityId = activityMonitor.logStart({ type: "fetch", url });
-
-	const controller = new AbortController();
-	const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-	const onAbort = () => controller.abort();
-	signal?.addEventListener("abort", onAbort);
 
 	try {
 		const response = await fetch(url, {
-			signal: controller.signal,
+			signal: operationSignal,
 			headers: {
 				"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 				"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -364,7 +387,7 @@ async function extractViaHttp(
 		const fetchedUrl = response.url || url;
 		const contentType = response.headers.get("content-type") || "";
 		const contentLengthHeader = response.headers.get("content-length");
-		const contentLength = contentLengthHeader ? parseInt(contentLengthHeader, 10) : undefined;
+		const contentLength = contentLengthHeader ? Number(contentLengthHeader) : undefined;
 		const httpMeta: Partial<ExtractedContent> = {
 			method: "http",
 			fetchedAt,
@@ -375,48 +398,40 @@ async function extractViaHttp(
 		};
 
 		if (!response.ok) {
+			const snippet = await readErrorSnippet(response, 200);
 			activityMonitor.logComplete(activityId, response.status);
 			return {
 				url,
 				title: "",
 				content: "",
-				error: `HTTP ${response.status}: ${response.statusText}`,
+				error: `HTTP ${response.status}: ${response.statusText}${snippet ? ` — ${snippet}` : ""}`,
 				...httpMeta,
 			};
 		}
-		const isPDFContent = isPDF(url, contentType);
-		const maxResponseSize = isPDFContent ? 20 * 1024 * 1024 : 5 * 1024 * 1024;
-		if (contentLengthHeader) {
-			const contentLength = parseInt(contentLengthHeader, 10);
-			if (contentLength > maxResponseSize) {
-				activityMonitor.logComplete(activityId, response.status);
-				return {
-					url,
-					title: "",
-					content: "",
-					error: `Response too large (${Math.round(contentLength / 1024 / 1024)}MB)`,
-					...httpMeta,
-					method: "http-size-limit",
-				};
-			}
-		}
 
+		const isPDFContent = isPDF(url, contentType);
 		if (isPDFContent) {
 			try {
-				const buffer = await response.arrayBuffer();
-				const result = await extractPDFToMarkdown(buffer, url);
+				const bytes = await readResponseBytes(response, MAX_PDF_RESPONSE_BYTES);
+				const result = await extractPDFToMarkdown(uint8ArrayToArrayBuffer(bytes), url, { signal: operationSignal });
 				activityMonitor.logComplete(activityId, response.status);
 				return {
 					url,
 					title: result.title,
-					content: `PDF extracted and saved to: ${result.outputPath}\n\nPages: ${result.pages}\nCharacters: ${result.chars}`,
+					content: result.content,
 					error: null,
 					...httpMeta,
 					method: "pdf",
+					metadata: { pdf: { outputPath: result.outputPath, pages: result.pages, chars: result.chars } },
 				};
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
-				activityMonitor.logError(activityId, message);
+				if (err instanceof ResponseTooLargeError) {
+					activityMonitor.logComplete(activityId, response.status);
+					return { url, title: "", content: "", error: message, ...httpMeta, method: "http-size-limit" };
+				}
+				if (operationSignal.aborted) activityMonitor.logComplete(activityId, 0);
+				else activityMonitor.logError(activityId, message);
 				return { url, title: "", content: "", error: `PDF extraction failed: ${message}`, ...httpMeta, method: "pdf" };
 			}
 		}
@@ -426,6 +441,7 @@ async function extractViaHttp(
 			contentType.includes("audio/") ||
 			contentType.includes("video/") ||
 			contentType.includes("application/zip")) {
+			await response.body?.cancel().catch(() => {});
 			activityMonitor.logComplete(activityId, response.status);
 			return {
 				url,
@@ -437,33 +453,34 @@ async function extractViaHttp(
 			};
 		}
 
-		const text = await response.text();
+		let text: string;
+		try {
+			text = await readResponseText(response, MAX_HTML_RESPONSE_BYTES);
+		} catch (err) {
+			if (err instanceof ResponseTooLargeError) {
+				activityMonitor.logComplete(activityId, response.status);
+				return { url, title: "", content: "", error: err.message, ...httpMeta, method: "http-size-limit" };
+			}
+			throw err;
+		}
 		const isHTML = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
-
 		if (!isHTML) {
 			activityMonitor.logComplete(activityId, response.status);
-			const title = extractTextTitle(text, url);
-			return { url, title, content: text, error: null, ...httpMeta, method: "text" };
+			return { url, title: extractTextTitle(text, url), content: text, error: null, ...httpMeta, method: "text" };
 		}
 
 		const { document } = parseHTML(text);
-		const reader = new Readability(document as unknown as Document);
-		const article = reader.parse();
-
+		const article = new Readability(document as unknown as Document).parse();
 		if (!article) {
 			activityMonitor.logComplete(activityId, response.status);
-
-			// Provide more specific error message
 			const jsRendered = isLikelyJSRendered(text);
-			const errorMsg = jsRendered
-				? "Page appears to be JavaScript-rendered (content loads dynamically)"
-				: "Could not extract readable content from HTML structure";
-
 			return {
 				url,
 				title: "",
 				content: "",
-				error: errorMsg,
+				error: jsRendered
+					? "Page appears to be JavaScript-rendered (content loads dynamically)"
+					: "Could not extract readable content from HTML structure",
 				...httpMeta,
 				method: jsRendered ? "js-rendered" : "readability-failed",
 			};
@@ -471,7 +488,6 @@ async function extractViaHttp(
 
 		const markdown = turndown.turndown(article.content);
 		activityMonitor.logComplete(activityId, response.status);
-
 		if (markdown.length < MIN_USEFUL_CONTENT) {
 			const incompleteJsRendered = isLikelyJSRendered(text);
 			return {
@@ -485,19 +501,12 @@ async function extractViaHttp(
 				method: incompleteJsRendered ? "js-rendered" : "readability-incomplete",
 			};
 		}
-
 		return { url, title: article.title || "", content: markdown, error: null, ...httpMeta, method: "readability" };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		if (message.toLowerCase().includes("abort")) {
-			activityMonitor.logComplete(activityId, 0);
-		} else {
-			activityMonitor.logError(activityId, message);
-		}
+		if (operationSignal.aborted || message.toLowerCase().includes("abort")) activityMonitor.logComplete(activityId, 0);
+		else activityMonitor.logError(activityId, message);
 		return { url, title: "", content: "", error: message, method: "http", fetchedAt: new Date().toISOString() };
-	} finally {
-		clearTimeout(timeoutId);
-		signal?.removeEventListener("abort", onAbort);
 	}
 }
 

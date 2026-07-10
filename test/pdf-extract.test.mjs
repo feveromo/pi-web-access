@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { getDocumentProxy } from "unpdf";
+import { extractPDFToMarkdown } from "../pdf-extract.ts";
 
 test("unpdf extracts text on Node 22 without native Promise.try", async () => {
   const originalPromiseTry = Promise.try;
@@ -22,6 +26,41 @@ test("unpdf extracts text on Node 22 without native Promise.try", async () => {
   } finally {
     if (originalPromiseTry) Promise.try = originalPromiseTry;
   }
+});
+
+test("PDF wrapper returns markdown and reuses identical output without overwriting", async () => {
+  const outputDir = mkdtempSync(join(tmpdir(), "pi-web-access-pdf-"));
+  try {
+    const first = await extractPDFToMarkdown(makePdf("Wrapped PDF text"), "https://example.test/paper.pdf", { outputDir, filename: "paper.md" });
+    const second = await extractPDFToMarkdown(makePdf("Wrapped PDF text"), "https://example.test/paper.pdf", { outputDir, filename: "paper.md" });
+
+    assert.match(first.content, /Wrapped PDF text/);
+    assert.equal(readFileSync(first.outputPath, "utf8"), first.content);
+    assert.equal(first.outputPath, second.outputPath);
+    assert.deepEqual(readdirSync(outputDir), ["paper.md"]);
+  } finally {
+    rmSync(outputDir, { recursive: true, force: true });
+  }
+});
+
+test("PDF wrapper bounds extracted markdown", async () => {
+  const outputDir = mkdtempSync(join(tmpdir(), "pi-web-access-pdf-cap-"));
+  try {
+    const result = await extractPDFToMarkdown(makePdf("A".repeat(5000)), "https://example.test/large.pdf", { outputDir, maxChars: 1000 });
+    assert.ok(result.content.length <= 1000);
+    assert.match(result.content, /truncated/i);
+  } finally {
+    rmSync(outputDir, { recursive: true, force: true });
+  }
+});
+
+test("PDF wrapper honors a pre-aborted signal", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    extractPDFToMarkdown(makePdf("cancel"), "https://example.test/cancel.pdf", { signal: controller.signal }),
+    err => err?.name === "AbortError",
+  );
 });
 
 function makePdf(text) {

@@ -5,10 +5,10 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "syntax": "find . -maxdepth 1 -name '*.ts' -print | sort | xargs -n1 node --check",
+    "syntax": "find . -maxdepth 1 \\( -name '*.ts' -o -name '*.js' \\) -print | sort | xargs -n1 node --check",
     "pack:dry-run": "npm pack --dry-run",
     "scan:sensitive": "node scripts/scan-sensitive.mjs",
-    "check": "npm run syntax && npm test && npm run scan:sensitive && npm run pack:dry-run"
+    "check": "npm run syntax && npm test && npm run scan:sensitive -- --all && npm run pack:dry-run"
   },
   "keywords": [
     "pi-package",
@@ -31,13 +31,14 @@
   "homepage": "https://github.com/feveromo/pi-web-access#readme",
   "files": [
     "*.ts",
+    "*.js",
     "scripts/scan-sensitive.mjs",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
   "dependencies": {
-    "@mozilla/readability": "^0.5.0",
+    "@mozilla/readability": "^0.6.0",
     "linkedom": "^0.16.0",
     "p-limit": "^6.1.0",
     "turndown": "^7.2.0",
