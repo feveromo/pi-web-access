@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import { test } from "node:test";
 
-import { fetchRemoteUrl, validateRemoteUrl, validateThirdPartySourceUrl } from "../ssrf-protection.ts";
+import { createPinnedLookup, fetchRemoteUrl, validateRemoteUrl, validateThirdPartySourceUrl } from "../ssrf-protection.ts";
 
 const publicLookup = async () => [{ address: "93.184.216.34", family: 4 }];
 
@@ -94,4 +95,148 @@ test("allowRanges rejects malformed and all-address CIDRs", async () => {
     await assert.rejects(validateRemoteUrl("http://198.18.0.5/", { allowRanges: [cidr] }), /Invalid CIDR notation/);
   }
   await assert.rejects(validateRemoteUrl("http://198.18.0.5/", { allowRanges: "198.18.0.0/15" }), /must be an array/);
+});
+
+test("pinned lookup returns only validated addresses in all and single forms", async () => {
+  const lookup = createPinnedLookup({
+    hostname: "Example.Test",
+    addresses: [
+      { address: "93.184.216.34", family: 4 },
+      { address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 },
+    ],
+  });
+  const call = options => new Promise((resolve, reject) => {
+    lookup("example.test", options, (error, ...values) => error ? reject(error) : resolve(values));
+  });
+  assert.deepEqual(await call({ all: true }), [[
+    { address: "93.184.216.34", family: 4 },
+    { address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 },
+  ]]);
+  assert.deepEqual(await call({ family: 6 }), ["2606:2800:220:1:248:1893:25c8:1946", 6]);
+  await assert.rejects(new Promise((resolve, reject) => {
+    lookup("attacker.test", {}, error => error ? reject(error) : resolve());
+  }), /unexpected hostname/);
+});
+
+test("each redirect gets independent DNS pins and strips cross-origin secrets", async () => {
+  const dnsAnswers = new Map([
+    ["first.test", [{ address: "93.184.216.34", family: 4 }]],
+    ["second.test", [{ address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 }]],
+  ]);
+  const lookupCalls = [];
+  const dispatchers = [];
+  const seen = [];
+  const response = await fetchRemoteUrl("https://first.test/start", {
+    headers: { Authorization: "Bearer secret", Cookie: "session=x", "Proxy-Authorization": "Basic x", "X-Safe": "yes" },
+  }, {
+    lookup: async hostname => {
+      lookupCalls.push(hostname);
+      return dnsAnswers.get(hostname);
+    },
+    fetch: async (url, init) => {
+      dispatchers.push(init.dispatcher);
+      seen.push({ url: url.toString(), headers: new Headers(init.headers) });
+      return seen.length === 1
+        ? new Response("redirect", { status: 302, headers: { location: "https://second.test/end" } })
+        : new Response("ok");
+    },
+  });
+  assert.equal(await response.text(), "ok");
+  assert.deepEqual(lookupCalls, ["first.test", "second.test"]);
+  assert.notEqual(dispatchers[0], dispatchers[1]);
+  assert.deepEqual(seen.map(item => item.url), ["https://first.test/start", "https://second.test/end"]);
+  assert.equal(seen[1].headers.get("authorization"), null);
+  assert.equal(seen[1].headers.get("cookie"), null);
+  assert.equal(seen[1].headers.get("proxy-authorization"), null);
+  assert.equal(seen[1].headers.get("x-safe"), "yes");
+});
+
+test("connection uses the validated pin while retaining the original hostname identity", async t => {
+  let hostHeader;
+  const server = http.createServer((request, response) => {
+    hostHeader = request.headers.host;
+    response.end("pinned");
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const { port } = server.address();
+  let validationLookups = 0;
+  const response = await fetchRemoteUrl(`http://identity.test:${port}/path`, {}, {
+    allowRanges: ["127.0.0.1/32"],
+    lookup: async hostname => {
+      validationLookups++;
+      assert.equal(hostname, "identity.test");
+      return validationLookups === 1
+        ? [{ address: "127.0.0.1", family: 4 }]
+        : [{ address: "10.0.0.1", family: 4 }];
+    },
+  });
+  assert.equal(await response.text(), "pinned");
+  assert.equal(validationLookups, 1, "the connection must not invoke the validation resolver again");
+  assert.equal(hostHeader, `identity.test:${port}`);
+
+  const numericResponse = await fetchRemoteUrl(`http://127.0.0.1:${port}/numeric`, {}, {
+    allowRanges: ["127.0.0.1/32"],
+    lookup: async () => { throw new Error("numeric targets must not fall back to DNS"); },
+  });
+  assert.equal(await numericResponse.text(), "pinned");
+  assert.equal(hostHeader, `127.0.0.1:${port}`);
+});
+
+test("hop Agent closes after body completion, cancellation, abort, and fetch failure", async () => {
+  async function run(bodyAction) {
+    let closes = 0;
+    const controller = new AbortController();
+    const response = await fetchRemoteUrl("https://cleanup.test/", { signal: controller.signal }, {
+      lookup: publicLookup,
+      fetch: async (_url, init) => {
+        init.dispatcher.close = async () => { closes++; };
+        return new Response(new ReadableStream({ pull() {} }));
+      },
+    });
+    assert.equal(closes, 0, "Agent must stay open while the response body is live");
+    await bodyAction(response, controller);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(closes, 1);
+  }
+  await run(response => response.body.cancel());
+  await run((_response, controller) => controller.abort());
+
+  let completionCloses = 0;
+  const complete = await fetchRemoteUrl("https://cleanup.test/", {}, {
+    lookup: publicLookup,
+    fetch: async (_url, init) => {
+      init.dispatcher.close = async () => { completionCloses++; };
+      return new Response("done");
+    },
+  });
+  assert.equal(await complete.text(), "done");
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(completionCloses, 1);
+
+  let streamErrorCloses = 0;
+  const streamError = await fetchRemoteUrl("https://cleanup.test/", {}, {
+    lookup: publicLookup,
+    fetch: async (_url, init) => {
+      init.dispatcher.close = async () => { streamErrorCloses++; };
+      return new Response(new ReadableStream({ start(controller) { controller.error(new Error("stream failed")); } }));
+    },
+  });
+  await assert.rejects(streamError.text(), /stream failed/);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(streamErrorCloses, 1);
+
+  let failureCloses = 0;
+  await assert.rejects(fetchRemoteUrl("https://cleanup.test/", {}, {
+    lookup: publicLookup,
+    fetch: async (_url, init) => {
+      init.dispatcher.close = async () => { failureCloses++; };
+      throw new Error("network failed");
+    },
+  }), /network failed/);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(failureCloses, 1);
 });

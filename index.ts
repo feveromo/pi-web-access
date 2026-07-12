@@ -150,6 +150,7 @@ function buildFetchDetail(result: ExtractedContent, index: number, includeMetada
 		truncated: result.truncated,
 		originalContentLength: result.originalContentLength,
 		retrievalStatus: result.retrievalStatus,
+		extractionWarning: result.metadata?.extractionWarning,
 		cacheHit: rawCache?.cacheHit,
 		cacheAgeMs: rawCache?.cacheAgeMs,
 		cacheShared: rawCache?.shared,
@@ -718,7 +719,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "fetch_content",
 		label: "Fetch Content",
-		description: "Fetch URL(s) and extract readable markdown via HTTP/Readability, GitHub cloning, PDF extraction, and Jina fallback. Successful public raw extractions are briefly cached below shaping; content is stored for get_search_content. Prefer one urls array when fetching several related pages.",
+		description: "Fetch URL(s) and extract readable markdown via HTTP/Readability, the npm registry, GitHub cloning, PDF extraction, and Jina fallback. JavaScript shells can return clearly marked static partial evidence after Jina fails. Successful public raw extractions are briefly cached below shaping; content is stored for get_search_content. Prefer one urls array when fetching several related pages.",
 		promptSnippet:
 			"Use to extract readable content from URLs, docs, PDFs, and GitHub repos. Prefer one urls:[...] call for several related pages.",
 		parameters: Type.Object({
@@ -795,6 +796,8 @@ export default function (pi: ExtensionAPI) {
 						contentType: result.contentType,
 						httpStatus: result.httpStatus,
 						fallbackPath: result.fallbackPath,
+						retrievalStatus: result.retrievalStatus,
+						extractionWarning: result.metadata?.extractionWarning,
 						originalContentLength: result.originalContentLength,
 						contentRef: params.returnMetadata ? result.contentRef : undefined,
 						metadata: params.returnMetadata ? result.metadata : undefined,
@@ -804,11 +807,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			let output = "## Fetched URLs\n\n";
-			for (const { url, title, content, error } of fetchResults) {
+			for (const { url, title, content, error, retrievalStatus } of fetchResults) {
 				if (error) {
 					output += `- ${url}: Error - ${error}\n`;
 				} else {
-					output += `- ${title || url} (${content.length} chars)\n`;
+					output += `- ${title || url} (${content.length} chars${retrievalStatus === "partial" ? ", partial static evidence" : ""})\n`;
 				}
 			}
 			const hint = buildSuccessfulFetchHint(responseId, fetchResults, MAX_FETCH_URLS);
@@ -853,6 +856,7 @@ export default function (pi: ExtensionAPI) {
 				title?: string;
 				truncated?: boolean;
 				responseId?: string;
+				retrievalStatus?: string;
 				phase?: string;
 				progress?: number;
 			};
@@ -870,6 +874,7 @@ export default function (pi: ExtensionAPI) {
 			if (details?.urlCount === 1) {
 				const title = details?.title || "Untitled";
 				let statusLine = theme.fg("success", title) + theme.fg("muted", ` (${details?.totalChars ?? 0} chars)`);
+				if (details?.retrievalStatus === "partial") statusLine += theme.fg("warning", " [partial static evidence]");
 				if (details?.truncated) {
 					statusLine += theme.fg("warning", " [truncated]");
 				}
@@ -1053,7 +1058,16 @@ export default function (pi: ExtensionAPI) {
 					const rendered = formatRetrievedFetch(urlData, maxChars);
 					return {
 						content: [{ type: "text", text: rendered.text }],
-						details: { url: urlData.url, urlIndex: index, title: urlData.title, contentLength: urlData.content.length, returnedChars: rendered.text.length, truncated: rendered.truncated },
+						details: {
+							url: urlData.url,
+							urlIndex: index,
+							title: urlData.title,
+							contentLength: urlData.content.length,
+							returnedChars: rendered.text.length,
+							truncated: rendered.truncated,
+							retrievalStatus: urlData.retrievalStatus,
+							extractionWarning: urlData.metadata?.extractionWarning,
+						},
 					};
 				}
 
@@ -1061,6 +1075,7 @@ export default function (pi: ExtensionAPI) {
 				let successful = 0;
 				let failed = 0;
 				let totalChars = 0;
+				const partialIndexes: number[] = [];
 				const batchMaxChars = maxChars ?? DEFAULT_BATCH_CONTENT_MAX_CHARS;
 				const sections = selected.map(({ index, urlData }) => {
 					if (urlData.error) {
@@ -1069,6 +1084,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					successful++;
 					totalChars += urlData.content.length;
+					if (urlData.retrievalStatus === "partial") partialIndexes.push(index);
 					const rendered = formatRetrievedFetch(urlData, batchMaxChars);
 					truncated ||= rendered.truncated;
 					return `## URL ${index}: ${urlData.url}\n\n${rendered.text.trim()}`;
@@ -1081,7 +1097,7 @@ export default function (pi: ExtensionAPI) {
 				truncated ||= capped.truncated;
 				return {
 					content: [{ type: "text", text: capped.text }],
-					details: { urlCount: selected.length, urlIndexes: selected.map(item => item.index), successful, failed, totalChars, contentLength: capped.text.length, truncated, batchMaxChars },
+					details: { urlCount: selected.length, urlIndexes: selected.map(item => item.index), successful, failed, partialCount: partialIndexes.length, partialIndexes, totalChars, contentLength: capped.text.length, truncated, batchMaxChars },
 				};
 			}
 
@@ -1126,6 +1142,10 @@ export default function (pi: ExtensionAPI) {
 				resultCount?: number;
 				contentLength?: number;
 				truncated?: boolean;
+				retrievalStatus?: string;
+				extractionWarning?: string;
+				partialCount?: number;
+				partialIndexes?: number[];
 			};
 
 			if (details?.error) {
@@ -1138,9 +1158,13 @@ export default function (pi: ExtensionAPI) {
 			} else if (details?.queryCount != null) {
 				statusLine = theme.fg("success", `${details.queryCount} queries`) + theme.fg("muted", ` (${details.resultCount ?? 0} results)`);
 			} else if (details?.urlCount != null) {
-				statusLine = theme.fg("success", `${details.urlCount} URLs`) + theme.fg("muted", ` (${details.contentLength ?? 0} chars)`);
+				const color = (details.partialCount ?? 0) > 0 ? "warning" : "success";
+				statusLine = theme.fg(color, `${details.urlCount} URLs`) + theme.fg("muted", ` (${details.contentLength ?? 0} chars)`);
+				if ((details.partialCount ?? 0) > 0) statusLine += theme.fg("warning", ` [${details.partialCount} partial]`);
 			} else {
-				statusLine = theme.fg("success", details?.title || "Content") + theme.fg("muted", ` (${details?.contentLength ?? 0} chars)`);
+				const color = details?.retrievalStatus === "partial" ? "warning" : "success";
+				statusLine = theme.fg(color, details?.title || "Content") + theme.fg("muted", ` (${details?.contentLength ?? 0} chars)`);
+				if (details?.retrievalStatus === "partial") statusLine += theme.fg("warning", " [partial static evidence]");
 			}
 			if (details?.truncated) statusLine += theme.fg("warning", " [truncated]");
 

@@ -28,6 +28,16 @@ test("package stays lean and Pi-native", () => {
   assert.match(pkg.homepage, /github\.com\/feveromo\/pi-web-access/);
   assert.match(pkg.bugs?.url, /github\.com\/feveromo\/pi-web-access/);
 
+  assert.equal(pkg.engines?.node, ">=22.19.0");
+  assert.deepEqual(pkg.dependencies, {
+    "@mozilla/readability": "0.6.0",
+    linkedom: "0.18.12",
+    "p-limit": "7.3.0",
+    turndown: "7.2.4",
+    undici: "7.28.0",
+    unpdf: "1.6.2",
+  });
+
   for (const dep of [
     "@earendil-works/pi-ai",
     "@earendil-works/pi-coding-agent",

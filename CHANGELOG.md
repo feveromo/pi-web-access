@@ -5,12 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Added age/count/byte quota pruning for the plugin-managed GitHub clone and PDF markdown caches, with active-output protection, bounded symlink-safe traversal, and no automatic pruning of custom user paths.
+- Added bounded static partial extraction for JavaScript/SPA shells after Jina failure, plus a cancellation- and SSRF-aware `npm-registry` adapter for canonical npm package URLs with metadata, links, and bounded README content.
 - Added bounded content-aware ranking to `github_examples`, a short-lived 20 MiB raw extraction cache below fetch shaping, cache metrics, and paper abstract/TOC aliases. Raw cache keys isolate extraction timeouts, retained-object byte accounting is bounded, and GitHub/sensitive/allow-ranged fetches are excluded.
 - Added abort-aware, redirect-validating SSRF protection for `fetch_content`, blocking private/internal/metadata targets by default with a strict `ssrf.allowRanges` escape hatch for direct trusted-network and fake-IP proxy access; exemptions never authorize third-party Jina forwarding.
 - Added modern Pi config discovery through `PI_CODING_AGENT_DIR`, `XDG_CONFIG_HOME/pi`, and the legacy `~/.pi` fallback.
 - Added mocked SearXNG, snippet-formatting, bounded-response, PDF-wrapper, and session-restore regression coverage for the primary research path.
 - Added shared response streaming guards that enforce actual body limits for chunked/compressed responses instead of trusting `Content-Length`.
-- Added short-lived disk-backed `docs_search` index caching under `~/.pi/web-access/docs-cache/`, with cache-hit metadata and a 30-minute TTL to survive quick Pi reloads without turning docs into a stale local mirror.
+- Added bounded, short-lived `docs_search` caching under `~/.pi/web-access/docs-cache/`, with split discovery/page entries, concurrent fetch sharing, detailed hit/miss/failure metadata, atomic writes, and a 30-minute TTL for safe reuse across queries and quick Pi reloads.
 - Added compact-output guardrails: `web_search` caps inline synthesized snippets and stores full search text for `get_search_content`, `docs_search` uses smaller default snippets, and large single-page `fetch_content` results now return a preview plus retrieval hint.
 - Added `get_search_content` batch selectors (`urlIndexes`, `queryIndexes`, `allUrls`, `allQueries`) plus optional per-item `maxChars` caps so agents can retrieve selected stored sources without many one-at-a-time calls.
 
@@ -19,11 +21,12 @@ All notable changes to this project will be documented in this file.
 - `web_search` now limits query fan-out, collapses concurrent duplicates, caches repeated searches briefly, reports progress, propagates cancellation, and bounds startup/health/search waits.
 - `fetch_content` now limits URL batches, normalizes timeouts, stream-limits HTML/PDF/Jina bodies, and avoids sending syntactically obvious private-address or credential-bearing URLs to Jina.
 - `get_search_content` now applies safe default per-item and total caps to batch retrieval while preserving uncapped single-item retrieval.
-- PDF extraction now returns bounded markdown content, cleans up pdf.js resources, reuses identical output, honors cancellation through persistence, and never overwrites a differing download.
+- PDF extraction now returns bounded markdown content, cleans up pdf.js resources, reuses identical output, honors cancellation through persistence, and never overwrites a differing output. New default outputs use `~/.pi/web-access/pdf-cache/` instead of accumulating in `~/Downloads/`; `PI_WEB_ACCESS_PDF_OUTPUT_DIR` remains an unpruned user-owned override.
 - `paper_research` topic maps and two-way citation graphs fetch independent branches concurrently through one request limiter; its JSON cache is now TTL- and byte-bounded.
 - Release checks now scan all tracked package files for sensitive residue and ignore local `.pi-subagents/` runtime artifacts.
 
 ### Fixed
+- Closed the direct-fetch DNS-rebinding gap by pinning every request and redirect connection to that hop's complete validated DNS answer set while preserving hostname-based Host, TLS SNI, and certificate verification.
 - Fixed mixed fetch batches recommending failed URL index 0, GitHub read truncation lacking a ready next-range call, unbounded live stored-result memory, and eager hydration of every externalized URL.
 - Fixed multiple positive `domainFilter` values to use OR semantics, invalid/empty `urls` arrays to fall back to `url`, and Pi widget clearing to use the current `undefined` API contract.
 - Updated `@mozilla/readability` to 0.6.0, which includes upstream performance improvements and fixes the published regex denial-of-service advisory affecting older releases.

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -31,13 +32,16 @@ test("unpdf extracts text on Node 22 without native Promise.try", async () => {
 test("PDF wrapper returns markdown and reuses identical output without overwriting", async () => {
   const outputDir = mkdtempSync(join(tmpdir(), "pi-web-access-pdf-"));
   try {
+    const userFile = join(outputDir, "user-owned.md");
+    writeFileSync(userFile, "keep");
+    utimesSync(userFile, new Date(0), new Date(0));
     const first = await extractPDFToMarkdown(makePdf("Wrapped PDF text"), "https://example.test/paper.pdf", { outputDir, filename: "paper.md" });
     const second = await extractPDFToMarkdown(makePdf("Wrapped PDF text"), "https://example.test/paper.pdf", { outputDir, filename: "paper.md" });
 
     assert.match(first.content, /Wrapped PDF text/);
     assert.equal(readFileSync(first.outputPath, "utf8"), first.content);
     assert.equal(first.outputPath, second.outputPath);
-    assert.deepEqual(readdirSync(outputDir), ["paper.md"]);
+    assert.deepEqual(readdirSync(outputDir).sort(), ["paper.md", "user-owned.md"]);
   } finally {
     rmSync(outputDir, { recursive: true, force: true });
   }
@@ -61,6 +65,37 @@ test("PDF wrapper honors a pre-aborted signal", async () => {
     extractPDFToMarkdown(makePdf("cancel"), "https://example.test/cancel.pdf", { signal: controller.signal }),
     err => err?.name === "AbortError",
   );
+});
+
+test("default managed PDF extraction refuses a symlink root before writing", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-web-access-pdf-home-"));
+  const victim = mkdtempSync(join(tmpdir(), "pi-web-access-pdf-victim-"));
+  try {
+    const parent = join(home, ".pi", "web-access");
+    const managedRoot = join(parent, "pdf-cache");
+    mkdirSync(parent, { recursive: true });
+    writeFileSync(join(victim, "owned.md"), "external victim");
+    symlinkSync(victim, managedRoot, "dir");
+    const script = `
+      import { extractPDFToMarkdown } from ${JSON.stringify(new URL("../pdf-extract.ts", import.meta.url).href)};
+      const bytes = Buffer.from(process.env.TEST_PDF_BASE64, "base64");
+      try {
+        await extractPDFToMarkdown(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), "https://example.test/managed.pdf");
+        process.exitCode = 2;
+      } catch (error) {
+        if (!String(error?.message).includes("unsafe managed PDF cache root")) throw error;
+      }
+    `;
+    const env = { ...process.env, HOME: home, TEST_PDF_BASE64: Buffer.from(makePdf("Do not write")).toString("base64") };
+    delete env.PI_WEB_ACCESS_PDF_OUTPUT_DIR;
+    const child = spawnSync(process.execPath, ["--input-type=module", "--eval", script], { env, encoding: "utf8" });
+    assert.equal(child.status, 0, child.stderr || child.stdout);
+    assert.deepEqual(readdirSync(victim), ["owned.md"]);
+    assert.equal(readFileSync(join(victim, "owned.md"), "utf8"), "external victim");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(victim, { recursive: true, force: true });
+  }
 });
 
 function makePdf(text) {

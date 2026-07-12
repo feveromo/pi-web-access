@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdir, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Readability } from "@mozilla/readability";
@@ -7,6 +7,8 @@ import { parseHTML } from "linkedom";
 import pLimit from "p-limit";
 import TurndownService from "turndown";
 import { readErrorSnippet, readResponseJson, readResponseText } from "./http-response.js";
+import { loadSsrfAllowRanges } from "./ssrf-config.js";
+import { fetchRemoteUrl, validateRemoteUrl, type Lookup } from "./ssrf-protection.ts";
 
 export type DocsSearchMode = "auto" | "llms" | "crawl";
 
@@ -38,22 +40,51 @@ interface DocsPage {
 	contentType: string;
 }
 
-interface CachedDocs {
+interface DiscoveredDoc {
+	title: string;
+	url: string;
+}
+
+interface CachedDiscovery {
 	expiresAt: number;
-	pages: DocsPage[];
 	source: string;
 	mode: DocsSearchMode;
+	links: DiscoveredDoc[];
+}
+
+interface CachedPage {
+	expiresAt: number;
+	page: DocsPage;
+	bytes: number;
+}
+
+interface SharedTask<T> {
+	controller: AbortController;
+	promise: Promise<T>;
+	waiters: number;
+	settled: boolean;
 }
 
 interface DocsCacheInfo {
 	hit: boolean;
 	storage: "memory" | "disk" | "fresh";
 	expiresAt: number;
+	discovery: { hit: boolean; shared: boolean; storage: "memory" | "disk" | "fresh" };
+	pages: { memoryHits: number; diskHits: number; sharedHits: number; misses: number; failures: number };
 }
 
-interface DiskCachedDocs extends CachedDocs {
+interface DiskDiscovery extends CachedDiscovery {
 	version: number;
+	kind: "discovery";
 	savedAt: number;
+}
+
+interface DiskPage {
+	version: number;
+	kind: "page";
+	savedAt: number;
+	expiresAt: number;
+	page: DocsPage;
 }
 
 interface OpenApiEndpoint {
@@ -70,9 +101,15 @@ interface OpenApiEndpoint {
 }
 
 const DOCS_CACHE_TTL_MS = 30 * 60 * 1000;
-const DOCS_CACHE_MAX = 30;
-const DOCS_CACHE_VERSION = 1;
-const DOCS_DISK_CACHE_MAX_BYTES = 5 * 1024 * 1024;
+const DISCOVERY_CACHE_MAX = 30;
+const DISCOVERY_CACHE_MAX_BYTES = 1024 * 1024;
+const PAGE_CACHE_MAX = 200;
+const PAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const DOCS_CACHE_VERSION = 3;
+const DOCS_DISK_CACHE_MAX_FILES = 300;
+const DOCS_DISK_CACHE_MAX_BYTES = 40 * 1024 * 1024;
+// Disk quotas are eventual; avoid a synchronous directory scan on every docs request.
+const DOCS_DISK_PRUNE_WRITE_CADENCE = 100;
 const DOCS_CACHE_DIR = process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR?.trim() || join(homedir(), ".pi", "web-access", "docs-cache");
 const DEFAULT_MAX_PAGES = 40;
 const MAX_PAGES_CAP = 100;
@@ -86,10 +123,16 @@ const MAX_DOCS_PAGE_BYTES = 2 * 1024 * 1024;
 const MAX_OPENAPI_BYTES = 20 * 1024 * 1024;
 const DEFAULT_OPENAPI_URL = "https://huggingface.co/.well-known/openapi.json";
 
-const docsCache = new Map<string, CachedDocs>();
-const inFlightDocs = new Map<string, Promise<{ pages: DocsPage[]; source: URL; mode: DocsSearchMode; cache: DocsCacheInfo }>>();
+const discoveryCache = new Map<string, CachedDiscovery>();
+const pageCache = new Map<string, CachedPage>();
+const inFlightDiscovery = new Map<string, SharedTask<CachedDiscovery>>();
+const inFlightPages = new Map<string, SharedTask<DocsPage | null>>();
 const openApiCache = new Map<string, { expiresAt: number; endpoints: OpenApiEndpoint[]; tags: string[] }>();
+let discoveryCacheBytes = 0;
+let pageCacheBytes = 0;
 let lastDocsCachePrune = 0;
+let docsDiskWritesSincePrune = 0;
+let docsCachePrunePromise: Promise<void> | null = null;
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
 const fetchLimit = pLimit(5);
@@ -112,7 +155,13 @@ function errorMessage(err: unknown): string {
 function normalizeSource(input: string): URL {
 	const trimmed = input.trim();
 	if (!trimmed) throw new Error("No docs source provided.");
-	return new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+	const source = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+	if (source.protocol !== "http:" && source.protocol !== "https:") throw new Error("Docs source must use HTTP or HTTPS.");
+	source.hash = "";
+	if (source.pathname !== "/" && !/\/llms(?:-full)?\.txt$/i.test(source.pathname)) {
+		source.pathname = source.pathname.replace(/\/+$/, "");
+	}
+	return source;
 }
 
 function normalizeMode(value: unknown): DocsSearchMode {
@@ -144,9 +193,9 @@ function truncate(text: string, max = DEFAULT_MAX_CHARS): string {
 	return normalized.length > max ? `${normalized.slice(0, max).trimEnd()}…` : normalized;
 }
 
-function docsDiskCacheFile(key: string): string {
-	const digest = createHash("sha256").update(key).digest("hex");
-	return join(DOCS_CACHE_DIR, `${digest}.json`);
+function docsDiskCacheFile(kind: "discovery" | "page", key: string): string {
+	const digest = createHash("sha256").update(`${kind}:${key}`).digest("hex");
+	return join(DOCS_CACHE_DIR, `${kind}-${digest}.json`);
 }
 
 function isDocsPage(value: unknown): value is DocsPage {
@@ -160,78 +209,209 @@ function isDocsPage(value: unknown): value is DocsPage {
 		&& typeof page.contentType === "string";
 }
 
-function isDiskCachedDocs(value: unknown): value is DiskCachedDocs {
+function isDiscoveredDoc(value: unknown): value is DiscoveredDoc {
+	if (!value || typeof value !== "object") return false;
+	const item = value as Record<string, unknown>;
+	return typeof item.title === "string" && typeof item.url === "string";
+}
+
+function isDiskDiscovery(value: unknown): value is DiskDiscovery {
 	if (!value || typeof value !== "object") return false;
 	const data = value as Record<string, unknown>;
-	return data.version === DOCS_CACHE_VERSION
-		&& typeof data.expiresAt === "number"
-		&& typeof data.savedAt === "number"
+	return data.version === DOCS_CACHE_VERSION && data.kind === "discovery"
+		&& typeof data.expiresAt === "number" && typeof data.savedAt === "number"
 		&& typeof data.source === "string"
 		&& (data.mode === "auto" || data.mode === "llms" || data.mode === "crawl")
-		&& Array.isArray(data.pages)
-		&& data.pages.every(isDocsPage);
+		&& Array.isArray(data.links) && data.links.every(isDiscoveredDoc);
 }
 
-function pruneDocsDiskCache(): void {
-	const now = Date.now();
-	if (now - lastDocsCachePrune < 60 * 60 * 1000) return;
-	lastDocsCachePrune = now;
-	if (!existsSync(DOCS_CACHE_DIR)) return;
+function isDiskPage(value: unknown): value is DiskPage {
+	if (!value || typeof value !== "object") return false;
+	const data = value as Record<string, unknown>;
+	return data.version === DOCS_CACHE_VERSION && data.kind === "page"
+		&& typeof data.expiresAt === "number" && typeof data.savedAt === "number"
+		&& isDocsPage(data.page);
+}
 
-	let files: string[];
-	try {
-		files = readdirSync(DOCS_CACHE_DIR);
-	} catch {
-		return;
+function byteLength(value: unknown): number {
+	try { return Buffer.byteLength(JSON.stringify(value), "utf8"); }
+	catch { return 0; }
+}
+
+function pruneMemoryCaches(now = Date.now()): void {
+	for (const [key, value] of discoveryCache) {
+		if (value.expiresAt > now) continue;
+		discoveryCache.delete(key);
+		discoveryCacheBytes -= byteLength(value);
 	}
+	while (discoveryCache.size > DISCOVERY_CACHE_MAX || discoveryCacheBytes > DISCOVERY_CACHE_MAX_BYTES) {
+		const key = discoveryCache.keys().next().value as string | undefined;
+		if (!key) break;
+		const value = discoveryCache.get(key);
+		discoveryCache.delete(key);
+		discoveryCacheBytes -= value ? byteLength(value) : 0;
+	}
+	for (const [key, value] of pageCache) {
+		if (value.expiresAt > now) continue;
+		pageCache.delete(key);
+		pageCacheBytes -= value.bytes;
+	}
+	while (pageCache.size > PAGE_CACHE_MAX || pageCacheBytes > PAGE_CACHE_MAX_BYTES) {
+		const key = pageCache.keys().next().value as string | undefined;
+		if (!key) break;
+		const value = pageCache.get(key);
+		pageCache.delete(key);
+		pageCacheBytes -= value?.bytes ?? 0;
+	}
+}
 
-	for (const file of files) {
-		if (!file.endsWith(".json")) continue;
-		const path = join(DOCS_CACHE_DIR, file);
-		try {
-			const stat = statSync(path);
-			if (now - stat.mtimeMs <= DOCS_CACHE_TTL_MS * 2) continue;
-			rmSync(path, { force: true });
-		} catch {
+const OWNED_DOCS_CACHE_FILE = /^(?:discovery|page)-[a-f0-9]{64}\.json$/;
+const OWNED_DOCS_TEMP_FILE = /^(?:discovery|page)-[a-f0-9]{64}\.json\.\d+\.[a-z0-9]+\.tmp$/;
+
+async function runDocsDiskPrune(now: number): Promise<void> {
+	try {
+		const entries: Array<{ path: string; bytes: number; mtimeMs: number }> = [];
+		for (const file of await readdir(DOCS_CACHE_DIR)) {
+			const path = join(DOCS_CACHE_DIR, file);
+			if (OWNED_DOCS_TEMP_FILE.test(file)) {
+				await rm(path, { force: true }).catch(() => {});
+				continue;
+			}
+			if (!OWNED_DOCS_CACHE_FILE.test(file)) continue;
+			try {
+				const fileStat = await stat(path);
+				if (fileStat.isFile()) entries.push({ path, bytes: fileStat.size, mtimeMs: fileStat.mtimeMs });
+			} catch {
+			}
 		}
+		entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+		let files = 0;
+		let bytes = 0;
+		for (const entry of entries) {
+			const expired = now - entry.mtimeMs > DOCS_CACHE_TTL_MS * 2;
+			if (expired || files >= DOCS_DISK_CACHE_MAX_FILES || bytes + entry.bytes > DOCS_DISK_CACHE_MAX_BYTES) {
+				await rm(entry.path, { force: true }).catch(() => {});
+				continue;
+			}
+			files++;
+			bytes += entry.bytes;
+		}
+	} catch {
+		// Cache maintenance is failure-open, including a missing cache directory.
 	}
 }
 
-function readDocsDiskCache(key: string): CachedDocs | null {
+async function pruneDocsDiskCache(force = false): Promise<void> {
+	const now = Date.now();
+	if (!force && now - lastDocsCachePrune < 60 * 60 * 1000) return;
+	if (docsCachePrunePromise) return docsCachePrunePromise;
+	lastDocsCachePrune = now;
+	docsDiskWritesSincePrune = 0;
+	docsCachePrunePromise = runDocsDiskPrune(now).finally(() => { docsCachePrunePromise = null; });
+	return docsCachePrunePromise;
+}
+
+async function removeDiskValue(kind: "discovery" | "page", key: string): Promise<void> {
+	await rm(docsDiskCacheFile(kind, key), { force: true }).catch(() => {});
+}
+
+async function readDiskValue(kind: "discovery" | "page", key: string): Promise<unknown | null> {
 	try {
-		const path = docsDiskCacheFile(key);
-		if (!existsSync(path)) return null;
-		const data = JSON.parse(readFileSync(path, "utf-8")) as unknown;
-		if (!isDiskCachedDocs(data) || data.expiresAt <= Date.now()) {
-			rmSync(path, { force: true });
+		const path = docsDiskCacheFile(kind, key);
+		const value = JSON.parse(await readFile(path, "utf8")) as unknown;
+		const expiresAt = (value as { expiresAt?: unknown })?.expiresAt;
+		if (typeof expiresAt !== "number" || expiresAt <= Date.now()) {
+			await rm(path, { force: true }).catch(() => {});
 			return null;
 		}
-		return { expiresAt: data.expiresAt, pages: data.pages, source: data.source, mode: data.mode };
+		const now = new Date();
+		await utimes(path, now, now).catch(() => {});
+		return value;
 	} catch {
 		return null;
 	}
 }
 
-function writeDocsDiskCache(key: string, value: CachedDocs): void {
+async function writeDiskValue(kind: "discovery" | "page", key: string, value: DiskDiscovery | DiskPage): Promise<void> {
+	let temp: string | undefined;
 	try {
-		pruneDocsDiskCache();
-		const payload: DiskCachedDocs = { version: DOCS_CACHE_VERSION, savedAt: Date.now(), ...value };
-		const body = JSON.stringify(payload);
-		if (body.length > DOCS_DISK_CACHE_MAX_BYTES) return;
-		mkdirSync(DOCS_CACHE_DIR, { recursive: true });
-		writeFileSync(docsDiskCacheFile(key), body, "utf-8");
+		const body = JSON.stringify(value);
+		if (Buffer.byteLength(body, "utf8") > MAX_DOCS_PAGE_BYTES + 64 * 1024) return;
+		await mkdir(DOCS_CACHE_DIR, { recursive: true });
+		const path = docsDiskCacheFile(kind, key);
+		temp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+		await writeFile(temp, body, "utf8");
+		await rename(temp, path);
+		temp = undefined;
+		docsDiskWritesSincePrune++;
+		if (docsDiskWritesSincePrune >= DOCS_DISK_PRUNE_WRITE_CADENCE) await pruneDocsDiskCache(true);
 	} catch {
+		if (temp) await rm(temp, { force: true }).catch(() => {});
 	}
 }
 
-async function fetchText(url: string, signal?: AbortSignal): Promise<{ text: string; url: string; contentType: string; status: number }> {
-	const res = await fetch(url, {
+function putDiscovery(key: string, value: CachedDiscovery): void {
+	const existing = discoveryCache.get(key);
+	if (existing) discoveryCacheBytes -= byteLength(existing);
+	discoveryCache.delete(key);
+	discoveryCache.set(key, value);
+	discoveryCacheBytes += byteLength(value);
+	pruneMemoryCaches();
+}
+
+function putPage(key: string, page: DocsPage, expiresAt: number): void {
+	let bytes = byteLength({ expiresAt, page, bytes: 0 });
+	bytes = byteLength({ expiresAt, page, bytes });
+	if (bytes > PAGE_CACHE_MAX_BYTES) return;
+	const existing = pageCache.get(key);
+	if (existing) pageCacheBytes -= existing.bytes;
+	pageCache.delete(key);
+	pageCache.set(key, { expiresAt, page, bytes });
+	pageCacheBytes += bytes;
+	pruneMemoryCaches();
+}
+
+function abortReason(signal: AbortSignal): unknown {
+	return signal.reason ?? new DOMException("Aborted", "AbortError");
+}
+
+async function waitForTask<T>(task: SharedTask<T>, signal: AbortSignal | undefined, removeIfCurrent: () => void): Promise<T> {
+	signal?.throwIfAborted();
+	task.waiters++;
+	try {
+		if (!signal) return await task.promise;
+		return await new Promise<T>((resolve, reject) => {
+			const onAbort = () => reject(abortReason(signal));
+			signal.addEventListener("abort", onAbort, { once: true });
+			task.promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+		});
+	} finally {
+		task.waiters--;
+		if (task.waiters === 0 && !task.settled) {
+			removeIfCurrent();
+			task.controller.abort();
+		}
+	}
+}
+
+interface DocsRequestOptions {
+	/** Internal deterministic-test hook; this is not exposed by either tool schema. */
+	lookup?: Lookup;
+}
+
+function remoteOptions(options?: DocsRequestOptions) {
+	const testLookup = (globalThis as typeof globalThis & { __PI_WEB_ACCESS_DOCS_LOOKUP__?: Lookup }).__PI_WEB_ACCESS_DOCS_LOOKUP__;
+	return { allowRanges: loadSsrfAllowRanges(), lookup: options?.lookup ?? testLookup };
+}
+
+async function fetchText(url: string, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ text: string; url: string; contentType: string; status: number }> {
+	const res = await fetchRemoteUrl(url, {
 		headers: {
 			"Accept": "text/markdown,text/plain,text/html,application/json,*/*",
 			"User-Agent": "pi-web-access/0.10",
 		},
 		signal: requestSignal(signal),
-	});
+	}, remoteOptions(options));
 	if (!res.ok) throw new Error(`HTTP ${res.status}: ${await readErrorSnippet(res, 200)}`);
 	return { text: await readResponseText(res, MAX_DOCS_PAGE_BYTES), url: res.url || url, contentType: res.headers.get("content-type") || "", status: res.status };
 }
@@ -276,17 +456,17 @@ function markdownLinks(markdown: string, base: URL): Array<{ title: string; url:
 	return links;
 }
 
-function htmlLinks(html: string, base: URL): Array<{ title: string; url: string }> {
+function htmlLinks(html: string, base: URL, source: URL): Array<{ title: string; url: string }> {
 	const { document } = parseHTML(html);
 	const links: Array<{ title: string; url: string }> = [];
 	const seen = new Set<string>();
-	const basePath = base.pathname.endsWith("/") ? base.pathname : base.pathname.replace(/\/[^/]*$/, "/");
+	const sourcePath = source.pathname === "/" ? "/" : `${source.pathname.replace(/\/+$/, "")}/`;
 	for (const anchor of Array.from(document.querySelectorAll("a[href]"))) {
 		const href = anchor.getAttribute("href") || "";
 		try {
 			const resolved = new URL(href, base);
-			if (resolved.origin !== base.origin) continue;
-			if (!resolved.pathname.startsWith(basePath) && !resolved.pathname.startsWith(`${basePath.replace(/\/$/, "")}/`)) continue;
+			if (resolved.origin !== source.origin) continue;
+			if (sourcePath !== "/" && resolved.pathname !== source.pathname && !resolved.pathname.startsWith(sourcePath)) continue;
 			if (/\.(png|jpe?g|gif|svg|webp|zip|tar|gz|pdf)$/i.test(resolved.pathname)) continue;
 			resolved.hash = "";
 			const key = resolved.toString();
@@ -299,7 +479,7 @@ function htmlLinks(html: string, base: URL): Array<{ title: string; url: string 
 	return links;
 }
 
-async function tryLlmsTxt(source: URL, signal?: AbortSignal): Promise<{ root: URL; text: string } | null> {
+async function tryLlmsTxt(source: URL, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ root: URL; text: string } | null> {
 	const candidates: URL[] = [];
 	if (/\/llms(?:-full)?\.txt$/i.test(source.pathname)) candidates.push(source);
 	else candidates.push(new URL("/llms.txt", source.origin), new URL(`${source.pathname.replace(/\/$/, "")}/llms.txt`, source));
@@ -308,11 +488,12 @@ async function tryLlmsTxt(source: URL, signal?: AbortSignal): Promise<{ root: UR
 		if (seen.has(candidate.toString())) continue;
 		seen.add(candidate.toString());
 		try {
-			const fetched = await fetchText(candidate.toString(), signal);
+			const fetched = await fetchText(candidate.toString(), signal, options);
 			if (fetched.text.length > 20 && markdownLinks(fetched.text, candidate).length > 0) {
 				return { root: candidate, text: fetched.text };
 			}
-		} catch {
+		} catch (err) {
+			if (signal?.aborted) throw abortReason(signal);
 		}
 	}
 	return null;
@@ -329,12 +510,12 @@ function markdownCandidate(url: string): string | null {
 	return null;
 }
 
-async function fetchDocsPage(item: { title: string; url: string }, signal?: AbortSignal): Promise<DocsPage | null> {
+async function fetchDocsPage(item: { title: string; url: string }, signal?: AbortSignal, options?: DocsRequestOptions): Promise<DocsPage | null> {
 	const candidates = [markdownCandidate(item.url), item.url].filter((v): v is string => !!v);
 	let lastError = "";
 	for (const candidate of candidates) {
 		try {
-			const fetched = await fetchText(candidate, signal);
+			const fetched = await fetchText(candidate, signal, options);
 			let title = item.title || titleFromUrl(item.url);
 			let content = fetched.text;
 			if (isLikelyMarkdown(fetched.url, fetched.contentType, fetched.text)) {
@@ -348,6 +529,7 @@ async function fetchDocsPage(item: { title: string; url: string }, signal?: Abor
 			if (content.length < 20) continue;
 			return { title, url: item.url, fetchUrl: fetched.url, content, contentType: fetched.contentType, glimpse: truncate(content, 220) };
 		} catch (err) {
+			if (signal?.aborted) throw abortReason(signal);
 			lastError = errorMessage(err);
 		}
 	}
@@ -373,75 +555,197 @@ function selectDiscoveredLinks(items: Array<{ title: string; url: string }>, que
 		.map(entry => entry.item);
 }
 
-async function discoverDocsPages(source: URL, mode: DocsSearchMode, maxPages: number, signal?: AbortSignal, query?: string): Promise<Array<{ title: string; url: string }>> {
-	const discovered: Array<{ title: string; url: string }> = [];
-	const add = (item: { title: string; url: string }) => {
+async function fetchRoot(source: URL, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ text: string; root: URL }> {
+	const candidates = [source.toString()];
+	if (source.pathname !== "/" && !source.pathname.endsWith("/")) {
+		const withSlash = new URL(source);
+		withSlash.pathname += "/";
+		candidates.push(withSlash.toString());
+	}
+	let lastError: unknown;
+	for (const candidate of candidates) {
+		try {
+			const fetched = await fetchText(candidate, signal, options);
+			return { text: fetched.text, root: new URL(fetched.url || candidate) };
+		} catch (err) {
+			if (signal?.aborted) throw abortReason(signal);
+			lastError = err;
+		}
+	}
+	throw lastError ?? new Error(`Could not fetch docs root ${source.toString()}`);
+}
+
+async function discoverDocsPages(source: URL, mode: DocsSearchMode, signal?: AbortSignal, options?: DocsRequestOptions): Promise<DiscoveredDoc[]> {
+	const discovered: DiscoveredDoc[] = [];
+	const seen = new Set<string>();
+	const add = (item: DiscoveredDoc) => {
 		if (discovered.length >= DISCOVERY_LINK_CAP) return;
-		if (discovered.some(existing => existing.url === item.url)) return;
-		discovered.push(item);
+		const url = canonicalPageKey(item.url);
+		if (!url || seen.has(url)) return;
+		seen.add(url);
+		discovered.push({ ...item, url });
 	};
 
 	if (mode !== "crawl") {
-		const llms = await tryLlmsTxt(source, signal);
+		const llms = await tryLlmsTxt(source, signal, options);
 		if (llms) {
 			add({ title: "llms.txt", url: llms.root.toString() });
 			for (const link of markdownLinks(llms.text, llms.root)) add(link);
-			return selectDiscoveredLinks(discovered, query, maxPages);
+			return discovered;
 		}
-		if (mode === "llms") return selectDiscoveredLinks(discovered, query, maxPages);
+		if (mode === "llms") return discovered;
 	}
 
-	const root = await fetchText(source.toString(), signal);
-	add({ title: titleFromUrl(source.toString()), url: source.toString() });
-	for (const link of htmlLinks(root.text, source)) add(link);
-	return selectDiscoveredLinks(discovered, query, maxPages);
+	const root = await fetchRoot(source, signal, options);
+	if (root.root.origin !== source.origin) throw new Error("Docs root redirected to a different origin.");
+	add({ title: titleFromUrl(root.root.toString()), url: root.root.toString() });
+	for (const link of htmlLinks(root.text, root.root, source)) add(link);
+	return discovered;
 }
 
-function cacheKeyForDocs(source: URL, mode: DocsSearchMode, maxPages: number, query: string | undefined): string {
-	// Discovery is query-biased before fetching pages, so cache entries must not
-	// be reused across different queries for the same docs root/maxPages.
-	return `${source.toString()}|${mode}|${maxPages}|${query?.trim().toLowerCase() ?? ""}`;
+function discoveryKey(source: URL, mode: DocsSearchMode): string {
+	return `${source.toString()}|${mode}`;
 }
 
-async function getDocsPages(params: DocsSearchParams, signal?: AbortSignal): Promise<{ pages: DocsPage[]; source: URL; mode: DocsSearchMode; cache: DocsCacheInfo }> {
+function canonicalPageKey(rawUrl: string): string | null {
+	try {
+		const url = new URL(rawUrl);
+		if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+		url.hash = "";
+		return url.toString();
+	} catch {
+		return null;
+	}
+}
+
+async function getDiscovery(source: URL, mode: DocsSearchMode, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ value: CachedDiscovery; storage: "memory" | "disk" | "fresh"; shared: boolean }> {
+	await validateRemoteUrl(source, { ...remoteOptions(options), signal: requestSignal(signal) });
+	pruneMemoryCaches();
+	const key = discoveryKey(source, mode);
+	const memory = discoveryCache.get(key);
+	if (memory && memory.expiresAt > Date.now()) {
+		discoveryCache.delete(key);
+		discoveryCache.set(key, memory);
+		return { value: memory, storage: "memory", shared: false };
+	}
+	const disk = await readDiskValue("discovery", key);
+	if (isDiskDiscovery(disk)) {
+		const value: CachedDiscovery = { expiresAt: disk.expiresAt, source: disk.source, mode: disk.mode, links: disk.links };
+		putDiscovery(key, value);
+		return { value, storage: "disk", shared: false };
+	}
+	if (disk !== null) await removeDiskValue("discovery", key);
+	let task = inFlightDiscovery.get(key);
+	const shared = !!task;
+	if (!task) {
+		const controller = new AbortController();
+		task = { controller, waiters: 0, settled: false, promise: Promise.resolve(null as never) };
+		const current = task;
+		task.promise = discoverDocsPages(source, mode, controller.signal, options)
+			.then(async links => {
+				controller.signal.throwIfAborted();
+				const value: CachedDiscovery = { expiresAt: Date.now() + DOCS_CACHE_TTL_MS, source: source.toString(), mode, links };
+				putDiscovery(key, value);
+				await writeDiskValue("discovery", key, { version: DOCS_CACHE_VERSION, kind: "discovery", savedAt: Date.now(), ...value });
+				return value;
+			})
+			.finally(() => {
+				current.settled = true;
+				if (inFlightDiscovery.get(key) === current) inFlightDiscovery.delete(key);
+			});
+		task.promise.catch(() => {});
+		inFlightDiscovery.set(key, task);
+	}
+	const current = task;
+	return {
+		value: await waitForTask(task, signal, () => {
+			if (inFlightDiscovery.get(key) === current) inFlightDiscovery.delete(key);
+		}),
+		storage: "fresh",
+		shared,
+	};
+}
+
+async function getCachedPage(item: DiscoveredDoc, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ page: DocsPage | null; storage: "memory" | "disk" | "fresh" | "shared" }> {
+	await validateRemoteUrl(item.url, { ...remoteOptions(options), signal: requestSignal(signal) });
+	pruneMemoryCaches();
+	const key = canonicalPageKey(item.url);
+	if (!key) return { page: null, storage: "fresh" };
+	const memory = pageCache.get(key);
+	if (memory && memory.expiresAt > Date.now()) {
+		pageCache.delete(key);
+		pageCache.set(key, memory);
+		return { page: memory.page, storage: "memory" };
+	}
+	const disk = await readDiskValue("page", key);
+	if (isDiskPage(disk)) {
+		putPage(key, disk.page, disk.expiresAt);
+		return { page: disk.page, storage: "disk" };
+	}
+	if (disk !== null) await removeDiskValue("page", key);
+	let task = inFlightPages.get(key);
+	const shared = !!task;
+	if (!task) {
+		const controller = new AbortController();
+		task = { controller, waiters: 0, settled: false, promise: Promise.resolve(null) };
+		const current = task;
+		task.promise = fetchLimit(() => fetchDocsPage(item, controller.signal, options))
+			.then(async page => {
+				controller.signal.throwIfAborted();
+				if (!page) return null;
+				const expiresAt = Date.now() + DOCS_CACHE_TTL_MS;
+				putPage(key, page, expiresAt);
+				await writeDiskValue("page", key, { version: DOCS_CACHE_VERSION, kind: "page", savedAt: Date.now(), expiresAt, page });
+				return page;
+			})
+			.finally(() => {
+				current.settled = true;
+				if (inFlightPages.get(key) === current) inFlightPages.delete(key);
+			});
+		task.promise.catch(() => {});
+		inFlightPages.set(key, task);
+	}
+	const current = task;
+	return {
+		page: await waitForTask(task, signal, () => {
+			if (inFlightPages.get(key) === current) inFlightPages.delete(key);
+		}),
+		storage: shared ? "shared" : "fresh",
+	};
+}
+
+async function getDocsPages(params: DocsSearchParams, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ pages: DocsPage[]; source: URL; mode: DocsSearchMode; cache: DocsCacheInfo }> {
 	const source = normalizeSource(params.source);
 	const mode = normalizeMode(params.mode);
 	const maxPages = clampInt(params.maxPages, DEFAULT_MAX_PAGES, MAX_PAGES_CAP);
-	const key = cacheKeyForDocs(source, mode, maxPages, params.query);
-	const now = Date.now();
-	const cached = docsCache.get(key);
-	if (cached && cached.expiresAt > now) {
-		return { pages: cached.pages, source, mode, cache: { hit: true, storage: "memory", expiresAt: cached.expiresAt } };
+	const discovery = await getDiscovery(source, mode, signal, options);
+	const selected = selectDiscoveredLinks(discovery.value.links, params.query, maxPages);
+	const fetched = await Promise.all(selected.map(item => getCachedPage(item, signal, options)));
+	const pages = fetched.flatMap(result => result.page ? [result.page] : []);
+	const pageMetrics = { memoryHits: 0, diskHits: 0, sharedHits: 0, misses: 0, failures: 0 };
+	for (const result of fetched) {
+		if (!result.page) pageMetrics.failures++;
+		if (result.storage === "memory") pageMetrics.memoryHits++;
+		else if (result.storage === "disk") pageMetrics.diskHits++;
+		else if (result.storage === "shared") pageMetrics.sharedHits++;
+		else pageMetrics.misses++;
 	}
-	if (cached) docsCache.delete(key);
-
-	const diskCached = readDocsDiskCache(key);
-	if (diskCached) {
-		if (docsCache.size >= DOCS_CACHE_MAX) docsCache.delete(docsCache.keys().next().value as string);
-		docsCache.set(key, diskCached);
-		return { pages: diskCached.pages, source, mode, cache: { hit: true, storage: "disk", expiresAt: diskCached.expiresAt } };
-	}
-
-	const inFlight = inFlightDocs.get(key);
-	if (inFlight) return inFlight;
-
-	const request = (async () => {
-		try {
-			const discovered = await discoverDocsPages(source, mode, maxPages, signal, params.query);
-			const pages = (await Promise.all(discovered.map(item => fetchLimit(() => fetchDocsPage(item, signal))))).filter((page): page is DocsPage => !!page);
-			const expiresAt = Date.now() + DOCS_CACHE_TTL_MS;
-			const value = { expiresAt, pages, source: source.toString(), mode };
-			if (docsCache.size >= DOCS_CACHE_MAX) docsCache.delete(docsCache.keys().next().value as string);
-			docsCache.set(key, value);
-			writeDocsDiskCache(key, value);
-			const cache: DocsCacheInfo = { hit: false, storage: "fresh", expiresAt };
-			return { pages, source, mode, cache };
-		} finally {
-			inFlightDocs.delete(key);
-		}
-	})();
-	inFlightDocs.set(key, request);
-	return request;
+	const discoveryHit = discovery.storage !== "fresh" || discovery.shared;
+	const hit = discoveryHit && pageMetrics.misses === 0 && pageMetrics.failures === 0;
+	const hasFreshOrSharedWork = discovery.storage === "fresh" || pageMetrics.sharedHits > 0 || pageMetrics.misses > 0;
+	const storage: DocsCacheInfo["storage"] = hasFreshOrSharedWork
+		? "fresh"
+		: pageMetrics.diskHits > 0 || discovery.storage === "disk" ? "disk" : "memory";
+	return {
+		pages,
+		source,
+		mode,
+		cache: {
+			hit, storage, expiresAt: discovery.value.expiresAt,
+			discovery: { hit: discoveryHit, shared: discovery.shared, storage: discovery.storage },
+			pages: pageMetrics,
+		},
+	};
 }
 
 function tokenize(value: string): string[] {
@@ -483,21 +787,21 @@ function snippetForPage(page: DocsPage, query: string, maxChars: number): string
 	return truncate(best, maxChars);
 }
 
-export async function executeDocsSearch(params: DocsSearchParams, signal?: AbortSignal): Promise<ToolReturn> {
+export async function executeDocsSearch(params: DocsSearchParams, signal?: AbortSignal, options?: DocsRequestOptions): Promise<ToolReturn> {
 	try {
 		const query = params.query?.trim() ?? "";
 		const maxResults = clampInt(params.maxResults, DEFAULT_MAX_RESULTS, MAX_RESULTS_CAP);
 		const maxCharacters = clampInt(params.maxCharacters, DEFAULT_MAX_CHARS, MAX_SNIPPET_CHARS);
-		const { pages, source, mode, cache } = await getDocsPages(params, signal);
+		const { pages, source, mode, cache } = await getDocsPages(params, signal, options);
 		const ranked = pages
 			.map((page, index) => ({ page, index, score: query ? scorePage(page, query) : Math.max(1, pages.length - index) }))
 			.filter(item => !query || item.score > 0)
 			.sort((a, b) => b.score - a.score || a.index - b.index)
 			.slice(0, maxResults);
 
-		const cacheSummary = cache.hit
-			? `Cache: ${cache.storage} hit; expires ${new Date(cache.expiresAt).toISOString()}.`
-			: `Cache: refreshed; cached until ${new Date(cache.expiresAt).toISOString()}.`;
+		const pageCacheSummary = `${cache.pages.memoryHits} memory, ${cache.pages.diskHits} disk, ${cache.pages.sharedHits} shared, ${cache.pages.misses} fetched, ${cache.pages.failures} failed`;
+		const discoveryCacheSummary = cache.discovery.shared ? "shared in-flight" : cache.discovery.hit ? cache.discovery.storage : "fetched";
+		const cacheSummary = `Cache: discovery ${discoveryCacheSummary}; pages ${pageCacheSummary}; expires ${new Date(cache.expiresAt).toISOString()}.`;
 		const lines = [`# Docs search: ${source.toString()}`, query ? `Query: "${query}"` : "No query provided — showing discovered pages.", `Indexed ${pages.length} page(s); showing ${ranked.length}.`, cacheSummary, ""];
 		for (let i = 0; i < ranked.length; i++) {
 			const { page, score } = ranked[i];
@@ -515,6 +819,9 @@ export async function executeDocsSearch(params: DocsSearchParams, signal?: Abort
 				cacheHit: cache.hit,
 				cacheStorage: cache.storage,
 				cacheExpiresAt: new Date(cache.expiresAt).toISOString(),
+				cache: { ...cache, expiresAt: new Date(cache.expiresAt).toISOString() },
+				cacheDiscovery: cache.discovery,
+				cachePages: cache.pages,
 				results: ranked.map(({ page, score }) => ({ title: page.title, url: page.url, fetchUrl: page.fetchUrl, score, contentLength: page.content.length })),
 				...(params.returnMetadata ? { pages: pages.map(p => ({ title: p.title, url: p.url, fetchUrl: p.fetchUrl, contentType: p.contentType, contentLength: p.content.length })) } : {}),
 			},
@@ -525,11 +832,12 @@ export async function executeDocsSearch(params: DocsSearchParams, signal?: Abort
 	}
 }
 
-async function fetchOpenApi(url: string, signal?: AbortSignal): Promise<{ endpoints: OpenApiEndpoint[]; tags: string[] }> {
+async function fetchOpenApi(url: string, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ endpoints: OpenApiEndpoint[]; tags: string[] }> {
 	const normalized = normalizeSource(url).toString();
+	await validateRemoteUrl(normalized, { ...remoteOptions(options), signal: requestSignal(signal) });
 	const cached = openApiCache.get(normalized);
 	if (cached && cached.expiresAt > Date.now()) return cached;
-	const res = await fetch(normalized, { headers: { "Accept": "application/json", "User-Agent": "pi-web-access/0.10" }, signal: requestSignal(signal) });
+	const res = await fetchRemoteUrl(normalized, { headers: { "Accept": "application/json", "User-Agent": "pi-web-access/0.10" }, signal: requestSignal(signal) }, remoteOptions(options));
 	if (!res.ok) throw new Error(`HTTP ${res.status}: ${await readErrorSnippet(res, 200)}`);
 	const spec = await readResponseJson<Record<string, unknown>>(res, MAX_OPENAPI_BYTES);
 	const servers = Array.isArray(spec.servers) ? spec.servers as Array<Record<string, unknown>> : [];
@@ -640,14 +948,14 @@ function formatParams(params: Array<Record<string, unknown>>): string {
 	return rows.join("\n");
 }
 
-export async function executeOpenApiSearch(params: OpenApiSearchParams, signal?: AbortSignal): Promise<ToolReturn> {
+export async function executeOpenApiSearch(params: OpenApiSearchParams, signal?: AbortSignal, options?: DocsRequestOptions): Promise<ToolReturn> {
 	try {
 		const url = params.url?.trim() || DEFAULT_OPENAPI_URL;
 		const query = params.query?.trim() || "";
 		const tag = params.tag?.trim() || "";
 		if (!query && !tag) throw new Error("Provide `query` and/or `tag`.");
 		const maxResults = clampInt(params.maxResults, DEFAULT_MAX_RESULTS, MAX_RESULTS_CAP);
-		const { endpoints, tags } = await fetchOpenApi(url, signal);
+		const { endpoints, tags } = await fetchOpenApi(url, signal, options);
 		const ranked = endpoints
 			.filter(ep => !tag || ep.tags.includes(tag))
 			.map((endpoint, index) => ({ endpoint, index, score: query ? scoreEndpoint(endpoint, query) : 1 }))

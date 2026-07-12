@@ -41,11 +41,15 @@ Start the configured SearXNG instance first, or ensure `start-web-search`/`SEARX
 - [ ] Oversized/chunked response: fetch a controlled endpoint that streams more than 5 MiB without `Content-Length`.
   - Expect: a `Response too large` error, method `http-size-limit`, early stream cancellation, and no Jina retry.
 - [ ] PDF URL: fetch a known public PDF URL.
-  - Expect: method `pdf`, readable markdown content is returned/stored, and `returnMetadata: true` exposes the collision-safe saved path under `metadata.pdf.outputPath`.
+  - Expect: method `pdf`, readable markdown content is returned/stored, and `returnMetadata: true` exposes a collision-safe saved path under `~/.pi/web-access/pdf-cache/` in `metadata.pdf.outputPath`; existing `~/Downloads` files remain untouched.
+- [ ] PDF custom output: set `PI_WEB_ACCESS_PDF_OUTPUT_DIR` to a temporary directory containing an old sentinel file, then fetch a PDF.
+  - Expect: the new markdown is written there and the sentinel is not quota-pruned.
 - [ ] GitHub URL: `fetch_content({ url: "https://github.com/owner/repo" })` and a `/blob/` file URL.
-  - Expect: repo/tree/file content and `fallbackPath` including `github` when metadata is requested.
+  - Expect: repo/tree/file content and `fallbackPath` including `github` when metadata is requested; default-cache quota maintenance does not remove the current clone.
 - [ ] JS-heavy fallback: fetch a known SPA or blocked page with `returnMetadata: true`.
-  - Expect: `fallbackPath` showing HTTP/Jina attempts; final method indicates the successful fallback or clear error guidance.
+  - Expect: Jina content takes precedence when available; otherwise a usable stored result has method `static-html-partial`, `retrievalStatus: "partial"`, a visible no-JavaScript warning, the original extraction warning in details/metadata, and only bounded same-origin route evidence.
+- [ ] npm package adapter: `fetch_content({ url: "https://www.npmjs.com/package/@types/node", returnMetadata: true })`.
+  - Expect: method `npm-registry`, resolved package/version metadata, registry/repository links, and a bounded README when published; a definitely missing package returns a precise registry 404 error without a Jina attempt.
 
 ## Paper Search / Research
 

@@ -42,11 +42,12 @@ web_search({ query: "exclude noisy domain", domainFilter: ["-pinterest.com"] })
 
 ### `fetch_content`
 
-Fetch URL(s) and extract readable markdown. Supports normal web pages, GitHub repos/files, PDFs, text/JSON/Markdown, Readability extraction, and Jina fallback.
+Fetch URL(s) and extract readable markdown. Supports normal web pages, canonical npm package pages, GitHub repos/files, PDFs, text/JSON/Markdown, Readability extraction, and Jina fallback.
 
 ```ts
 fetch_content({ url: "https://example.com/article" })
 fetch_content({ urls: ["https://example.com", "https://www.iana.org/domains/example"] })
+fetch_content({ url: "https://www.npmjs.com/package/@types/node" })
 fetch_content({ url: "https://github.com/octocat/Hello-World" })
 fetch_content({ url: "https://github.com/owner/repo/blob/main/README.md" })
 fetch_content({ url: "https://example.com/article", mode: "highlights", objective: "license terms", maxChars: 1500 })
@@ -63,7 +64,9 @@ fetch_content({ url: "https://example.com/article", mode: "highlights", objectiv
 | `timeoutMs` | Per-attempt timeout, 100–120,000 ms; default 30,000 |
 | `returnMetadata` | Include content references and nested extraction/shaping metadata; compact status fields are always returned |
 
-HTTP/text bodies are stream-limited to 5 MiB and PDFs to 20 MiB even when a server omits or lies about `Content-Length`. Direct fetches resolve and block private, loopback, link-local, cloud-metadata, and selected special-use targets by default, and every redirect hop is revalidated. Jina fallback validates the original target under stricter rules: `ssrf.allowRanges` never authorizes forwarding a private/internal source URL to that third party. Credential-bearing and signed URLs are also kept away from Jina.
+HTTP/text bodies are stream-limited to 5 MiB and PDFs to 20 MiB even when a server omits or lies about `Content-Length`. Canonical `npmjs.com/package/...` URLs use bounded public `registry.npmjs.org` metadata and report method `npm-registry`, including the selected version, package links, and a bounded README when published; registry 404s return directly without Jina. Direct fetches resolve and block private, loopback, link-local, cloud-metadata, and selected special-use targets by default, and every redirect hop is revalidated. Jina fallback validates the original target under stricter rules: `ssrf.allowRanges` never authorizes forwarding a private/internal source URL to that third party. Credential-bearing and signed URLs are also kept away from Jina.
+
+When direct HTML is an incomplete SPA shell, Jina still gets precedence. If Jina fails or is unsafe to call, `fetch_content` stores a clearly marked partial result with `retrievalStatus: "partial"`, the original extraction warning, bounded title/meta/OpenGraph evidence, and same-origin documentation/API/manifest/module route candidates. It never executes page JavaScript or adds a browser runtime.
 
 ### `get_search_content`
 
@@ -124,7 +127,7 @@ docs_search({ source: "https://docs.example.com/llms.txt", query: "authenticatio
 
 Use `fetch_content` on a result URL when you need the full docs page.
 
-`docs_search` keeps a small query-aware docs index in memory and on disk under `~/.pi/web-access/docs-cache/` for about 30 minutes. This survives quick Pi reloads without becoming a stale long-term docs mirror.
+`docs_search` caches discovery indexes and individual pages separately in bounded memory and under `~/.pi/web-access/docs-cache/` for about 30 minutes. Concurrent searches share discovery and overlapping page fetches, while per-call cache metrics distinguish memory, disk, shared, fresh, and failed page work.
 
 ### `openapi_search`
 
@@ -187,7 +190,7 @@ For Pi-runtime confidence after reloading tool schemas, also run the manual regr
 Long research sessions should stay useful without stuffing giant blobs into Pi's session log.
 
 - Search/fetch metadata is still persisted with `pi.appendEntry()` so `/search` and `get_search_content` survive reloads and tree navigation.
-- `docs_search` stores short-lived docs indexes under `~/.pi/web-access/docs-cache/` for quick reuse across reloads; the TTL is about 30 minutes to limit staleness.
+- `docs_search` stores short-lived split discovery/page entries under `~/.pi/web-access/docs-cache/` for reuse across queries and reloads; file/byte bounds and the roughly 30-minute TTL limit disk growth and staleness.
 - Successful public `fetch_content` extractions use a two-minute in-memory raw cache (50 entries / 20 MiB) below content shaping, so repeated full/highlights/summary calls with the same extraction timeout reshape locally without another download. GitHub, sensitive/signed URLs, failures, and all fetches while `ssrf.allowRanges` is configured are not cached.
 - Large fetched source bodies are stored outside the session under `~/.pi/web-access/content/`; the session entry keeps a compact preview plus a content reference.
 - `get_search_content` hydrates large bodies from that disk cache on demand, keeping the in-memory/session representation compact.
@@ -201,11 +204,11 @@ Long research sessions should stay useful without stuffing giant blobs into Pi's
 - Large repos use a lightweight GitHub API view unless `forceClone: true` is set.
 - Blob URLs return file content.
 - Tree URLs return directory context.
-- The in-memory clone cache is reset on session changes, but temp clone directories are not eagerly deleted; stored repo paths stay useful across reloads/tree navigation. Old temp clones in the default cache are pruned after about 7 days or replaced by a later refresh.
+- The in-memory clone cache is reset on session changes, but temp clone directories stay useful across reloads/tree navigation. Before and after clone insertion, the default managed cache prunes entries older than 7 days and evicts the oldest entries above 20 repos or 2,000 MiB; active/current clones are protected. A custom `clonePath` is treated as user-owned and is never quota-pruned automatically.
 
 ## PDF behavior
 
-PDF URLs are text-extracted, returned/stored as markdown, and also saved under `~/Downloads/`. Identical output is reused; differing existing files are never overwritten and receive a numeric suffix. Extraction defaults to at most 100 pages and 2,000,000 markdown characters, cleans up pdf.js resources, and honors cancellation before persistence and between pages. No OCR is performed.
+PDF URLs are text-extracted, returned/stored as markdown, and saved in the managed `~/.pi/web-access/pdf-cache/` by default. Identical output is reused; differing existing files are never overwritten and receive a numeric suffix. The managed cache keeps files for 7 days and evicts the oldest files above 100 outputs or 250 MiB while protecting the current output. Set `PI_WEB_ACCESS_PDF_OUTPUT_DIR` to use an explicitly user-owned output directory; custom paths are never pruned. Existing files in `~/Downloads/` are not touched or migrated. Extraction defaults to at most 100 pages and 2,000,000 markdown characters, cleans up pdf.js resources, and honors cancellation before persistence and between pages. No OCR is performed.
 
 ## Configuration
 
@@ -218,7 +221,9 @@ Config uses `$PI_CODING_AGENT_DIR/web-search.json` when set, then `$XDG_CONFIG_H
     "enabled": true,
     "maxRepoSizeMB": 350,
     "cloneTimeoutSeconds": 30,
-    "clonePath": "/tmp/pi-github-repos"
+    "clonePath": "/tmp/pi-github-repos",
+    "maxCachedRepos": 20,
+    "maxCacheSizeMB": 2000
   },
   "shortcuts": {
     "activity": "ctrl+shift+w"
@@ -231,7 +236,7 @@ Config uses `$PI_CODING_AGENT_DIR/web-search.json` when set, then `$XDG_CONFIG_H
 
 `web_search` is keyless, so no search API key is configured here. By default it targets `http://127.0.0.1:8888` (override the port with `SEARXNG_PORT`). Set `SEARXNG_URL` to use another HTTP(S) instance and `SEARXNG_START_HELPER` to choose the executable used when the default endpoint is down. The package does not install SearXNG itself; if no helper is available, start the configured instance separately and the tool returns a precise setup error. `GITHUB_TOKEN` takes precedence over `githubToken`; either one raises GitHub API limits for `github_examples`. No scholarly API key is required.
 
-Keep the resolved `web-search.json` private (`chmod 600`) and never commit it. `ssrf.allowRanges` is an explicit escape hatch for trusted private networks or TUN/fake-IP proxy ranges; entries must be strict IPv4/IPv6 CIDRs (or single IPs), and broad `/0` exemptions are rejected. The guard validates DNS before each request/redirect, but native `fetch` resolves independently, so this reduces SSRF exposure without claiming complete DNS-rebinding protection or network-sandbox isolation. If a key is pasted into chat, shell history, logs, or a public issue, rotate it with the provider even if the repository scan is clean.
+Keep the resolved `web-search.json` private (`chmod 600`) and never commit it. `ssrf.allowRanges` is an explicit escape hatch for trusted private networks or TUN/fake-IP proxy ranges; entries must be strict IPv4/IPv6 CIDRs (or single IPs), and broad `/0` exemptions are rejected. The guard validates DNS before each request/redirect and pins that hop's connection to the complete validated address set, while retaining the original hostname for HTTP Host, TLS SNI, and certificate verification. This closes the validate-then-fetch DNS-rebinding gap; it does not replace network-sandbox isolation. If a key is pasted into chat, shell history, logs, or a public issue, rotate it with the provider even if the repository scan is clean.
 
 ## Commands and UI
 
