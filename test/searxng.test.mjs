@@ -46,12 +46,12 @@ test("SearXNG maps, sanitizes, deduplicates, filters, and caches results", async
     const options = {
       numResults: 20,
       recencyFilter: "month",
-      domainFilter: ["example.test", "-noise.test"],
+      domainFilter: ["example.test", "https://docs.test/path", "EXAMPLE.TEST", "-noise.test", "bad domain query"],
     };
     const first = await searxngSearch("  useful query  ", options);
 
     assert.equal(calls.length, 2);
-    assert.equal(calls[1].searchParams.get("q"), "useful query site:example.test -site:noise.test");
+    assert.equal(calls[1].searchParams.get("q"), "useful query (site:example.test OR site:docs.test) -site:noise.test");
     assert.equal(calls[1].searchParams.get("time_range"), "month");
     assert.equal(calls[1].searchParams.get("categories"), "general,news");
     assert.equal(first.results.length, 2);
@@ -64,6 +64,23 @@ test("SearXNG maps, sanitizes, deduplicates, filters, and caches results", async
     const second = await searxngSearch("useful query", options);
     assert.equal(calls.length, 2, "warm identical search should use the short-lived cache");
     assert.equal(second.metadata.cacheHit, true);
+  } finally {
+    restoreEnvironment();
+  }
+});
+
+test("a single positive domain filter keeps the compact site query", async () => {
+  const calls = [];
+  try {
+    globalThis.fetch = async url => {
+      const requested = new URL(String(url));
+      calls.push(requested);
+      if (requested.pathname === "/") return new Response("ok");
+      return jsonResponse({ results: [{ title: "One", url: "https://docs.test/one", content: "snippet" }] });
+    };
+    const { searxngSearch } = await loadSearx("single-domain");
+    await searxngSearch("query", { domainFilter: ["docs.test"] });
+    assert.equal(calls[1].searchParams.get("q"), "query site:docs.test");
   } finally {
     restoreEnvironment();
   }

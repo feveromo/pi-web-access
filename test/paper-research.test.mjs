@@ -178,6 +178,14 @@ test("paper_research reads specific arXiv HTML sections", async () => {
     assert.match(text, /# 3 Method/);
     assert.match(text, /Exact recipe and hyperparameters/);
     assert.equal(result.details.section, "3 Method");
+
+    const abstract = await executePaperResearch({ operation: "read_paper", arxivId: "2401.00001", section: "abstract" });
+    assert.match(abstract.content[0].text, /Abstract text\./);
+    assert.equal(abstract.details.section, "Abstract");
+
+    const toc = await executePaperResearch({ operation: "read_paper", arxivId: "2401.00001", section: "toc" });
+    assert.match(toc.content[0].text, /## Sections/);
+    assert.match(toc.content[0].text, /3 Method/);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -1,12 +1,12 @@
 import { existsSync, lstatSync, readFileSync, rmSync, statSync, readdirSync, openSync, readSync, closeSync, realpathSync, type Dirent } from "node:fs";
 import { execFile } from "node:child_process";
-import { homedir } from "node:os";
 import { extname, join, resolve as resolvePath, sep as pathSep } from "node:path";
 import { activityMonitor } from "./activity.js";
 import type { ExtractedContent } from "./extract.js";
 import { checkGhAvailable, checkRepoSize, fetchViaApi, showGhHint } from "./github-api.js";
+import { getWebSearchConfigPath } from "./utils.js";
 
-const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
+const CONFIG_PATH = getWebSearchConfigPath();
 const DEFAULT_CLONE_PATH = "/tmp/pi-github-repos";
 
 const BINARY_EXTENSIONS = new Set([

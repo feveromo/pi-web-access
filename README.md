@@ -1,6 +1,6 @@
 # Pi Web Access — Lean Fork
 
-A slimmed-down fork of [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for Pi, synced with the useful upstream baseline fixes through `v0.10.7`. This version is intentionally focused on one thing: fast, predictable research and content extraction without interactive review UIs, media analysis, or extra provider layers. It is designed to behave like close-to-the-metal Pi software: small API surface, bounded output, cancellable work, session-safe storage, and native TUI rendering.
+A slimmed-down fork of [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for Pi, synced with the useful retained upstream fixes through `v0.13.0`. This version is intentionally focused on one thing: fast, predictable research and content extraction without interactive review UIs, media analysis, or extra provider layers. It is designed to behave like close-to-the-metal Pi software: small API surface, bounded output, cancellable work, session-safe storage, and native TUI rendering.
 
 ## What is different in this fork?
 
@@ -35,7 +35,7 @@ web_search({ query: "exclude noisy domain", domainFilter: ["-pinterest.com"] })
 | `query` / `queries` | Single query or up to 8 varied queries; duplicates are removed and active requests are limited to 3 |
 | `numResults` | Results per query, default 5, max 20 |
 | `recencyFilter` | `day`, `week`, `month`, `year` (mapped to SearXNG `time_range`); when set, also pulls SearXNG's news engines and surfaces `publishedDate` next to dated sources, since news engines are the ones that reliably return dates |
-| `domainFilter` | Include/exclude domains; prefix exclusions with `-` (mapped to `site:` / `-site:`) |
+| `domainFilter` | Include/exclude domains; multiple includes are ORed, while exclusions (prefixed with `-`) are applied together |
 | `returnMetadata` | Include raw SearXNG engine/debug metadata; compact timing/count signals are always in `details.metrics` |
 
 `details.metrics` reports result counts, unique domains, timing, cache, engine, and partial-failure signals. For full source text, follow `web_search` with `fetch_content` on the official/source URLs. The instance aggregates many engines; when one engine is upstream-rate-limited, the rest can keep contributing. General web engines do not reliably return publication dates; dates show up mainly when `recencyFilter` enables news results.
@@ -63,7 +63,7 @@ fetch_content({ url: "https://example.com/article", mode: "highlights", objectiv
 | `timeoutMs` | Per-attempt timeout, 100–120,000 ms; default 30,000 |
 | `returnMetadata` | Include content references and nested extraction/shaping metadata; compact status fields are always returned |
 
-HTTP/text bodies are stream-limited to 5 MiB and PDFs to 20 MiB even when a server omits or lies about `Content-Length`. Jina fallback is skipped for syntactically obvious private-address, credential-bearing, or signed URLs so those URLs are not sent to a third party.
+HTTP/text bodies are stream-limited to 5 MiB and PDFs to 20 MiB even when a server omits or lies about `Content-Length`. Direct fetches resolve and block private, loopback, link-local, cloud-metadata, and selected special-use targets by default, and every redirect hop is revalidated. Jina fallback validates the original target under stricter rules: `ssrf.allowRanges` never authorizes forwarding a private/internal source URL to that third party. Credential-bearing and signed URLs are also kept away from Jina.
 
 ### `get_search_content`
 
@@ -105,11 +105,13 @@ paper_research({ operation: "search", query: "RAG evaluation", minCitations: 25,
 paper_research({ operation: "map_topic", query: "RAG evaluation", maxResults: 3 })
 paper_research({ operation: "citation_graph", openAlexId: "W1234567890", direction: "citations" })
 paper_research({ operation: "read_paper", arxivId: "2401.00001", section: "3" })
+paper_research({ operation: "read_paper", arxivId: "2401.00001", section: "abstract" })
+paper_research({ operation: "read_paper", arxivId: "2401.00001", section: "toc" })
 paper_research({ operation: "abstract_search", query: "RAG faithfulness benchmark" })
 paper_research({ operation: "linked_resources", arxivId: "2401.00001" })
 ```
 
-Key operations: `search`, `map_topic`, `trending`, `details`, `read_paper`, `citation_graph`, `abstract_search`, `related`, `linked_resources`.
+Key operations: `search`, `map_topic`, `trending`, `details`, `read_paper`, `citation_graph`, `abstract_search`, `related`, `linked_resources`. For `read_paper`, `section` accepts an exact number/name plus the aliases `abstract` and `toc`.
 
 ### `docs_search`
 
@@ -135,7 +137,7 @@ openapi_search({ url: "https://api.example.com/openapi.json", query: "create web
 
 ### `github_examples`
 
-Find and read current examples/tutorials/notebooks/cookbook files in GitHub repos without cloning first.
+Find and read current examples/tutorials/notebooks/cookbook files in GitHub repos without cloning first. Keyword searches use path scoring plus a bounded content scan of up to 8 likely small text/example files, returning matched terms and snippets without unbounded API traffic. `minScore` is the minimum final combined path/content score; whitespace-only keywords are treated as absent.
 
 ```ts
 github_examples({ operation: "find", repo: "huggingface/trl", keyword: "sft" })
@@ -186,9 +188,10 @@ Long research sessions should stay useful without stuffing giant blobs into Pi's
 
 - Search/fetch metadata is still persisted with `pi.appendEntry()` so `/search` and `get_search_content` survive reloads and tree navigation.
 - `docs_search` stores short-lived docs indexes under `~/.pi/web-access/docs-cache/` for quick reuse across reloads; the TTL is about 30 minutes to limit staleness.
+- Successful public `fetch_content` extractions use a two-minute in-memory raw cache (50 entries / 20 MiB) below content shaping, so repeated full/highlights/summary calls with the same extraction timeout reshape locally without another download. GitHub, sensitive/signed URLs, failures, and all fetches while `ssrf.allowRanges` is configured are not cached.
 - Large fetched source bodies are stored outside the session under `~/.pi/web-access/content/`; the session entry keeps a compact preview plus a content reference.
 - `get_search_content` hydrates large bodies from that disk cache on demand, keeping the in-memory/session representation compact.
-- Session restore keeps recent web-access entries for 24 hours; disk-backed large content is pruned after about 7 days.
+- Session restore keeps recent web-access entries for 24 hours; live results are also capped at 100 entries / about 8 MiB, and disk-backed large content is pruned after about 7 days.
 - Tool outputs are intentionally compact: `web_search` returns snippets and stores full result text, and `fetch_content` previews large single pages, while full stored results remain available through `get_search_content`.
 - For tight context work, prefer `mode: "highlights"` / `"summary"` and set `maxChars` explicitly.
 
@@ -206,7 +209,7 @@ PDF URLs are text-extracted, returned/stored as markdown, and also saved under `
 
 ## Configuration
 
-Config lives at `~/.pi/web-search.json` and every field is optional.
+Config uses `$PI_CODING_AGENT_DIR/web-search.json` when set, then `$XDG_CONFIG_HOME/pi/web-search.json`, and otherwise `~/.pi/web-search.json`. Every field is optional.
 
 ```json
 {
@@ -219,13 +222,16 @@ Config lives at `~/.pi/web-search.json` and every field is optional.
   },
   "shortcuts": {
     "activity": "ctrl+shift+w"
+  },
+  "ssrf": {
+    "allowRanges": ["198.18.0.0/15"]
   }
 }
 ```
 
 `web_search` is keyless, so no search API key is configured here. By default it targets `http://127.0.0.1:8888` (override the port with `SEARXNG_PORT`). Set `SEARXNG_URL` to use another HTTP(S) instance and `SEARXNG_START_HELPER` to choose the executable used when the default endpoint is down. The package does not install SearXNG itself; if no helper is available, start the configured instance separately and the tool returns a precise setup error. `GITHUB_TOKEN` takes precedence over `githubToken`; either one raises GitHub API limits for `github_examples`. No scholarly API key is required.
 
-Keep `~/.pi/web-search.json` private (`chmod 600 ~/.pi/web-search.json`) and never commit it. If a key is pasted into chat, shell history, logs, or a public issue, rotate it with the provider even if the repository scan is clean.
+Keep the resolved `web-search.json` private (`chmod 600`) and never commit it. `ssrf.allowRanges` is an explicit escape hatch for trusted private networks or TUN/fake-IP proxy ranges; entries must be strict IPv4/IPv6 CIDRs (or single IPs), and broad `/0` exemptions are rejected. The guard validates DNS before each request/redirect, but native `fetch` resolves independently, so this reduces SSRF exposure without claiming complete DNS-rebinding protection or network-sandbox isolation. If a key is pasted into chat, shell history, logs, or a public issue, rotate it with the provider even if the repository scan is clean.
 
 ## Commands and UI
 

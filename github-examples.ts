@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import pLimit from "p-limit";
 import { readErrorSnippet, readResponseJson, readResponseText } from "./http-response.js";
+import { getWebSearchConfigPath } from "./utils.js";
 
 export type GitHubExamplesOperation = "find" | "read";
 
@@ -33,6 +33,12 @@ interface GitHubTreeItem {
 	size?: number;
 }
 
+interface ContentScanResult {
+	file: ExampleFile;
+	status: "succeeded" | "failed";
+	error?: string;
+}
+
 interface ExampleFile {
 	path: string;
 	url: string;
@@ -41,17 +47,23 @@ interface ExampleFile {
 	size: number;
 	exampleScore: number;
 	keywordScore: number;
+	contentScore?: number;
+	matchedTerms?: string[];
+	matchSnippet?: string;
 	score: number;
 	priority: number;
 }
 
 const GITHUB_API = "https://api.github.com";
-const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
+const CONFIG_PATH = getWebSearchConfigPath();
 const REQUEST_TIMEOUT_MS = 20000;
 const DEFAULT_MAX_RESULTS = 12;
 const MAX_RESULTS = 50;
 const MAX_GITHUB_JSON_BYTES = 20 * 1024 * 1024;
 const MAX_GITHUB_FILE_BYTES = 5 * 1024 * 1024;
+const CONTENT_SCAN_LIMIT = 8;
+const CONTENT_SCAN_MAX_BYTES = 256 * 1024;
+const contentScanLimit = pLimit(3);
 
 const EXAMPLE_PATTERNS = [
 	"scripts", "script", "examples", "example", "notebooks", "notebook",
@@ -152,10 +164,10 @@ async function fetchGitHubJson<T>(path: string, signal?: AbortSignal): Promise<T
 	return await readResponseJson<T>(res, MAX_GITHUB_JSON_BYTES);
 }
 
-async function fetchGitHubText(path: string, signal?: AbortSignal): Promise<string> {
+async function fetchGitHubText(path: string, signal?: AbortSignal, maxBytes = MAX_GITHUB_FILE_BYTES): Promise<string> {
 	const res = await fetch(`${GITHUB_API}${path}`, { headers: githubHeaders(true), signal: requestSignal(signal) });
 	if (!res.ok) throw new Error(`GitHub API ${res.status}: ${await readErrorSnippet(res, 250)}`);
-	return await readResponseText(res, MAX_GITHUB_FILE_BYTES);
+	return await readResponseText(res, maxBytes);
 }
 
 async function findSimilarRepos(repo: string, signal?: AbortSignal): Promise<Array<{ full_name?: string; description?: string; stargazers_count?: number; html_url?: string }>> {
@@ -234,6 +246,43 @@ function combinedScore(path: string, keyword: string | undefined): { exampleScor
 	return { exampleScore: ex.score, keywordScore: kw, score, priority: ex.priority };
 }
 
+function contentMatch(content: string, keyword: string): { score: number; matchedTerms: string[]; snippet?: string } {
+	const terms = [...new Set(tokenize(keyword))];
+	if (terms.length === 0) return { score: 0, matchedTerms: [] };
+	const lower = content.toLowerCase();
+	const contentTokens = new Set(tokenize(content));
+	const matchedTerms = terms.filter(term => contentTokens.has(term));
+	if (matchedTerms.length === 0) return { score: 0, matchedTerms };
+	const phrase = lower.includes(keyword.trim().toLowerCase());
+	const score = Math.min(100, Math.round((matchedTerms.length / terms.length) * 85 + (phrase ? 15 : 0)));
+	const first = Math.min(...matchedTerms.map(term => lower.indexOf(term)).filter(index => index >= 0));
+	const start = Math.max(0, first - 100);
+	const snippet = content.slice(start, Math.min(content.length, first + 220)).replace(/\s+/g, " ").trim();
+	return { score, matchedTerms, snippet };
+}
+
+async function scanCandidateContent(repo: string, file: ExampleFile, keyword: string, signal?: AbortSignal): Promise<ContentScanResult> {
+	try {
+		const encodedPath = file.path.split("/").map(encodeURIComponent).join("/");
+		const refQuery = file.ref ? `?ref=${encodeURIComponent(file.ref)}` : "";
+		const content = await fetchGitHubText(`/repos/${repo}/contents/${encodedPath}${refQuery}`, signal, CONTENT_SCAN_MAX_BYTES);
+		const match = contentMatch(content, keyword);
+		return {
+			status: "succeeded",
+			file: {
+				...file,
+				contentScore: match.score,
+				matchedTerms: match.matchedTerms,
+				matchSnippet: match.snippet,
+				score: Math.round(file.exampleScore * 0.35 + file.keywordScore * 0.35 + match.score * 0.65 + 5),
+			},
+		};
+	} catch (err) {
+		if (signal?.aborted) throw signal.reason ?? err;
+		return { status: "failed", file, error: errorMessage(err) };
+	}
+}
+
 async function getRepoInfo(repo: string, signal?: AbortSignal): Promise<GitHubRepoInfo> {
 	return fetchGitHubJson<GitHubRepoInfo>(`/repos/${repo}`, signal);
 }
@@ -250,7 +299,8 @@ async function executeFind(params: GitHubExamplesParams, signal?: AbortSignal): 
 	const repo = normalizeRepo(params.repo);
 	if (!repo) return failure("find", "`repo` must be owner/name or a GitHub URL.", params);
 	const maxResults = clampInt(params.maxResults, DEFAULT_MAX_RESULTS, MAX_RESULTS);
-	const minScore = clampInt(params.minScore, params.keyword ? 45 : 55, 100);
+	const keyword = normalizeToken(params.keyword) ?? undefined;
+	const minScore = clampInt(params.minScore, keyword ? 45 : 55, 100);
 	let info: GitHubRepoInfo;
 	try {
 		info = await getRepoInfo(repo, signal);
@@ -265,13 +315,13 @@ async function executeFind(params: GitHubExamplesParams, signal?: AbortSignal): 
 	}
 	const ref = params.ref?.trim() || info.default_branch || "main";
 	const { tree, truncated } = await getRepoTree(repo, ref, signal);
-	const examples: ExampleFile[] = [];
+	let examples: ExampleFile[] = [];
 	for (const item of tree) {
 		const path = item.path!;
 		if (!isLikelyTextPath(path)) continue;
-		const scored = combinedScore(path, params.keyword);
-		if (params.keyword) {
-			if (scored.keywordScore < minScore) continue;
+		const scored = combinedScore(path, keyword);
+		if (keyword) {
+			if (scored.exampleScore < 55 && scored.keywordScore < 30) continue;
 		} else if (scored.score < minScore && scored.exampleScore < 60) continue;
 		examples.push({
 			path,
@@ -283,16 +333,40 @@ async function executeFind(params: GitHubExamplesParams, signal?: AbortSignal): 
 		});
 	}
 	examples.sort((a, b) => b.score - a.score || a.priority - b.priority || a.path.split("/").length - b.path.split("/").length || a.path.localeCompare(b.path));
+	let scanAttempted = 0;
+	let scanSucceeded = 0;
+	let scanFailed = 0;
+	let scanErrors: string[] = [];
+	if (keyword) {
+		const scanCandidates = examples.filter(file => file.size <= CONTENT_SCAN_MAX_BYTES).slice(0, CONTENT_SCAN_LIMIT);
+		scanAttempted = scanCandidates.length;
+		const scanned = await Promise.all(scanCandidates.map(file => contentScanLimit(() => scanCandidateContent(repo, file, keyword, signal))));
+		scanSucceeded = scanned.filter(result => result.status === "succeeded").length;
+		scanFailed = scanned.length - scanSucceeded;
+		scanErrors = [...new Set(scanned.flatMap(result => result.error ? [result.error] : []))].slice(0, 3);
+		const scannedByPath = new Map(scanned.map(result => [result.file.path, result.file]));
+		examples = examples
+			.map(file => scannedByPath.get(file.path) ?? file)
+			.filter(file => ((file.contentScore ?? 0) > 0 || file.keywordScore > 0) && file.score >= minScore);
+		examples.sort((a, b) => b.score - a.score || (b.contentScore ?? 0) - (a.contentScore ?? 0) || a.priority - b.priority || a.path.localeCompare(b.path));
+	} else {
+		examples = examples.filter(file => file.score >= minScore);
+	}
 	const results = examples.slice(0, maxResults);
-	const lines = [`# GitHub examples in ${repo}`, info.description ? info.description : "", `Branch/ref: ${ref}`, params.keyword ? `Keyword: "${params.keyword}"` : "No keyword — showing likely example/tutorial files.", `Showing ${results.length} of ${examples.length} candidate file(s).`, truncated ? "Warning: GitHub reported the repository tree as truncated, so example discovery may be incomplete. Try a narrower ref/path or fetch the repository with `fetch_content`." : "", ""].filter(Boolean);
+	const lines = [`# GitHub examples in ${repo}`, info.description ? info.description : "", `Branch/ref: ${ref}`, keyword ? `Keyword: "${keyword}"` : "No keyword — showing likely example/tutorial files.", `Showing ${results.length} of ${examples.length} candidate file(s).`, scanFailed > 0 ? `Content scan: ${scanSucceeded}/${scanAttempted} succeeded; ${scanFailed} failed${scanErrors[0] ? ` (${scanErrors[0]})` : ""}.` : "", truncated ? "Warning: GitHub reported the repository tree as truncated, so example discovery may be incomplete. Try a narrower ref/path or fetch the repository with `fetch_content`." : "", ""].filter(Boolean);
 	for (let i = 0; i < results.length; i++) {
 		const file = results[i];
 		lines.push(`## ${i + 1}. ${file.path}`);
 		lines.push(`${file.url}`);
-		lines.push(`Score: ${file.score} (example ${file.exampleScore}, keyword ${file.keywordScore}) · Size: ${file.size.toLocaleString()} bytes`);
+		lines.push(`Score: ${file.score} (example ${file.exampleScore}, path ${file.keywordScore}${file.contentScore != null ? `, content ${file.contentScore}` : ""}) · Size: ${file.size.toLocaleString()} bytes`);
+		if (file.matchedTerms?.length) lines.push(`Matched terms: ${file.matchedTerms.join(", ")}`);
+		if (file.matchSnippet) lines.push(`> ${file.matchSnippet}`);
 		lines.push(`Read: github_examples({ operation: "read", repo: "${repo}", path: "${file.path}", ref: "${ref}" })`, "");
 	}
-	return { content: [{ type: "text", text: lines.join("\n") }], details: { operation: "find", repo, ref, truncated, count: results.length, totalCandidates: examples.length, results } };
+	if (results.length === 0) {
+		lines.push(`No bounded path/content matches were found. Try fetch_content({ url: "https://github.com/${repo}" }) to inspect or clone the repository, or retry with a path-oriented keyword.`);
+	}
+	return { content: [{ type: "text", text: lines.join("\n") }], details: { operation: "find", repo, ref, truncated, count: results.length, totalCandidates: examples.length, contentScan: { attempted: scanAttempted, succeeded: scanSucceeded, failed: scanFailed, errors: scanErrors }, contentScanLimit: CONTENT_SCAN_LIMIT, contentScanMaxBytes: CONTENT_SCAN_MAX_BYTES, minScore, results } };
 }
 
 function decodeContentResponse(data: Record<string, unknown>): string | null {
@@ -353,7 +427,15 @@ async function executeRead(params: GitHubExamplesParams, signal?: AbortSignal): 
 	let text = `# ${repo}/${path}\nhttps://github.com/${repo}/blob/${ref}/${path}\n\n`;
 	text += `Showing lines ${selected.lineStart}-${selected.lineEnd} of ${selected.totalLines}${selected.truncated ? " (truncated)" : ""}.\n\n`;
 	text += "```\n" + selected.text + "\n```";
-	if (selected.truncated) text += `\n\nCall again with lineStart/lineEnd to read another range.`;
+	if (selected.lineEnd < selected.totalLines) {
+		const nextStart = selected.lineEnd + 1;
+		const nextEnd = Math.min(selected.totalLines, nextStart + 299);
+		text += `\n\nNext: github_examples({ operation: "read", repo: "${repo}", path: "${path}", ref: "${ref}", lineStart: ${nextStart}, lineEnd: ${nextEnd} })`;
+	} else if (selected.lineStart > 1) {
+		const earlierEnd = selected.lineStart - 1;
+		const earlierStart = Math.max(1, earlierEnd - 299);
+		text += `\n\nEarlier: github_examples({ operation: "read", repo: "${repo}", path: "${path}", ref: "${ref}", lineStart: ${earlierStart}, lineEnd: ${earlierEnd} })`;
+	}
 	return { content: [{ type: "text", text }], details: { operation: "read", repo, path, ref, lineStart: selected.lineStart, lineEnd: selected.lineEnd, totalLines: selected.totalLines, truncated: selected.truncated } };
 }
 
