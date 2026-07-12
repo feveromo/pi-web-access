@@ -36,12 +36,17 @@ test("Pi widget clearing uses the current undefined API contract", () => {
 
 test("raw extraction caching stays below local shaping and excludes sensitive URLs", () => {
   const extract = read("extract.ts");
+  const persistent = read("raw-persistent-cache.js");
   assert.match(extract, /if \(!key\) return shapeExtractedContent\(await extractRawContent/);
-  assert.match(extract, /return shapeExtractedContent\(withRawCacheMetadata\(cached\.value/);
+  assert.match(extract, /decorateRawCacheResult\(cached\.value/);
   assert.match(extract, /buildRawExtractionCacheKey\(url/);
-  assert.match(extract, /shouldCacheRawExtraction\(result, loadSsrfAllowRanges\(\)\)/);
-  assert.match(extract, /sizeOf: approximateRawResultBytes/);
-  assert.match(extract, /maxBytes: 20 \* 1024 \* 1024/);
+  assert.match(persistent, /shouldCacheRawExtraction\(result, allowRanges\(\)\)/);
+  assert.match(persistent, /sizeOf: approximateRawResultBytes/);
+  assert.match(persistent, /memoryMaxEntries: 50, memoryMaxBytes: 20 \* 1024 \* 1024/);
+  assert.match(persistent, /namespace: "raw-fetch"/);
+  assert.match(persistent, /staleMs: 24 \* 60 \* 60 \* 1000/);
+  assert.match(extract, /const originCache = cacheFreshnessFromHeaders\(response\.headers\)/);
+  assert.match(extract, /transportError:/);
 });
 
 test("fetch extraction uses bounded direct and strict third-party SSRF boundaries", () => {

@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+
+const cacheDir = mkdtempSync(join(tmpdir(), "pi-web-access-paper-research-"));
+process.env.PI_WEB_ACCESS_RESEARCH_CACHE_DIR = cacheDir;
+after(() => rmSync(cacheDir, { recursive: true, force: true }));
 
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -44,6 +51,9 @@ test("paper_research searches OpenAlex with filters and abstracts", async () => 
     assert.match(text, /\*\*Abstract:\*\* Evaluates RAG systems/);
     assert.equal(result.details.provider, "openalex");
     assert.equal(result.details.count, 1);
+    const queryEnvelope = JSON.parse(readFileSync(join(cacheDir, readdirSync(cacheDir).find(name => name.startsWith("paper-research-"))), "utf8"));
+    assert.equal(queryEnvelope.freshUntil - queryEnvelope.storedAt, 24 * 60 * 60 * 1000);
+    assert.equal(queryEnvelope.staleUntil, queryEnvelope.freshUntil);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -62,6 +72,9 @@ test("paper_research rejects a pre-aborted caller even when data is cached", asy
     const params = { operation: "details", openAlexId: "W999" };
     const warm = await executePaperResearch(params);
     assert.match(warm.content[0].text, /Cached Paper/);
+    const detailEnvelope = JSON.parse(readFileSync(join(cacheDir, readdirSync(cacheDir).find(name => name.startsWith("paper-detail-"))), "utf8"));
+    assert.equal(detailEnvelope.freshUntil - detailEnvelope.storedAt, 30 * 24 * 60 * 60 * 1000);
+    assert.equal(detailEnvelope.staleUntil, detailEnvelope.freshUntil);
 
     const controller = new AbortController();
     controller.abort();

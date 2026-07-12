@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+
+const cacheDir = mkdtempSync(join(tmpdir(), "pi-web-access-paper-search-"));
+process.env.PI_WEB_ACCESS_RESEARCH_CACHE_DIR = cacheDir;
+after(() => rmSync(cacheDir, { recursive: true, force: true }));
 
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -42,6 +49,9 @@ test("paper_search parses compact OpenAlex records and abstracts", async () => {
     const text = result.content[0].text;
 
     assert.equal(result.details.count, 1);
+    const envelope = JSON.parse(readFileSync(join(cacheDir, readdirSync(cacheDir).find(name => name.startsWith("paper-search-"))), "utf8"));
+    assert.equal(envelope.freshUntil - envelope.storedAt, 24 * 60 * 60 * 1000);
+    assert.equal(envelope.staleUntil, envelope.freshUntil);
     assert.match(requestedUrl.searchParams.get("select"), /abstract_inverted_index/);
     assert.match(text, /Useful Paper/);
     assert.match(text, /Ada Lovelace, Grace Hopper/);

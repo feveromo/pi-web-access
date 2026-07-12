@@ -1,6 +1,7 @@
 import { parseHTML } from "linkedom";
 import pLimit from "p-limit";
 import { readErrorSnippet, readResponseJson, readResponseText } from "./http-response.js";
+import { createPersistentCache } from "./persistent-cache.js";
 
 export type PaperResearchOperation =
 	| "search"
@@ -94,6 +95,17 @@ const MAX_JSON_RESPONSE_BYTES = 5 * 1024 * 1024;
 const MAX_PAPER_HTML_BYTES = 10 * 1024 * 1024;
 const JSON_CACHE_TTL_MS = 30 * 60 * 1000;
 const JSON_CACHE_MAX_BYTES = 20 * 1024 * 1024;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const paperQueryCache = createPersistentCache({
+	namespace: "paper-research", freshMs: DAY_MS, staleMs: DAY_MS,
+	maxEntries: 1000, maxBytes: 64 * 1024 * 1024, maxValueBytes: 10 * 1024 * 1024,
+	validate: isCachedToolReturn, admit: (value: ToolReturn) => !value.details.error,
+});
+const paperImmutableCache = createPersistentCache({
+	namespace: "paper-detail", freshMs: 30 * DAY_MS, staleMs: 30 * DAY_MS,
+	maxEntries: 1000, maxBytes: 96 * 1024 * 1024, maxValueBytes: 12 * 1024 * 1024,
+	validate: isCachedToolReturn, admit: (value: ToolReturn) => !value.details.error,
+});
 
 const OPENALEX_FIELDS = [
 	"id",
@@ -118,6 +130,24 @@ const fetchLimit = pLimit(FETCH_CONCURRENCY);
 const graphLimit = pLimit(3);
 const jsonCache = new Map<string, { value: unknown; expiresAt: number; bytes: number }>();
 let jsonCacheBytes = 0;
+
+function isBoundedPaperValue(value: unknown, budget = { nodes: 0 }, depth = 0): boolean {
+	if (++budget.nodes > 100_000 || depth > 12) return false;
+	if (value === undefined || value === null || typeof value === "boolean") return true;
+	if (typeof value === "number") return Number.isFinite(value);
+	if (typeof value === "string") return value.length <= 10 * 1024 * 1024;
+	if (Array.isArray(value)) return value.length <= 10_000 && value.every(item => isBoundedPaperValue(item, budget, depth + 1));
+	if (!value || typeof value !== "object") return false;
+	const entries = Object.entries(value);
+	return entries.length <= 10_000 && entries.every(([key, item]) => key.length <= 10_000 && isBoundedPaperValue(item, budget, depth + 1));
+}
+function isCachedToolReturn(value: unknown): value is ToolReturn {
+	if (!value || typeof value !== "object") return false;
+	const item = value as Record<string, unknown>;
+	return Array.isArray(item.content) && item.content.length <= 10
+		&& item.content.every(part => !!part && typeof part === "object" && (part as Record<string, unknown>).type === "text" && typeof (part as Record<string, unknown>).text === "string" && ((part as Record<string, unknown>).text as string).length <= 10 * 1024 * 1024)
+		&& !!item.details && typeof item.details === "object" && isBoundedPaperValue(item.details);
+}
 
 function clampInt(value: unknown, fallback: number, max: number): number {
 	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -865,7 +895,7 @@ function failure(operation: string, message: string, params: PaperResearchParams
 	return { content: [{ type: "text", text: `Paper research failed: ${message}` }], details: { operation, error: message, params } };
 }
 
-export async function executePaperResearch(params: PaperResearchParams, signal?: AbortSignal): Promise<ToolReturn> {
+async function executePaperResearchFresh(params: PaperResearchParams, signal?: AbortSignal): Promise<ToolReturn> {
 	const operation = params.operation;
 	try {
 		signal?.throwIfAborted();
@@ -885,4 +915,19 @@ export async function executePaperResearch(params: PaperResearchParams, signal?:
 		throwIfCallerAborted(signal, err);
 		return failure(operation ?? "unknown", errorMessage(err), params);
 	}
+}
+
+export async function executePaperResearch(params: PaperResearchParams, signal?: AbortSignal): Promise<ToolReturn> {
+	const operation = params.operation;
+	if (!operation) return executePaperResearchFresh(params, signal);
+	const immutable = operation === "details" || operation === "read_paper";
+	const ttlMs = immutable ? 30 * DAY_MS : DAY_MS;
+	const cache = immutable ? paperImmutableCache : paperQueryCache;
+	const normalized = Object.fromEntries(Object.entries(params)
+		.filter(([, value]) => value !== undefined)
+		.sort(([a], [b]) => a.localeCompare(b)));
+	const cached = await cache.get(JSON.stringify(normalized), sharedSignal => executePaperResearchFresh(params, sharedSignal), {
+		signal, freshMs: ttlMs, staleMs: ttlMs, staleOnError: false,
+	});
+	return { ...cached.value, details: { ...cached.value.details, cache: cached.metadata } };
 }

@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-12
+
+### Added
+- Added a shared, bounded persistent research cache with versioned schema-validated envelopes, SHA-256 keys, atomic async writes, memory LRU, abort-isolated request coalescing, explicit stale-on-transient-error handling, and symlink-safe owned-file pruning.
+- Persisted web search, documentation, OpenAPI, public raw extraction, paper research, and responseId records with policy-specific freshness and hard-retention bounds.
+
+### Changed
+- Public raw fetch freshness now honors origin `Cache-Control` up to 24 hours while excluding private, signed, credentialed, GitHub, custom-network, and non-cacheable responses; URL SSRF validation always precedes cache lookup.
+- Stored responseIds and externalized content now remain available for seven days across reloads, with bounded record/content storage and explicit deletion of owned files.
+
 ### Added
 - Added age/count/byte quota pruning for the plugin-managed GitHub clone and PDF markdown caches, with active-output protection, bounded symlink-safe traversal, and no automatic pruning of custom user paths.
 - Added bounded static partial extraction for JavaScript/SPA shells after Jina failure, plus a cancellation- and SSRF-aware `npm-registry` adapter for canonical npm package URLs with metadata, links, and bounded README content.

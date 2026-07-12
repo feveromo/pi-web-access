@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+import { formatSearchCacheWarning } from "../search-output.js";
+
+const cacheDir = mkdtempSync(join(tmpdir(), "pi-web-access-searxng-"));
+process.env.PI_WEB_ACCESS_RESEARCH_CACHE_DIR = cacheDir;
+after(() => rmSync(cacheDir, { recursive: true, force: true }));
 
 const originalFetch = globalThis.fetch;
 const originalUrl = process.env.SEARXNG_URL;
@@ -22,6 +30,54 @@ async function loadSearx(label) {
 function jsonResponse(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }
+
+test("web search adaptive freshness policy matches each recency window", async () => {
+  const { webSearchFreshnessMs } = await loadSearx("ttl-policy");
+  assert.equal(webSearchFreshnessMs(undefined), 24 * 60 * 60 * 1000);
+  assert.equal(webSearchFreshnessMs("day"), 10 * 60 * 1000);
+  assert.equal(webSearchFreshnessMs("week"), 60 * 60 * 1000);
+  assert.equal(webSearchFreshnessMs("month"), 6 * 60 * 60 * 1000);
+  assert.equal(webSearchFreshnessMs("year"), 24 * 60 * 60 * 1000);
+});
+
+test("web search persists across reloads and stale-falls back only on transient HTTP errors", async () => {
+  const original = globalThis.fetch;
+  const label = `persistent-${Date.now()}`;
+  const query = `durable query ${Date.now()}`;
+  const payload = { results: [{ title: "Durable", url: "https://example.test/durable", content: "Persistent result" }] };
+  try {
+    let calls = 0;
+    globalThis.fetch = async url => { calls++; return String(url).endsWith("/") ? new Response("ok") : jsonResponse(payload); };
+    const warmModule = await loadSearx(label);
+    const warm = await warmModule.searxngSearch(query);
+    assert.equal(warm.metadata.cache.status, "miss");
+    const file = readdirSync(cacheDir).find(name => name.startsWith("web-search-") && name.endsWith(".cache.json"));
+    const path = join(cacheDir, file);
+    const envelope = JSON.parse(readFileSync(path, "utf8"));
+    assert.equal(envelope.staleUntil - envelope.storedAt, 7 * 24 * 60 * 60 * 1000);
+
+    globalThis.fetch = async () => { throw new Error("disk reload must not fetch"); };
+    const diskModule = await loadSearx(label);
+    const disk = await diskModule.searxngSearch(query);
+    assert.equal(disk.metadata.cache.storage, "disk");
+    assert.equal(disk.metadata.cache.status, "fresh");
+
+    const storedAt = Date.now() - 2 * 24 * 60 * 60 * 1000;
+    const staleEnvelope = { ...envelope, storedAt, freshUntil: storedAt + 24 * 60 * 60 * 1000, staleUntil: storedAt + 7 * 24 * 60 * 60 * 1000 };
+    writeFileSync(path, JSON.stringify(staleEnvelope));
+    globalThis.fetch = async url => String(url).endsWith("/") ? new Response("ok") : new Response("unavailable", { status: 503 });
+    const staleModule = await loadSearx(label);
+    const stale = await staleModule.searxngSearch(query);
+    assert.equal(stale.metadata.cache.status, "stale");
+    assert.ok(stale.metadata.cache.ageMs >= 2 * 24 * 60 * 60 * 1000);
+    assert.match(formatSearchCacheWarning(stale.metadata), /WARNING: stale cached search results/);
+
+    writeFileSync(path, JSON.stringify(staleEnvelope));
+    globalThis.fetch = async url => String(url).endsWith("/") ? new Response("ok") : new Response("bad request", { status: 400 });
+    const rejectedModule = await loadSearx(label);
+    await assert.rejects(rejectedModule.searxngSearch(query), /HTTP 400/);
+  } finally { globalThis.fetch = original; }
+});
 
 test("SearXNG maps, sanitizes, deduplicates, filters, and caches results", async () => {
   const calls = [];

@@ -20,7 +20,7 @@ The goal is a clean baseline: small surface area, fewer surprises, and easier qu
 
 ### `web_search`
 
-Keyless web research via SearXNG. Returns bounded source titles, URLs, and snippets; use `fetch_content` for full page text. Repeated identical searches use a short in-memory cache, and concurrent duplicates collapse into one backend request.
+Keyless web research via SearXNG. Returns bounded source titles, URLs, and snippets; use `fetch_content` for full page text. Repeated searches use a bounded persistent cache, and concurrent duplicates collapse into one backend request. Ordinary searches stay fresh for 24 hours; recency searches use 10 minutes (`day`), 1 hour (`week`), 6 hours (`month`), or 24 hours (`year`). Transient refresh failures may return clearly labeled stale data up to seven days total age.
 
 ```ts
 web_search({ query: "TypeScript generics official docs" })
@@ -127,7 +127,7 @@ docs_search({ source: "https://docs.example.com/llms.txt", query: "authenticatio
 
 Use `fetch_content` on a result URL when you need the full docs page.
 
-`docs_search` caches discovery indexes and individual pages separately in bounded memory and under `~/.pi/web-access/docs-cache/` for about 30 minutes. Concurrent searches share discovery and overlapping page fetches, while per-call cache metrics distinguish memory, disk, shared, fresh, and failed page work.
+`docs_search` caches discovery indexes and individual pages separately for seven fresh days under the shared research cache. Concurrent searches share discovery and overlapping page fetches, while per-call cache metrics distinguish memory, disk, shared, fresh, stale, and failed page work. A transient refresh failure may use clearly labeled stale docs up to 30 days total age. OpenAPI specs stay fresh for 24 hours and have a seven-day hard-retention bound.
 
 ### `openapi_search`
 
@@ -190,11 +190,12 @@ For Pi-runtime confidence after reloading tool schemas, also run the manual regr
 Long research sessions should stay useful without stuffing giant blobs into Pi's session log.
 
 - Search/fetch metadata is still persisted with `pi.appendEntry()` so `/search` and `get_search_content` survive reloads and tree navigation.
-- `docs_search` stores short-lived split discovery/page entries under `~/.pi/web-access/docs-cache/` for reuse across queries and reloads; file/byte bounds and the roughly 30-minute TTL limit disk growth and staleness.
-- Successful public `fetch_content` extractions use a two-minute in-memory raw cache (50 entries / 20 MiB) below content shaping, so repeated full/highlights/summary calls with the same extraction timeout reshape locally without another download. GitHub, sensitive/signed URLs, failures, and all fetches while `ssrf.allowRanges` is configured are not cached.
+- Research caches live under `PI_WEB_ACCESS_RESEARCH_CACHE_DIR` or `~/.pi/web-access/research-cache/`. They use bounded, schema-validated entries and only prune exact files owned by this extension. Writes await coalesced quota maintenance; separate processes don't share a lock, so simultaneous cross-process writes can briefly exceed a limit until either process's final prune completes.
+- Successful public `fetch_content` extractions persist below content shaping. Origin `s-maxage`/`max-age` is honored up to 24 hours; otherwise freshness is six hours, with a 24-hour hard-retention bound for transient refresh failures. GitHub, private/signed/credentialed URLs, errors, Jina fallbacks, `no-store`/`private` responses, and custom-network fetches are excluded.
 - Large fetched source bodies are stored outside the session under `~/.pi/web-access/content/`; the session entry keeps a compact preview plus a content reference.
 - `get_search_content` hydrates large bodies from that disk cache on demand, keeping the in-memory/session representation compact.
-- Session restore keeps recent web-access entries for 24 hours; live results are also capped at 100 entries / about 8 MiB, and disk-backed large content is pruned after about 7 days.
+- ResponseId records and externalized content persist for seven days across sessions and reloads. Live and disk storage have count/byte bounds, and explicit deletion removes both the record and its owned externalized files. A single externalized batch is written and protected before pruning, so every returned reference remains valid; a batch larger than the 1,000-file/192 MiB quota may temporarily exceed it until the next batch triggers pruning.
+- Paper query/list results have 24-hour hard freshness; immutable paper details and resolved HTML/sections have 30-day hard freshness, with no invented stale fallback window.
 - Tool outputs are intentionally compact: `web_search` returns snippets and stores full result text, and `fetch_content` previews large single pages, while full stored results remain available through `get_search_content`.
 - For tight context work, prefer `mode: "highlights"` / `"summary"` and set `maxChars` explicitly.
 

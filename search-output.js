@@ -1,5 +1,12 @@
 export const DEFAULT_INLINE_SEARCH_CHARS = 3500;
 
+export function formatSearchCacheWarning(metadata) {
+	const cache = metadata?.cache;
+	return cache?.status === "stale"
+		? `WARNING: stale cached search results are shown because refresh failed (${cache.warning ?? "transient error"}).`
+		: "";
+}
+
 export function isProbablyBinarySearchText(value) {
 	if (!value) return false;
 	const sample = value.slice(0, 4000);

@@ -1,21 +1,25 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readdir, realpath, rm, rmdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve as resolvePath, sep as pathSep } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import type { ExtractedContent, StoredContentRef } from "./extract.js";
 import type { SearchResult } from "./search-types.js";
+import { createPersistentCache } from "./persistent-cache.js";
 
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const CONTENT_STORE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const CONTENT_STORE_TTL_MS = CACHE_TTL_MS;
 const MAX_SESSION_CONTENT_CHARS = 24_000;
-const CONTENT_STORE_PATH = process.env.PI_WEB_ACCESS_CONTENT_DIR?.trim() || join(homedir(), ".pi", "web-access", "content");
+const CONTENT_STORE_PATH = resolvePath(process.env.PI_WEB_ACCESS_CONTENT_DIR?.trim() || join(homedir(), ".pi", "web-access", "content"));
 const CONTENT_REF_VERSION = 1;
 const MAX_LIVE_RESULTS = 100;
 const MAX_LIVE_RESULT_BYTES = 8 * 1024 * 1024;
+const MAX_CONTENT_FILES = 1000;
+const MAX_CONTENT_BYTES = 192 * 1024 * 1024;
 
-let lastContentPrune = 0;
 let storedResultBytes = 0;
+const pendingPersistence = new Set<Promise<unknown>>();
 
 export interface QueryResultData {
 	query: string;
@@ -36,6 +40,11 @@ export interface StoredSearchData {
 
 const storedResults = new Map<string, StoredSearchData>();
 const storedSizes = new Map<string, number>();
+const persistentResults = createPersistentCache({
+	namespace: "response", freshMs: CACHE_TTL_MS, staleMs: CACHE_TTL_MS,
+	maxEntries: 500, maxBytes: 64 * 1024 * 1024, maxValueBytes: 8 * 1024 * 1024,
+	validate: isValidStoredData,
+});
 
 function approximateStoredBytes(data: StoredSearchData): number {
 	try { return Buffer.byteLength(JSON.stringify(data), "utf8"); }
@@ -73,28 +82,61 @@ function contentHash(content: string): string {
 	return createHash("sha256").update(content).digest("hex");
 }
 
-function pruneContentStore(): void {
-	const now = Date.now();
-	if (now - lastContentPrune < 60 * 60 * 1000) return;
-	lastContentPrune = now;
-	if (!existsSync(CONTENT_STORE_PATH)) return;
+async function readRegularNoFollow(path: string): Promise<string> {
+	const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+	try { const info = await handle.stat(); if (!info.isFile()) throw new Error("Not a regular file"); return await handle.readFile("utf8"); }
+	finally { await handle.close(); }
+}
 
-	let dirs: string[];
+async function safeContentRoot(create = false): Promise<boolean> {
 	try {
-		dirs = readdirSync(CONTENT_STORE_PATH);
-	} catch {
-		return;
-	}
-
-	for (const dir of dirs) {
-		const path = join(CONTENT_STORE_PATH, dir);
-		try {
-			const stat = statSync(path);
-			if (now - stat.mtimeMs > CONTENT_STORE_TTL_MS) {
-				rmSync(path, { recursive: true, force: true });
+		if (create) {
+			let ancestor = CONTENT_STORE_PATH;
+			while (true) {
+				try { await lstat(ancestor); break; } catch {
+					const parent = dirname(ancestor);
+					if (parent === ancestor) return false;
+					ancestor = parent;
+				}
 			}
-		} catch {
+			const ancestorStat = await lstat(ancestor);
+			if (ancestorStat.isSymbolicLink() || await realpath(ancestor) !== resolvePath(ancestor)) return false;
+			await mkdir(CONTENT_STORE_PATH, { recursive: true, mode: 0o700 });
 		}
+		const rootStat = await lstat(CONTENT_STORE_PATH);
+		return rootStat.isDirectory() && !rootStat.isSymbolicLink() && await realpath(CONTENT_STORE_PATH) === CONTENT_STORE_PATH;
+	} catch { return false; }
+}
+
+async function safeResultDirectory(id: string, create = false): Promise<boolean> {
+	if (!/^[a-z0-9_-]{1,128}$/i.test(id) || !await safeContentRoot(create)) return false;
+	const dir = resultDir(id);
+	try {
+		if (create) await mkdir(dir, { recursive: true, mode: 0o700 });
+		const info = await lstat(dir);
+		return info.isDirectory() && !info.isSymbolicLink() && await realpath(dir) === dir;
+	} catch { return false; }
+}
+
+async function pruneContentStore(protectedPaths = new Set<string>(), now = Date.now()): Promise<void> {
+	if (!await safeContentRoot(false)) return;
+	const entries: Array<{ path: string; bytes: number; mtimeMs: number }> = [];
+	for (const dir of await readdir(CONTENT_STORE_PATH).catch(() => [])) {
+		if (!/^[a-z0-9_-]{1,128}$/i.test(dir) || !await safeResultDirectory(dir, false)) continue;
+		const dirPath = join(CONTENT_STORE_PATH, dir);
+		for (const file of await readdir(dirPath).catch(() => [])) {
+			if (!/^\d+-[a-f0-9]{12}\.md$/.test(file)) continue;
+			const path = join(dirPath, file);
+			try { const info = await lstat(path); if (info.isFile() && !info.isSymbolicLink()) entries.push({ path, bytes: info.size, mtimeMs: info.mtimeMs }); } catch {}
+		}
+	}
+	entries.sort((a, b) => a.mtimeMs - b.mtimeMs || a.path.localeCompare(b.path));
+	let count = entries.length;
+	let bytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
+	for (const entry of entries) {
+		if (protectedPaths.has(entry.path)) continue;
+		if (now - entry.mtimeMs <= CONTENT_STORE_TTL_MS && count <= MAX_CONTENT_FILES && bytes <= MAX_CONTENT_BYTES) continue;
+		try { await rm(entry.path, { force: true }); count--; bytes -= entry.bytes; } catch {}
 	}
 }
 
@@ -108,98 +150,54 @@ function previewContent(content: string): string {
 	return `${preview}${marker}`;
 }
 
-function externalizeContent(id: string, index: number, item: ExtractedContent): ExtractedContent {
-	if (!item.content || item.content.length <= MAX_SESSION_CONTENT_CHARS) return item;
-
-	pruneContentStore();
-	const hash = contentHash(item.content);
-	const dir = resultDir(id);
-	const path = join(dir, `${index}-${hash.slice(0, 12)}.md`);
-
-	try {
-		mkdirSync(dir, { recursive: true });
-		writeFileSync(path, item.content, "utf-8");
-	} catch {
-		return item;
-	}
-
-	const ref: StoredContentRef = {
-		version: CONTENT_REF_VERSION,
-		kind: "file",
-		path,
-		chars: item.content.length,
-		sha256: hash,
-		savedAt: Date.now(),
-		previewChars: Math.min(item.content.length, MAX_SESSION_CONTENT_CHARS),
-	};
-
-	return {
-		...item,
-		content: previewContent(item.content),
-		contentRef: ref,
-		originalContentLength: item.originalContentLength ?? item.content.length,
-		truncated: true,
-		metadata: {
-			...(item.metadata ?? {}),
-			sessionStorage: {
-				externalized: true,
-				chars: ref.chars,
-				previewChars: ref.previewChars,
-			},
-		},
-	};
-}
-
 function isValidContentRef(ref: StoredContentRef): boolean {
-	return ref.version === CONTENT_REF_VERSION
-		&& ref.kind === "file"
-		&& typeof ref.path === "string"
-		&& ref.path.length > 0
-		&& typeof ref.sha256 === "string"
-		&& /^[a-f0-9]{64}$/i.test(ref.sha256);
+	return ref.version === CONTENT_REF_VERSION && ref.kind === "file" && typeof ref.path === "string" && ref.path.length > 0
+		&& typeof ref.sha256 === "string" && /^[a-f0-9]{64}$/i.test(ref.sha256);
 }
 
-function isPathInContentStore(filePath: string): boolean {
-	try {
-		const storeRoot = existsSync(CONTENT_STORE_PATH)
-			? realpathSync(CONTENT_STORE_PATH)
-			: resolvePath(CONTENT_STORE_PATH);
-		const candidate = realpathSync(filePath);
-		if (candidate === storeRoot) return true;
-		const prefix = storeRoot.endsWith(pathSep) ? storeRoot : storeRoot + pathSep;
-		return candidate.startsWith(prefix);
-	} catch {
-		return false;
-	}
+async function isSafeContentFile(id: string, filePath: string): Promise<boolean> {
+	if (!await safeResultDirectory(id, false)) return false;
+	const name = filePath.split("/").pop() ?? "";
+	if (!/^\d+-[a-f0-9]{12}\.md$/.test(name) || resolvePath(filePath) !== join(resultDir(id), name)) return false;
+	try { const info = await lstat(filePath); return info.isFile() && !info.isSymbolicLink() && await realpath(filePath) === resolvePath(filePath); } catch { return false; }
 }
 
-export function hydrateStoredFetchItem(item: ExtractedContent): ExtractedContent {
+export async function hydrateStoredFetchItem(item: ExtractedContent): Promise<ExtractedContent> {
 	const ref = item.contentRef;
-	if (!ref || !isValidContentRef(ref) || !isPathInContentStore(ref.path)) return item;
+	const id = ref?.path ? resolvePath(ref.path).split("/").at(-2) ?? "" : "";
+	if (!ref || !isValidContentRef(ref) || !await isSafeContentFile(id, ref.path)) return item;
+	try { const content = await readRegularNoFollow(ref.path); return contentHash(content) === ref.sha256 ? { ...item, content } : item; } catch { return item; }
+}
 
-	try {
-		const content = readFileSync(ref.path, "utf-8");
-		if (contentHash(content) !== ref.sha256) return item;
-		return { ...item, content };
-	} catch {
-		return item;
+export async function prepareStoredDataForSession(id: string, data: StoredSearchData): Promise<StoredSearchData> {
+	if (data.type !== "fetch" || !data.urls || !await safeResultDirectory(id, true)) return data;
+	const protectedPaths = new Set<string>();
+	const urls: ExtractedContent[] = [];
+	for (let index = 0; index < data.urls.length; index++) {
+		const item = data.urls[index];
+		if (!item.content || item.content.length <= MAX_SESSION_CONTENT_CHARS) { urls.push(item); continue; }
+		const hash = contentHash(item.content);
+		const path = join(resultDir(id), `${index}-${hash.slice(0, 12)}.md`);
+		try {
+			const existing = await lstat(path).catch(() => null);
+			if (existing) {
+				if (existing.isSymbolicLink() || !existing.isFile() || await realpath(path) !== path || contentHash(await readRegularNoFollow(path)) !== hash) { urls.push(item); continue; }
+			} else {
+				await writeFile(path, item.content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+			}
+			protectedPaths.add(path);
+			const ref: StoredContentRef = { version: CONTENT_REF_VERSION, kind: "file", path, chars: item.content.length, sha256: hash, savedAt: Date.now(), previewChars: Math.min(item.content.length, MAX_SESSION_CONTENT_CHARS) };
+			urls.push({ ...item, content: previewContent(item.content), contentRef: ref, originalContentLength: item.originalContentLength ?? item.content.length, truncated: true,
+				metadata: { ...(item.metadata ?? {}), sessionStorage: { externalized: true, chars: ref.chars, previewChars: ref.previewChars } } });
+		} catch { urls.push(item); }
 	}
+	await pruneContentStore(protectedPaths);
+	return { ...data, urls };
 }
 
-export function prepareStoredDataForSession(id: string, data: StoredSearchData): StoredSearchData {
+async function hydrateStoredData(data: StoredSearchData): Promise<StoredSearchData> {
 	if (data.type !== "fetch" || !data.urls) return data;
-	return {
-		...data,
-		urls: data.urls.map((item, index) => externalizeContent(id, index, item)),
-	};
-}
-
-function hydrateStoredData(data: StoredSearchData): StoredSearchData {
-	if (data.type !== "fetch" || !data.urls) return data;
-	return {
-		...data,
-		urls: data.urls.map(hydrateStoredFetchItem),
-	};
+	return { ...data, urls: await Promise.all(data.urls.map(hydrateStoredFetchItem)) };
 }
 
 export function generateId(): string {
@@ -207,22 +205,44 @@ export function generateId(): string {
 }
 
 export function storeResult(id: string, data: StoredSearchData): void {
+	if (id !== data.id || !/^[a-z0-9_-]{1,128}$/i.test(id)) return;
 	if (storedResults.has(id)) removeStoredResult(id);
 	const bytes = approximateStoredBytes(data);
 	storedResults.set(id, data);
 	storedSizes.set(id, bytes);
 	storedResultBytes += bytes;
 	pruneStoredResults();
+	const now = Date.now();
+	if (data.timestamp > now + 60_000 || now - data.timestamp >= CACHE_TTL_MS) return;
+	const pending = persistentResults.set(id, data, { now: data.timestamp, freshMs: CACHE_TTL_MS, staleMs: CACHE_TTL_MS });
+	pendingPersistence.add(pending);
+	void pending.finally(() => pendingPersistence.delete(pending));
 }
 
-export function getStoredResult(id: string): StoredSearchData | null {
+export async function flushStoragePersistence(): Promise<void> {
+	await Promise.allSettled([...pendingPersistence]);
+}
+
+export async function getStoredResult(id: string): Promise<StoredSearchData | null> {
+	pruneStoredResults();
+	const live = storedResults.get(id);
+	if (live) return live;
+	if (!/^[a-z0-9_-]{1,128}$/i.test(id)) return null;
+	const cached = await persistentResults.lookup(id);
+	if (cached.state === "miss" || !cached.value) return null;
+	const data = cached.value as StoredSearchData;
+	if (data.id !== id) return null;
+	const bytes = approximateStoredBytes(data);
+	storedResults.set(id, data);
+	storedSizes.set(id, bytes);
+	storedResultBytes += bytes;
 	pruneStoredResults();
 	return storedResults.get(id) ?? null;
 }
 
-export function getResult(id: string): StoredSearchData | null {
-	const data = getStoredResult(id);
-	return data ? hydrateStoredData(data) : null;
+export async function getResult(id: string): Promise<StoredSearchData | null> {
+	const data = await getStoredResult(id);
+	return data ? await hydrateStoredData(data) : null;
 }
 
 export function getAllResults(): StoredSearchData[] {
@@ -230,14 +250,21 @@ export function getAllResults(): StoredSearchData[] {
 	return Array.from(storedResults.values());
 }
 
-export function deleteResult(id: string): boolean {
-	if (!storedResults.has(id)) return false;
-	try {
-		rmSync(resultDir(id), { recursive: true, force: true });
-	} catch {
-		return false;
+export async function deleteResult(id: string): Promise<boolean> {
+	const data = storedResults.get(id) ?? await getStoredResult(id);
+	if (!data) return false;
+	if (data.type === "fetch" && await safeResultDirectory(id, false)) {
+		for (const item of data.urls ?? []) {
+			const ref = item.contentRef;
+			if (!ref || !isValidContentRef(ref) || !await isSafeContentFile(id, ref.path)) continue;
+			try { await rm(ref.path, { force: true }); } catch {}
+		}
+		try { await rmdir(resultDir(id)); } catch {}
 	}
-	return removeStoredResult(id);
+	removeStoredResult(id);
+	await flushStoragePersistence();
+	await persistentResults.delete(id);
+	return true;
 }
 
 export function clearResults(): void {

@@ -1,4 +1,5 @@
 import { readErrorSnippet, readResponseJson, readResponseText } from "./http-response.js";
+import { createPersistentCache } from "./persistent-cache.js";
 
 export type PaperSearchSource = "auto" | "openalex" | "arxiv";
 
@@ -48,6 +49,30 @@ function clampMaxResults(value: unknown): number {
 }
 
 const REQUEST_TIMEOUT_MS = 20000;
+const PAPER_QUERY_TTL_MS = 24 * 60 * 60 * 1000;
+function isBoundedPaperValue(value: unknown, budget = { nodes: 0 }, depth = 0): boolean {
+	if (++budget.nodes > 50_000 || depth > 12) return false;
+	if (value === undefined || value === null || typeof value === "boolean") return true;
+	if (typeof value === "number") return Number.isFinite(value);
+	if (typeof value === "string") return value.length <= 5 * 1024 * 1024;
+	if (Array.isArray(value)) return value.length <= 10_000 && value.every(item => isBoundedPaperValue(item, budget, depth + 1));
+	if (!value || typeof value !== "object") return false;
+	const entries = Object.entries(value);
+	return entries.length <= 10_000 && entries.every(([key, item]) => key.length <= 10_000 && isBoundedPaperValue(item, budget, depth + 1));
+}
+function isCachedPaperReturn(value: unknown): boolean {
+	if (!value || typeof value !== "object") return false;
+	const item = value as { content?: unknown; details?: unknown };
+	return Array.isArray(item.content) && item.content.length <= 10
+		&& item.content.every(part => !!part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string" && (part as { text: string }).text.length <= 5 * 1024 * 1024)
+		&& !!item.details && typeof item.details === "object" && isBoundedPaperValue(item.details);
+}
+const paperSearchCache = createPersistentCache({
+	namespace: "paper-search", freshMs: PAPER_QUERY_TTL_MS, staleMs: PAPER_QUERY_TTL_MS,
+	maxEntries: 500, maxBytes: 48 * 1024 * 1024, maxValueBytes: 5 * 1024 * 1024,
+	validate: isCachedPaperReturn,
+	admit: (value: { details?: Record<string, unknown> }) => !value.details?.error,
+});
 const MAX_PAPER_SEARCH_BYTES = 5 * 1024 * 1024;
 const OPENALEX_BASE_SELECT_FIELDS = [
 	"id",
@@ -243,7 +268,7 @@ async function searchArxiv(params: PaperSearchParams, signal?: AbortSignal): Pro
 	return records;
 }
 
-export async function executePaperSearch(params: PaperSearchParams, signal?: AbortSignal): Promise<{
+async function executePaperSearchFresh(params: PaperSearchParams, signal?: AbortSignal): Promise<{
 	content: Array<{ type: "text"; text: string }>;
 	details: Record<string, unknown>;
 }> {
@@ -296,4 +321,24 @@ export async function executePaperSearch(params: PaperSearchParams, signal?: Abo
 		const message = formatSearchError(err);
 		return { content: [{ type: "text", text: `Paper search failed: ${message}` }], details: { query, source, error: message } };
 	}
+}
+
+export async function executePaperSearch(params: PaperSearchParams, signal?: AbortSignal): Promise<{
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, unknown>;
+}> {
+	const query = typeof params.query === "string" ? params.query.trim() : "";
+	if (!query) return executePaperSearchFresh(params, signal);
+	const normalized = {
+		query,
+		source: params.source === "openalex" || params.source === "arxiv" ? params.source : "auto",
+		maxResults: clampMaxResults(params.maxResults),
+		yearFrom: typeof params.yearFrom === "number" && Number.isFinite(params.yearFrom) ? Math.floor(params.yearFrom) : null,
+		openAccessOnly: params.openAccessOnly === true,
+		includeAbstracts: params.includeAbstracts === true,
+	};
+	const cached = await paperSearchCache.get(JSON.stringify(normalized), sharedSignal => executePaperSearchFresh({ ...params, query }, sharedSignal), {
+		signal, freshMs: PAPER_QUERY_TTL_MS, staleMs: PAPER_QUERY_TTL_MS, staleOnError: false,
+	});
+	return { ...cached.value, details: { ...cached.value.details, cache: cached.metadata } };
 }

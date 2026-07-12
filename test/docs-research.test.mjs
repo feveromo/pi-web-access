@@ -1,19 +1,23 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
 const sharedDocsCacheDir = mkdtempSync(join(tmpdir(), "pi-web-access-docs-shared-"));
 const originalDocsCacheDir = process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR;
+const originalResearchCacheDir = process.env.PI_WEB_ACCESS_RESEARCH_CACHE_DIR;
 const originalDocsLookup = globalThis.__PI_WEB_ACCESS_DOCS_LOOKUP__;
 process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR = sharedDocsCacheDir;
+process.env.PI_WEB_ACCESS_RESEARCH_CACHE_DIR = sharedDocsCacheDir;
 globalThis.__PI_WEB_ACCESS_DOCS_LOOKUP__ = async () => [{ address: "93.184.216.34", family: 4 }];
 
 after(() => {
   if (originalDocsCacheDir === undefined) delete process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR;
   else process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR = originalDocsCacheDir;
+  if (originalResearchCacheDir === undefined) delete process.env.PI_WEB_ACCESS_RESEARCH_CACHE_DIR;
+  else process.env.PI_WEB_ACCESS_RESEARCH_CACHE_DIR = originalResearchCacheDir;
   if (originalDocsLookup === undefined) delete globalThis.__PI_WEB_ACCESS_DOCS_LOOKUP__;
   else globalThis.__PI_WEB_ACCESS_DOCS_LOOKUP__ = originalDocsLookup;
   rmSync(sharedDocsCacheDir, { recursive: true, force: true });
@@ -142,12 +146,10 @@ test("docs_search cache does not reuse query-biased page sets", async () => {
 
 test("docs_search reuses fresh disk cache after module reload", async () => {
   const originalFetch = globalThis.fetch;
-  const originalCacheDir = process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR;
-  const cacheDir = mkdtempSync(join(tmpdir(), "pi-web-access-docs-"));
+  const cacheDir = sharedDocsCacheDir;
   const source = `https://docs-persist-${process.pid}-${Date.now()}.test`;
 
   try {
-    process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR = cacheDir;
     let fetchCount = 0;
     globalThis.fetch = async (url) => {
       fetchCount++;
@@ -165,8 +167,12 @@ test("docs_search reuses fresh disk cache after module reload", async () => {
     const first = await firstModule.executeDocsSearch({ source, query: "cache token", maxPages: 2, maxResults: 1 });
     assert.equal(first.details.cacheHit, false);
     assert.equal(first.details.cacheStorage, "fresh");
-    assert.ok(readdirSync(cacheDir).some(file => file.startsWith("discovery-") && file.endsWith(".json")));
-    assert.ok(readdirSync(cacheDir).some(file => file.startsWith("page-") && file.endsWith(".json")));
+    assert.ok(readdirSync(cacheDir).some(file => file.startsWith("docs-discovery-") && file.endsWith(".cache.json")));
+    assert.ok(readdirSync(cacheDir).some(file => file.startsWith("docs-page-") && file.endsWith(".cache.json")));
+    const discoveryFile = readdirSync(cacheDir).find(file => file.startsWith("docs-discovery-") && file.endsWith(".cache.json"));
+    const discoveryEnvelope = JSON.parse(readFileSync(join(cacheDir, discoveryFile), "utf8"));
+    assert.equal(discoveryEnvelope.freshUntil - discoveryEnvelope.storedAt, 7 * 24 * 60 * 60 * 1000);
+    assert.equal(discoveryEnvelope.staleUntil - discoveryEnvelope.storedAt, 30 * 24 * 60 * 60 * 1000);
     assert.ok(fetchCount >= 2);
 
     globalThis.fetch = async (url) => {
@@ -182,9 +188,6 @@ test("docs_search reuses fresh disk cache after module reload", async () => {
     assert.match(second.content[0].text, /Cache Token/);
   } finally {
     globalThis.fetch = originalFetch;
-    if (originalCacheDir === undefined) delete process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR;
-    else process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR = originalCacheDir;
-    rmSync(cacheDir, { recursive: true, force: true });
   }
 });
 
@@ -215,17 +218,14 @@ test("distinct concurrent docs queries share discovery and overlapping page fetc
 
     assert.equal(fetchCounts.get("https://docs.concurrent/llms.txt"), 1);
     assert.equal(fetchCounts.get("https://docs.concurrent/shared"), 1);
-    assert.equal(alpha.details.cacheDiscovery.shared, false);
-    assert.equal(sharedAlpha.details.cacheDiscovery.shared, true);
-    assert.equal(sharedAlpha.details.cacheDiscovery.hit, true);
-    assert.equal(sharedAlpha.details.cachePages.sharedHits, 2);
-    assert.equal(sharedAlpha.details.cacheHit, true);
-    assert.equal(sharedAlpha.details.cacheStorage, "fresh", "all-shared work must not be labeled as memory");
-    assert.equal(beta.details.cacheDiscovery.shared, true);
-    assert.equal(beta.details.cacheDiscovery.hit, true);
-    assert.equal(alpha.details.cachePages.misses + beta.details.cachePages.misses, 3);
-    assert.equal(alpha.details.cachePages.sharedHits + beta.details.cachePages.sharedHits, 1);
-    assert.equal(beta.details.cacheStorage, "fresh", "mixed shared/fresh work must report fresh storage");
+    const discoveryStates = [alpha, sharedAlpha, beta].map(result => result.details.cacheDiscovery.shared);
+    assert.equal(discoveryStates.filter(shared => !shared).length, 1);
+    assert.equal(discoveryStates.filter(Boolean).length, 2);
+    const results = [alpha, sharedAlpha, beta];
+    assert.equal(results.filter(result => result.details.cacheDiscovery.hit).length, 2);
+    assert.equal(results.reduce((sum, result) => sum + result.details.cachePages.misses, 0), 3);
+    assert.equal(results.reduce((sum, result) => sum + result.details.cachePages.sharedHits, 0), 3);
+    assert.ok(results.every(result => result.details.cacheStorage === "fresh"), "shared and fetched work must not be labeled as memory");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -383,7 +383,32 @@ test("docs page memory cache evicts least-recently-used entries at its count bou
   }
 });
 
-test("docs disk cache ignores and prunes unsafe v2 split entries", async () => {
+test("a symlinked legacy docs root leaves its external victim untouched", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCacheDir = process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR;
+  const victim = mkdtempSync(join(tmpdir(), "pi-web-access-legacy-docs-victim-"));
+  const parent = mkdtempSync(join(tmpdir(), "pi-web-access-legacy-docs-link-"));
+  const linkedRoot = join(parent, "docs-cache");
+  const ownedLooking = join(victim, `discovery-${"a".repeat(64)}.json`);
+  writeFileSync(ownedLooking, "external victim");
+  symlinkSync(victim, linkedRoot);
+  process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR = linkedRoot;
+  try {
+    globalThis.fetch = async url => String(url).endsWith("/llms.txt")
+      ? textResponse("# Docs\n\n- [Safe](/safe)")
+      : textResponse("# Safe\n\nSafe documentation content.");
+    const module = await import(`../docs-research.ts?legacy-root-symlink=${Date.now()}-${Math.random()}`);
+    const result = await module.executeDocsSearch({ source: `https://legacy-safe-${Date.now()}.test`, query: "safe" });
+    assert.equal(result.details.count > 0, true);
+    assert.equal(readFileSync(ownedLooking, "utf8"), "external victim");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalCacheDir === undefined) delete process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR; else process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR = originalCacheDir;
+    rmSync(parent, { recursive: true, force: true }); rmSync(victim, { recursive: true, force: true });
+  }
+});
+
+test("docs disk cache ignores legacy split entries without touching them", async () => {
   const originalFetch = globalThis.fetch;
   const originalCacheDir = process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR;
   const cacheDir = mkdtempSync(join(tmpdir(), "pi-web-access-docs-bounds-"));
@@ -415,7 +440,7 @@ test("docs disk cache ignores and prunes unsafe v2 split entries", async () => {
     const result = await executeDocsSearch({ source, query: "bounded", maxPages: 1 });
     assert.equal(fetchCount, 2, "a v2 split entry must not satisfy the DNS-pinned cache");
     assert.equal(result.details.cacheHit, false);
-    assert.equal(JSON.parse(readFileSync(oldFile, "utf8")).version, 3);
+    assert.equal(JSON.parse(readFileSync(oldFile, "utf8")).version, 2, "legacy entries are ignored rather than touched");
   } finally {
     globalThis.fetch = originalFetch;
     if (originalCacheDir === undefined) delete process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR;
@@ -451,13 +476,36 @@ test("docs disk pruning leaves unrelated JSON and temp files untouched", async (
     assert.equal(readFileSync(unrelatedJson, "utf8"), "preserve-check");
     assert.equal(readFileSync(unrelatedTmp, "utf8"), "preserve-check");
     assert.equal(readFileSync(lookalikeTmp, "utf8"), "preserve-check");
-    assert.equal(readdirSync(cacheDir).includes(ownedTmp.split("/").pop()), false);
+    assert.equal(readdirSync(cacheDir).includes(ownedTmp.split("/").pop()), true, "obsolete legacy cleanup is not invoked");
   } finally {
     globalThis.fetch = originalFetch;
     if (originalCacheDir === undefined) delete process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR;
     else process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR = originalCacheDir;
     rmSync(cacheDir, { recursive: true, force: true });
   }
+});
+
+test("docs 7d-fresh entries use clearly labeled stale data on transient refresh through 30d", async () => {
+  const originalFetch = globalThis.fetch;
+  const source = `https://docs-stale-${Date.now()}.test`;
+  try {
+    const before = new Set(readdirSync(sharedDocsCacheDir));
+    globalThis.fetch = async url => String(url).endsWith("/llms.txt")
+      ? textResponse("# Docs\n\n- [Stale Page](/page)")
+      : textResponse("# Stale Page\n\nRetained documentation content.");
+    const warm = await import(`../docs-research.ts?docs-stale-warm=${Date.now()}-${Math.random()}`);
+    await warm.executeDocsSearch({ source, query: "retained", maxPages: 2 });
+    for (const name of readdirSync(sharedDocsCacheDir).filter(name => !before.has(name) && /^docs-(?:discovery|page)-/.test(name))) {
+      const path = join(sharedDocsCacheDir, name);
+      const envelope = JSON.parse(readFileSync(path, "utf8"));
+      writeFileSync(path, JSON.stringify({ ...envelope, freshUntil: Date.now() - 1, staleUntil: envelope.storedAt + 30 * 24 * 60 * 60 * 1000 }));
+    }
+    globalThis.fetch = async () => new Response("unavailable", { status: 503 });
+    const staleModule = await import(`../docs-research.ts?docs-stale-reload=${Date.now()}-${Math.random()}`);
+    const stale = await staleModule.executeDocsSearch({ source, query: "retained", maxPages: 2 });
+    assert.match(stale.content[0].text, /WARNING: stale cached documentation/);
+    assert.ok(stale.details.cache.staleWarnings.length > 0);
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test("docs_search blocks localhost before any cache lookup or fetch", async () => {
@@ -513,6 +561,62 @@ test("openapi_search blocks localhost and public-to-private redirects", async ()
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("openapi stale fallback accepts 503 but rejects 4xx refresh failures", async () => {
+  const originalFetch = globalThis.fetch;
+  const source = `https://openapi-stale-${Date.now()}.test/spec.json`;
+  const spec = { paths: { "/items": { get: { summary: "List items", responses: { 200: { description: "ok" } } } } } };
+  try {
+    globalThis.fetch = async () => jsonResponse(spec);
+    const firstModule = await import(`../docs-research.ts?openapi-stale-warm=${Date.now()}-${Math.random()}`);
+    await firstModule.executeOpenApiSearch({ url: source, query: "items" });
+    const file = readdirSync(sharedDocsCacheDir).find(name => name.startsWith("openapi-") && name.endsWith(".cache.json"));
+    assert.ok(file);
+    const path = join(sharedDocsCacheDir, file);
+    const envelope = JSON.parse(readFileSync(path, "utf8"));
+    assert.equal(envelope.freshUntil - envelope.storedAt, 24 * 60 * 60 * 1000);
+    assert.equal(envelope.staleUntil - envelope.storedAt, 7 * 24 * 60 * 60 * 1000);
+    writeFileSync(path, JSON.stringify({ ...envelope, freshUntil: Date.now() - 1, staleUntil: Date.now() + 60_000 }));
+
+    globalThis.fetch = async () => new Response("unavailable", { status: 503 });
+    const staleModule = await import(`../docs-research.ts?openapi-stale-503=${Date.now()}-${Math.random()}`);
+    const stale = await staleModule.executeOpenApiSearch({ url: source, query: "items" });
+    assert.equal(stale.details.cache.status, "stale");
+    assert.match(stale.content[0].text, /WARNING: stale cached OpenAPI/);
+
+    writeFileSync(path, JSON.stringify({ ...envelope, freshUntil: Date.now() - 1, staleUntil: Date.now() + 60_000 }));
+    globalThis.fetch = async () => new Response("unauthorized", { status: 401 });
+    const authModule = await import(`../docs-research.ts?openapi-stale-401=${Date.now()}-${Math.random()}`);
+    const auth = await authModule.executeOpenApiSearch({ url: source, query: "items" });
+    assert.match(auth.content[0].text, /HTTP 401/);
+    assert.equal(auth.details.cache, undefined);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("forged OpenAPI envelopes with excessive schema recursion are rejected before use", async () => {
+  const originalFetch = globalThis.fetch;
+  const source = `https://openapi-forged-${Date.now()}.test/spec.json`;
+  const spec = { paths: { "/safe": { get: { summary: "Safe endpoint" } } } };
+  try {
+    const before = new Set(readdirSync(sharedDocsCacheDir));
+    globalThis.fetch = async () => jsonResponse(spec);
+    const warmModule = await import(`../docs-research.ts?openapi-forge-warm=${Date.now()}-${Math.random()}`);
+    await warmModule.executeOpenApiSearch({ url: source, query: "safe" });
+    const file = readdirSync(sharedDocsCacheDir).find(name => name.startsWith("openapi-") && !before.has(name));
+    const path = join(sharedDocsCacheDir, file);
+    const envelope = JSON.parse(readFileSync(path, "utf8"));
+    let schema = { type: "string" };
+    for (let i = 0; i < 30; i++) schema = { items: schema };
+    envelope.value.endpoints[0].parameters = [{ name: "bad", schema }];
+    writeFileSync(path, JSON.stringify(envelope));
+    let refreshes = 0;
+    globalThis.fetch = async () => { refreshes++; return jsonResponse(spec); };
+    const reloaded = await import(`../docs-research.ts?openapi-forge-reload=${Date.now()}-${Math.random()}`);
+    const result = await reloaded.executeOpenApiSearch({ url: source, query: "safe" });
+    assert.equal(refreshes, 1);
+    assert.equal(result.details.count, 1);
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test("openapi_search returns endpoint details and curl example", async () => {

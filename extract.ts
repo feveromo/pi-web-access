@@ -16,8 +16,9 @@ import {
 } from "./http-response.js";
 import { fetchRemoteUrl, validateRemoteUrl, validateThirdPartySourceUrl, type Lookup } from "./ssrf-protection.js";
 import { loadSsrfAllowRanges } from "./ssrf-config.js";
-import { createRawExtractionCache } from "./raw-extraction-cache.js";
-import { approximateRawResultBytes, buildRawExtractionCacheKey, shouldCacheRawExtraction } from "./raw-cache-policy.js";
+import { buildRawExtractionCacheKey } from "./raw-cache-policy.js";
+import { cacheFreshnessFromHeaders } from "./persistent-cache.js";
+import { createRawPersistentCache, decorateRawCacheResult } from "./raw-persistent-cache.js";
 import { extractNpmPackage, parseNpmPackageUrl } from "./npm-registry.js";
 import { extractStaticHtmlPartial, isLikelyJSRendered, preferJinaResult } from "./static-html-partial.js";
 
@@ -169,13 +170,7 @@ function finalizeRawResult(
 	};
 }
 
-const rawExtractionCache = createRawExtractionCache({
-	ttlMs: 2 * 60 * 1000,
-	maxEntries: 50,
-	maxBytes: 20 * 1024 * 1024,
-	sizeOf: approximateRawResultBytes,
-	shouldCache: (result: ExtractedContent) => shouldCacheRawExtraction(result, loadSsrfAllowRanges()),
-});
+const rawExtractionCache = createRawPersistentCache({ allowRanges: loadSsrfAllowRanges });
 
 function rawCacheKey(url: string, options?: ExtractOptions): string | null {
 	return buildRawExtractionCacheKey(url, {
@@ -185,9 +180,7 @@ function rawCacheKey(url: string, options?: ExtractOptions): string | null {
 	}, loadSsrfAllowRanges());
 }
 
-function withRawCacheMetadata(result: ExtractedContent, cacheHit: boolean, cacheAgeMs: number, shared = false): ExtractedContent {
-	return { ...result, metadata: { ...(result.metadata ?? {}), rawCache: { cacheHit, cacheAgeMs, shared } } };
-}
+
 
 const turndown = new TurndownService({
 	headingStyle: "atx",
@@ -412,20 +405,29 @@ export async function extractContent(
 ): Promise<ExtractedContent> {
 	const key = rawCacheKey(url, options);
 	if (!key) return shapeExtractedContent(await extractRawContent(url, signal, options), options);
-	const cached = await rawExtractionCache.get(
-		key,
-		async (sharedSignal: AbortSignal) => {
-			const result = await extractRawContent(url, sharedSignal, options);
-			if (result.error || sharedSignal.aborted) throw Object.assign(new Error(result.error || "Aborted"), { rawResult: result });
-			return result;
-		},
-		signal,
-	).catch((err: Error & { rawResult?: ExtractedContent }) => {
-		if (err.rawResult) return { value: err.rawResult, cacheHit: false, cacheAgeMs: 0, shared: false };
-		if (isAbortError(err)) return { value: abortedResult(url), cacheHit: false, cacheAgeMs: 0, shared: false };
+	// DNS/SSRF validation deliberately precedes memory and disk lookup; a warm entry
+	// must never bypass a changed resolver or allow-range policy.
+	try {
+		await validateRemoteUrl(url, { allowRanges: loadSsrfAllowRanges(), lookup: options?.lookup, signal: requestSignal(signal, normalizeTimeoutMs(options?.timeoutMs)) });
+	} catch (err) {
+		if (signal?.aborted || isAbortError(err)) return shapeExtractedContent(abortedResult(url), options);
+		return shapeExtractedContent(finalizeRawResult({ url, title: "", content: "", error: errorMessage(err) }, "http", ["http"]), options);
+	}
+	const cached = await rawExtractionCache.get(key, async (sharedSignal: AbortSignal) => {
+		const result = await extractRawContent(url, sharedSignal, options);
+		if (result.error || sharedSignal.aborted) {
+			const transport = result.metadata?.transportError as { code?: string; name?: string; timeout?: boolean } | undefined;
+			const error = Object.assign(new Error(result.error || "Aborted"), { rawResult: result, status: result.httpStatus, code: transport?.code, name: transport?.name ?? "Error", timeout: transport?.timeout });
+			throw error;
+		}
+		const origin = result.metadata?.originCache as { persist?: boolean; freshMs?: number } | undefined;
+		return { value: result, persist: origin?.persist !== false, freshMs: origin?.freshMs ?? 6 * 60 * 60 * 1000, staleMs: 24 * 60 * 60 * 1000 };
+	}, { signal, staleMs: 24 * 60 * 60 * 1000 }).catch((err: Error & { rawResult?: ExtractedContent }) => {
+		if (err.rawResult) return { value: err.rawResult, metadata: { status: "miss", ageMs: 0, storage: "none", freshUntil: null, staleUntil: null, shared: false } };
+		if (isAbortError(err)) return { value: abortedResult(url), metadata: { status: "miss", ageMs: 0, storage: "none", freshUntil: null, staleUntil: null, shared: false } };
 		throw err;
 	});
-	return shapeExtractedContent(withRawCacheMetadata(cached.value, cached.cacheHit, cached.cacheAgeMs, cached.shared), options);
+	return shapeExtractedContent(decorateRawCacheResult(cached.value, cached.metadata) as ExtractedContent, options);
 }
 
 async function extractViaHttp(
@@ -458,6 +460,7 @@ async function extractViaHttp(
 		const contentType = response.headers.get("content-type") || "";
 		const contentLengthHeader = response.headers.get("content-length");
 		const contentLength = contentLengthHeader ? Number(contentLengthHeader) : undefined;
+		const originCache = cacheFreshnessFromHeaders(response.headers);
 		const httpMeta: Partial<ExtractedContent> = {
 			method: "http",
 			fetchedAt,
@@ -465,6 +468,7 @@ async function extractViaHttp(
 			contentType: contentType || undefined,
 			httpStatus: response.status,
 			contentLength: contentLength !== undefined && Number.isFinite(contentLength) ? contentLength : undefined,
+			metadata: { originCache },
 		};
 
 		if (!response.ok) {
@@ -582,7 +586,9 @@ async function extractViaHttp(
 		const message = err instanceof Error ? err.message : String(err);
 		if (operationSignal.aborted || message.toLowerCase().includes("abort")) activityMonitor.logComplete(activityId, 0);
 		else activityMonitor.logError(activityId, message);
-		return { url, title: "", content: "", error: message, method: "http", fetchedAt: new Date().toISOString() };
+		const source = err as { code?: unknown; name?: unknown };
+		return { url, title: "", content: "", error: message, method: "http", fetchedAt: new Date().toISOString(),
+			metadata: { transportError: { code: typeof source?.code === "string" ? source.code : undefined, name: typeof source?.name === "string" ? source.name : undefined, timeout: source?.name === "TimeoutError" } } };
 	}
 }
 
