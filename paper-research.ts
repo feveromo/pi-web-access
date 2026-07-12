@@ -777,7 +777,11 @@ async function opReadPaper(params: PaperResearchParams, signal?: AbortSignal): P
 		const text = [`# ${hfPaper?.title || arxivId}`, `https://arxiv.org/abs/${arxivId}`, "", hfPaper?.summary || "HTML extraction was unavailable.", "", `PDF: https://arxiv.org/pdf/${arxivId}`, `HTML extraction errors: ${errors.join("; ")}`].join("\n");
 		return { content: [{ type: "text", text }], details: { operation: "read_paper", arxivId, count: 0, errors } };
 	}
-	if (params.section) {
+	if (params.section?.trim().toLowerCase() === "abstract") {
+		const text = [`# Abstract — ${parsed.title || arxivId}`, `https://arxiv.org/abs/${arxivId}`, "", parsed.abstract || "(No extractable abstract.)"].join("\n");
+		return { content: [{ type: "text", text }], details: { operation: "read_paper", arxivId, section: "Abstract", count: parsed.abstract ? 1 : 0 } };
+	}
+	if (params.section && params.section.trim().toLowerCase() !== "toc") {
 		const section = findSection(parsed.sections, params.section);
 		if (!section) {
 			const available = parsed.sections.map(s => `- ${s.title}`).join("\n");

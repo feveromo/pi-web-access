@@ -4,7 +4,7 @@ import TurndownService from "turndown";
 import pLimit from "p-limit";
 import { activityMonitor } from "./activity.js";
 import { extractPDFToMarkdown, isPDF } from "./pdf-extract.js";
-import { extractGitHub } from "./github-extract.js";
+import { extractGitHub, parseGitHubUrl } from "./github-extract.js";
 import {
 	ResponseTooLargeError,
 	isSafeForThirdPartyFetch,
@@ -14,6 +14,10 @@ import {
 	requestSignal,
 	uint8ArrayToArrayBuffer,
 } from "./http-response.js";
+import { fetchRemoteUrl, validateRemoteUrl, validateThirdPartySourceUrl, type Lookup } from "./ssrf-protection.js";
+import { loadSsrfAllowRanges } from "./ssrf-config.js";
+import { createRawExtractionCache } from "./raw-extraction-cache.js";
+import { approximateRawResultBytes, buildRawExtractionCacheKey, shouldCacheRawExtraction } from "./raw-cache-policy.js";
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const MIN_TIMEOUT_MS = 100;
@@ -144,14 +148,13 @@ function shapeExtractedContent(result: ExtractedContent, options?: ExtractOption
 	};
 }
 
-function finalizeResult(
+function finalizeRawResult(
 	result: ExtractedContent,
-	options: ExtractOptions | undefined,
 	method: string,
 	fallbackPath: string[],
 	extra?: Partial<ExtractedContent>,
 ): ExtractedContent {
-	const merged: ExtractedContent = {
+	return {
 		...result,
 		...extra,
 		method: result.method ?? extra?.method ?? method,
@@ -159,7 +162,26 @@ function finalizeResult(
 		fetchedAt: result.fetchedAt ?? extra?.fetchedAt ?? new Date().toISOString(),
 		fallbackPath: result.fallbackPath ?? fallbackPath,
 	};
-	return shapeExtractedContent(merged, options);
+}
+
+const rawExtractionCache = createRawExtractionCache({
+	ttlMs: 2 * 60 * 1000,
+	maxEntries: 50,
+	maxBytes: 20 * 1024 * 1024,
+	sizeOf: approximateRawResultBytes,
+	shouldCache: (result: ExtractedContent) => shouldCacheRawExtraction(result, loadSsrfAllowRanges()),
+});
+
+function rawCacheKey(url: string, options?: ExtractOptions): string | null {
+	return buildRawExtractionCacheKey(url, {
+		forceClone: options?.forceClone,
+		timeoutMs: options?.timeoutMs,
+		hasLookup: !!options?.lookup,
+	}, loadSsrfAllowRanges());
+}
+
+function withRawCacheMetadata(result: ExtractedContent, cacheHit: boolean, cacheAgeMs: number, shared = false): ExtractedContent {
+	return { ...result, metadata: { ...(result.metadata ?? {}), rawCache: { cacheHit, cacheAgeMs, shared } } };
 }
 
 const turndown = new TurndownService({
@@ -204,6 +226,8 @@ export interface ExtractedContent {
 export interface ExtractOptions {
 	timeoutMs?: number;
 	forceClone?: boolean;
+	/** Internal test hook; not exposed by the Pi tool schema. */
+	lookup?: Lookup;
 	objective?: string;
 	queries?: string[];
 	mode?: ExtractMode;
@@ -218,18 +242,21 @@ async function extractWithJinaReader(
 	url: string,
 	signal?: AbortSignal,
 	timeoutMs = JINA_TIMEOUT_MS,
+	lookup?: Lookup,
 ): Promise<ExtractedContent | null> {
 	const jinaUrl = JINA_READER_BASE + url;
 
 	const activityId = activityMonitor.logStart({ type: "api", query: `jina: ${url}` });
+	const operationSignal = requestSignal(signal, normalizeTimeoutMs(timeoutMs, JINA_TIMEOUT_MS));
 
 	try {
+		await validateThirdPartySourceUrl(url, { lookup, signal: operationSignal });
 		const res = await fetch(jinaUrl, {
 			headers: {
 				"Accept": "text/markdown",
 				"X-No-Cache": "true",
 			},
-			signal: requestSignal(signal, normalizeTimeoutMs(timeoutMs, JINA_TIMEOUT_MS)),
+			signal: operationSignal,
 		});
 
 		if (!res.ok) {
@@ -268,7 +295,7 @@ async function extractWithJinaReader(
 	}
 }
 
-export async function extractContent(
+async function extractRawContent(
 	url: string,
 	signal?: AbortSignal,
 	options?: ExtractOptions,
@@ -288,17 +315,28 @@ export async function extractContent(
 	if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
 		return { url, title: "", content: "", error: `Unsupported URL protocol: ${parsedUrl.protocol}` };
 	}
+	if (parseGitHubUrl(url)) {
+		try {
+			await validateRemoteUrl(parsedUrl, {
+				allowRanges: loadSsrfAllowRanges(),
+				lookup: options?.lookup,
+				signal: requestSignal(signal, normalizeTimeoutMs(options?.timeoutMs)),
+			});
+		} catch (err) {
+			return { url, title: "", content: "", error: errorMessage(err), status: "error", method: "blocked-url" };
+		}
+	}
 
 	fallbackPath.push("github");
 	try {
 		const ghResult = await extractGitHub(url, signal, options?.forceClone);
-		if (ghResult) return finalizeResult(ghResult, options, "github", fallbackPath);
+		if (ghResult) return finalizeRawResult(ghResult, "github", fallbackPath);
 		if (signal?.aborted) return abortedResult(url, fallbackPath);
 	} catch (err) {
 		const message = errorMessage(err);
 		if (isAbortError(err)) return abortedResult(url, fallbackPath);
 		if (isConfigParseError(err)) {
-			return finalizeResult({ url, title: "", content: "", error: message }, options, "github", fallbackPath);
+			return finalizeRawResult({ url, title: "", content: "", error: message }, "github", fallbackPath);
 		}
 	}
 
@@ -308,16 +346,16 @@ export async function extractContent(
 	const httpResult = await extractViaHttp(url, signal, options);
 
 	if (signal?.aborted) return abortedResult(url, fallbackPath);
-	if (!httpResult.error) return finalizeResult(httpResult, options, httpResult.method ?? "http", fallbackPath);
-	if (NON_RECOVERABLE_ERRORS.some(prefix => httpResult.error!.startsWith(prefix))) return finalizeResult(httpResult, options, httpResult.method ?? "http", fallbackPath);
+	if (!httpResult.error) return finalizeRawResult(httpResult, httpResult.method ?? "http", fallbackPath);
+	if (NON_RECOVERABLE_ERRORS.some(prefix => httpResult.error!.startsWith(prefix))) return finalizeRawResult(httpResult, httpResult.method ?? "http", fallbackPath);
 	if (httpResult.httpStatus && httpResult.httpStatus >= 400 && httpResult.httpStatus < 500 && httpResult.httpStatus !== 403 && httpResult.httpStatus !== 429) {
-		return finalizeResult(httpResult, options, httpResult.method ?? "http", fallbackPath);
+		return finalizeRawResult(httpResult, httpResult.method ?? "http", fallbackPath);
 	}
 
 	if (isSafeForThirdPartyFetch(url)) {
 		fallbackPath.push("jina");
-		const jinaResult = await extractWithJinaReader(url, signal, options?.timeoutMs);
-		if (jinaResult) return finalizeResult(jinaResult, options, "jina", fallbackPath);
+		const jinaResult = await extractWithJinaReader(url, signal, options?.timeoutMs, options?.lookup);
+		if (jinaResult) return finalizeRawResult(jinaResult, "jina", fallbackPath);
 		if (signal?.aborted) return abortedResult(url, fallbackPath);
 	} else {
 		fallbackPath.push("jina-skipped-sensitive-url");
@@ -333,7 +371,30 @@ export async function extractContent(
 			? ["  \u2022 Jina fallback was skipped to avoid sending a private or credential-bearing URL to a third party"]
 			: []),
 	].join("\n");
-	return finalizeResult({ ...httpResult, error: guidance }, options, httpResult.method ?? "http", fallbackPath);
+	return finalizeRawResult({ ...httpResult, error: guidance }, httpResult.method ?? "http", fallbackPath);
+}
+
+export async function extractContent(
+	url: string,
+	signal?: AbortSignal,
+	options?: ExtractOptions,
+): Promise<ExtractedContent> {
+	const key = rawCacheKey(url, options);
+	if (!key) return shapeExtractedContent(await extractRawContent(url, signal, options), options);
+	const cached = await rawExtractionCache.get(
+		key,
+		async (sharedSignal: AbortSignal) => {
+			const result = await extractRawContent(url, sharedSignal, options);
+			if (result.error || sharedSignal.aborted) throw Object.assign(new Error(result.error || "Aborted"), { rawResult: result });
+			return result;
+		},
+		signal,
+	).catch((err: Error & { rawResult?: ExtractedContent }) => {
+		if (err.rawResult) return { value: err.rawResult, cacheHit: false, cacheAgeMs: 0, shared: false };
+		if (isAbortError(err)) return { value: abortedResult(url), cacheHit: false, cacheAgeMs: 0, shared: false };
+		throw err;
+	});
+	return shapeExtractedContent(withRawCacheMetadata(cached.value, cached.cacheHit, cached.cacheAgeMs, cached.shared), options);
 }
 
 function isLikelyJSRendered(html: string): boolean {
@@ -368,7 +429,7 @@ async function extractViaHttp(
 	const activityId = activityMonitor.logStart({ type: "fetch", url });
 
 	try {
-		const response = await fetch(url, {
+		const response = await fetchRemoteUrl(url, {
 			signal: operationSignal,
 			headers: {
 				"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -381,7 +442,7 @@ async function extractViaHttp(
 				"Sec-Fetch-User": "?1",
 				"Upgrade-Insecure-Requests": "1",
 			},
-		});
+		}, { allowRanges: loadSsrfAllowRanges(), lookup: options?.lookup });
 
 		const fetchedAt = new Date().toISOString();
 		const fetchedUrl = response.url || url;

@@ -11,8 +11,11 @@ const CONTENT_STORE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SESSION_CONTENT_CHARS = 24_000;
 const CONTENT_STORE_PATH = process.env.PI_WEB_ACCESS_CONTENT_DIR?.trim() || join(homedir(), ".pi", "web-access", "content");
 const CONTENT_REF_VERSION = 1;
+const MAX_LIVE_RESULTS = 100;
+const MAX_LIVE_RESULT_BYTES = 8 * 1024 * 1024;
 
 let lastContentPrune = 0;
+let storedResultBytes = 0;
 
 export interface QueryResultData {
 	query: string;
@@ -32,6 +35,31 @@ export interface StoredSearchData {
 }
 
 const storedResults = new Map<string, StoredSearchData>();
+const storedSizes = new Map<string, number>();
+
+function approximateStoredBytes(data: StoredSearchData): number {
+	try { return Buffer.byteLength(JSON.stringify(data), "utf8"); }
+	catch { return 0; }
+}
+
+function removeStoredResult(id: string): boolean {
+	const deleted = storedResults.delete(id);
+	storedResultBytes -= storedSizes.get(id) ?? 0;
+	storedSizes.delete(id);
+	return deleted;
+}
+
+function pruneStoredResults(now = Date.now()): void {
+	for (const [id, data] of storedResults) {
+		if (now - data.timestamp < CACHE_TTL_MS && data.timestamp <= now + 60_000) continue;
+		removeStoredResult(id);
+	}
+	while (storedResults.size > MAX_LIVE_RESULTS || storedResultBytes > MAX_LIVE_RESULT_BYTES) {
+		const oldest = storedResults.keys().next().value as string | undefined;
+		if (!oldest) break;
+		removeStoredResult(oldest);
+	}
+}
 
 function safeId(id: string): string {
 	return id.replace(/[^a-z0-9_-]/gi, "_");
@@ -145,7 +173,7 @@ function isPathInContentStore(filePath: string): boolean {
 	}
 }
 
-function hydrateContent(item: ExtractedContent): ExtractedContent {
+export function hydrateStoredFetchItem(item: ExtractedContent): ExtractedContent {
 	const ref = item.contentRef;
 	if (!ref || !isValidContentRef(ref) || !isPathInContentStore(ref.path)) return item;
 
@@ -170,7 +198,7 @@ function hydrateStoredData(data: StoredSearchData): StoredSearchData {
 	if (data.type !== "fetch" || !data.urls) return data;
 	return {
 		...data,
-		urls: data.urls.map(hydrateContent),
+		urls: data.urls.map(hydrateStoredFetchItem),
 	};
 }
 
@@ -179,15 +207,26 @@ export function generateId(): string {
 }
 
 export function storeResult(id: string, data: StoredSearchData): void {
+	if (storedResults.has(id)) removeStoredResult(id);
+	const bytes = approximateStoredBytes(data);
 	storedResults.set(id, data);
+	storedSizes.set(id, bytes);
+	storedResultBytes += bytes;
+	pruneStoredResults();
+}
+
+export function getStoredResult(id: string): StoredSearchData | null {
+	pruneStoredResults();
+	return storedResults.get(id) ?? null;
 }
 
 export function getResult(id: string): StoredSearchData | null {
-	const data = storedResults.get(id);
+	const data = getStoredResult(id);
 	return data ? hydrateStoredData(data) : null;
 }
 
 export function getAllResults(): StoredSearchData[] {
+	pruneStoredResults();
 	return Array.from(storedResults.values());
 }
 
@@ -198,11 +237,13 @@ export function deleteResult(id: string): boolean {
 	} catch {
 		return false;
 	}
-	return storedResults.delete(id);
+	return removeStoredResult(id);
 }
 
 export function clearResults(): void {
 	storedResults.clear();
+	storedSizes.clear();
+	storedResultBytes = 0;
 }
 
 function isValidStoredData(data: unknown): data is StoredSearchData {
@@ -237,14 +278,14 @@ function isValidStoredData(data: unknown): data is StoredSearchData {
 }
 
 export function restoreFromSession(ctx: ExtensionContext): void {
-	storedResults.clear();
+	clearResults();
 	const now = Date.now();
 
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type === "custom" && entry.customType === "web-search-results") {
 			const data = entry.data;
 			if (isValidStoredData(data) && data.timestamp <= now + 60_000 && now - data.timestamp < CACHE_TTL_MS) {
-				storedResults.set(data.id, data);
+				storeResult(data.id, data);
 			}
 		}
 	}

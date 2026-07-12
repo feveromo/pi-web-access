@@ -11,12 +11,16 @@ import { executeDocsSearch, executeOpenApiSearch } from "./docs-research.js";
 import { executeGitHubExamples } from "./github-examples.js";
 import { formatFullResults, formatSearchSummary } from "./search-output.js";
 import { createSearchScheduler, runSearchQueries } from "./web-search-runner.js";
+import { normalizeFetchContentParams } from "./fetch-params.js";
+import { buildSuccessfulFetchHint } from "./fetch-output.js";
+import { getWebSearchConfigPath } from "./utils.js";
 import {
 	clearResults,
 	deleteResult,
 	generateId,
 	getAllResults,
-	getResult,
+	getStoredResult,
+	hydrateStoredFetchItem,
 	prepareStoredDataForSession,
 	restoreFromSession,
 	storeResult,
@@ -24,11 +28,9 @@ import {
 	type StoredSearchData,
 } from "./storage.js";
 import { activityMonitor, type ActivityEntry } from "./activity.js";
-import { homedir } from "node:os";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 
-const WEB_SEARCH_CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
+const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
 const MAX_INLINE_CONTENT = 6000;
 const MAX_SEARCH_QUERIES = 8;
 const MAX_FETCH_URLS = 20;
@@ -40,6 +42,7 @@ const searchSchedule = createSearchScheduler(SEARCH_QUERY_CONCURRENCY);
 
 interface WebSearchConfig {
 	shortcuts?: { activity?: string };
+	ssrf?: { allowRanges?: string[] };
 }
 
 interface SearchReturnOptions {
@@ -81,19 +84,6 @@ function normalizeQueryList(queryList: unknown[]): string[] {
 		const key = trimmed.toLowerCase();
 		if (!trimmed || seen.has(key)) continue;
 		seen.add(key);
-		normalized.push(trimmed);
-	}
-	return normalized;
-}
-
-function normalizeUrlList(urlList: unknown[]): string[] {
-	const normalized: string[] = [];
-	const seen = new Set<string>();
-	for (const url of urlList) {
-		if (typeof url !== "string") continue;
-		const trimmed = url.trim();
-		if (!trimmed || seen.has(trimmed)) continue;
-		seen.add(trimmed);
 		normalized.push(trimmed);
 	}
 	return normalized;
@@ -143,6 +133,7 @@ function extractDomain(url: string): string {
 }
 
 function buildFetchDetail(result: ExtractedContent, index: number, includeMetadata = false): Record<string, unknown> {
+	const rawCache = result.metadata?.rawCache as { cacheHit?: boolean; cacheAgeMs?: number; shared?: boolean } | undefined;
 	return {
 		index,
 		url: result.url,
@@ -159,6 +150,9 @@ function buildFetchDetail(result: ExtractedContent, index: number, includeMetada
 		truncated: result.truncated,
 		originalContentLength: result.originalContentLength,
 		retrievalStatus: result.retrievalStatus,
+		cacheHit: rawCache?.cacheHit,
+		cacheAgeMs: rawCache?.cacheAgeMs,
+		cacheShared: rawCache?.shared,
 		contentRef: includeMetadata ? result.contentRef : undefined,
 		metadata: includeMetadata ? result.metadata : undefined,
 	};
@@ -389,7 +383,7 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				widgetUnsubscribe?.();
 				widgetUnsubscribe = null;
-				ctx.ui.setWidget("web-activity", null);
+				ctx.ui.setWidget("web-activity", undefined);
 			}
 		},
 	});
@@ -561,7 +555,7 @@ export default function (pi: ExtensionAPI) {
 			doi: Type.Optional(Type.String({ description: "DOI for details/citation_graph/related" })),
 			openAlexId: Type.Optional(Type.String({ description: "OpenAlex work ID such as W1234567890 or https://openalex.org/W1234567890" })),
 			paperId: Type.Optional(Type.String({ description: "Convenience paper identifier: OpenAlex ID/URL, DOI/doi URL, or arXiv ID/URL" })),
-			section: Type.Optional(Type.String({ description: "Section name or number for read_paper, e.g. '3', 'Method', '4.2'" })),
+			section: Type.Optional(Type.String({ description: "Section name or number for read_paper, e.g. '3', 'Method', '4.2'; use 'abstract' for only the abstract or 'toc' for the table of contents" })),
 			direction: Type.Optional(StringEnum(["citations", "references", "both"], { description: "OpenAlex citation graph direction (default both)" })),
 			date: Type.Optional(Type.String({ description: "YYYY-MM-DD for Hugging Face trending papers" })),
 			yearFrom: Type.Optional(Type.Integer({ description: "Minimum publication year for OpenAlex search/abstract_search" })),
@@ -679,7 +673,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "github_examples",
 		label: "GitHub Examples",
-		description: "Find and read working example scripts, notebooks, tutorials, cookbook files, and guides in GitHub repositories using the GitHub API. Use before implementing against a fast-moving library API.",
+		description: "Find and read working example scripts, notebooks, tutorials, cookbook files, and guides in GitHub repositories using bounded path plus content ranking. Use before implementing against a fast-moving library API.",
 		promptSnippet:
 			"Use to discover and read current GitHub example files with fuzzy keyword/path ranking and line ranges.",
 		promptGuidelines: [
@@ -692,7 +686,7 @@ export default function (pi: ExtensionAPI) {
 			path: Type.Optional(Type.String({ description: "File path to read when operation='read'" })),
 			ref: Type.Optional(Type.String({ description: "Branch, tag, or commit/ref. Defaults to repo default branch for find and HEAD for read." })),
 			maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "Max results for find (default 12, max 50)" })),
-			minScore: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Minimum path score for find" })),
+			minScore: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Minimum final combined path/content match score for find" })),
 			lineStart: Type.Optional(Type.Integer({ minimum: 1, description: "First line to read (1-indexed)" })),
 			lineEnd: Type.Optional(Type.Integer({ minimum: 1, description: "Last line to read (inclusive)" })),
 		}),
@@ -724,7 +718,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "fetch_content",
 		label: "Fetch Content",
-		description: "Fetch URL(s) and extract readable markdown via HTTP/Readability, GitHub cloning, PDF extraction, and Jina fallback. Content is stored for get_search_content. Prefer one urls array when fetching several related pages.",
+		description: "Fetch URL(s) and extract readable markdown via HTTP/Readability, GitHub cloning, PDF extraction, and Jina fallback. Successful public raw extractions are briefly cached below shaping; content is stored for get_search_content. Prefer one urls array when fetching several related pages.",
 		promptSnippet:
 			"Use to extract readable content from URLs, docs, PDFs, and GitHub repos. Prefer one urls:[...] call for several related pages.",
 		parameters: Type.Object({
@@ -742,8 +736,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate) {
-			const rawUrlList: unknown[] = Array.isArray(params.urls) ? params.urls : (params.url ? [params.url] : []);
-			const urlList = normalizeUrlList(rawUrlList);
+			const { urlList, options } = normalizeFetchContentParams(params);
 			if (urlList.length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: No URL provided." }],
@@ -760,15 +753,7 @@ export default function (pi: ExtensionAPI) {
 				details: { phase: "fetch", progress: 0 },
 			});
 
-			const fetchResults = await fetchAllContent(urlList, signal, {
-				forceClone: params.forceClone,
-				objective: params.objective,
-				queries: params.queries,
-				mode: params.mode,
-				maxChars: params.maxChars,
-				timeoutMs: params.timeoutMs,
-				returnMetadata: params.returnMetadata,
-			});
+			const fetchResults = await fetchAllContent(urlList, signal, options);
 			const successful = fetchResults.filter((r) => !r.error).length;
 			const totalChars = fetchResults.reduce((sum, r) => sum + r.content.length, 0);
 			const responseId = storeAndPublishFetch(fetchResults);
@@ -826,11 +811,13 @@ export default function (pi: ExtensionAPI) {
 					output += `- ${title || url} (${content.length} chars)\n`;
 				}
 			}
-			output += `\n---\nUse get_search_content({ responseId: "${responseId}", urlIndex: 0 }) to retrieve one URL, or get_search_content({ responseId: "${responseId}", urlIndexes: [0, 1] }) for a batch.`;
+			const hint = buildSuccessfulFetchHint(responseId, fetchResults, MAX_FETCH_URLS);
+			const successfulIndexes = hint.successfulIndexes;
+			if (hint.text) output += `\n---\n${hint.text}`;
 
 			return {
 				content: [{ type: "text", text: output }],
-				details: { urls: urlList, urlCount: urlList.length, successful, totalChars, responseId, perUrl },
+				details: { urls: urlList, urlCount: urlList.length, successful, successfulIndexes, totalChars, responseId, perUrl },
 			};
 		},
 
@@ -926,7 +913,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params) {
-			const data = getResult(params.responseId);
+			const data = getStoredResult(params.responseId);
 			if (!data) {
 				return {
 					content: [{ type: "text", text: `Error: No stored results for "${params.responseId}"` }],
@@ -1020,7 +1007,7 @@ export default function (pi: ExtensionAPI) {
 					if (index === null || !data.urls) return `Invalid URL index`;
 					const urlData = data.urls[index];
 					if (!urlData) return `Index ${index} out of range (0-${data.urls.length - 1})`;
-					selected.push({ index, urlData });
+					selected.push({ index, urlData: hydrateStoredFetchItem(urlData) });
 					return null;
 				};
 
@@ -1033,7 +1020,7 @@ export default function (pi: ExtensionAPI) {
 							details: { error: "URL not found" },
 						};
 					}
-					selected.push({ index, urlData: data.urls[index] });
+					selected.push({ index, urlData: hydrateStoredFetchItem(data.urls[index]) });
 				} else if (params.urlIndex !== undefined) {
 					const error = selectIndex(normalizeContentIndex(params.urlIndex));
 					if (error) return { content: [{ type: "text", text: error }], details: { error: "Index out of range" } };
@@ -1045,7 +1032,7 @@ export default function (pi: ExtensionAPI) {
 							if (error) return { content: [{ type: "text", text: error }], details: { error: "Index out of range" } };
 						}
 					} else if (params.allUrls === true) {
-						data.urls.forEach((urlData, index) => selected.push({ index, urlData }));
+						data.urls.forEach((urlData, index) => selected.push({ index, urlData: hydrateStoredFetchItem(urlData) }));
 					} else {
 						const available = data.urls.map((u, i) => `${i}: ${u.url}`).join("\n  ");
 						return {

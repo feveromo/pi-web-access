@@ -75,8 +75,19 @@ function normalizeDomainFilter(value: string[] | undefined): string[] {
 	const seen = new Set<string>();
 	for (const raw of value) {
 		if (typeof raw !== "string") continue;
-		const domain = raw.trim();
-		if (!domain || domain === "-" || seen.has(domain)) continue;
+		const trimmed = raw.trim();
+		const excluded = trimmed.startsWith("-");
+		let candidate = (excluded ? trimmed.slice(1) : trimmed).trim().toLowerCase();
+		if (!candidate) continue;
+		try {
+			const parsed = new URL(/^https?:\/\//i.test(candidate) ? candidate : `https://${candidate}`);
+			candidate = parsed.hostname.toLowerCase().replace(/\.$/, "");
+		} catch {
+			continue;
+		}
+		if (!candidate || !/^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(candidate)) continue;
+		const domain = `${excluded ? "-" : ""}${candidate}`;
+		if (seen.has(domain)) continue;
 		seen.add(domain);
 		domains.push(domain);
 		if (domains.length >= 20) break;
@@ -85,12 +96,11 @@ function normalizeDomainFilter(value: string[] | undefined): string[] {
 }
 
 function buildQuery(rawQuery: string, domainFilter?: string[]): string {
-	let query = rawQuery.trim();
-	const terms = normalizeDomainFilter(domainFilter).map(domain =>
-		domain.startsWith("-") ? `-site:${domain.slice(1)}` : `site:${domain}`,
-	);
-	if (terms.length > 0) query = `${query} ${terms.join(" ")}`.trim();
-	return query;
+	const domains = normalizeDomainFilter(domainFilter);
+	const included = domains.filter(domain => !domain.startsWith("-")).map(domain => `site:${domain}`);
+	const excluded = domains.filter(domain => domain.startsWith("-")).map(domain => `-site:${domain.slice(1)}`);
+	const includeTerm = included.length > 1 ? `(${included.join(" OR ")})` : included[0];
+	return [rawQuery.trim(), includeTerm, ...excluded].filter(Boolean).join(" ");
 }
 
 function searchCacheKey(query: string, opts: SearxngSearchOptions): string {
