@@ -9,7 +9,7 @@ import { executePaperSearch } from "./paper-search.js";
 import { executePaperResearch } from "./paper-research.js";
 import { executeDocsSearch, executeOpenApiSearch } from "./docs-research.js";
 import { executeGitHubExamples } from "./github-examples.js";
-import { formatFullResults, formatSearchSummary } from "./search-output.js";
+import { formatFullResults, formatSearchCacheWarning, formatSearchSummary } from "./search-output.js";
 import { createSearchScheduler, runSearchQueries } from "./web-search-runner.js";
 import { normalizeFetchContentParams } from "./fetch-params.js";
 import { buildSuccessfulFetchHint } from "./fetch-output.js";
@@ -133,7 +133,7 @@ function extractDomain(url: string): string {
 }
 
 function buildFetchDetail(result: ExtractedContent, index: number, includeMetadata = false): Record<string, unknown> {
-	const rawCache = result.metadata?.rawCache as { cacheHit?: boolean; cacheAgeMs?: number; shared?: boolean } | undefined;
+	const rawCache = result.metadata?.rawCache as { cacheHit?: boolean; cacheAgeMs?: number; shared?: boolean; status?: string; storage?: string; warning?: string } | undefined;
 	return {
 		index,
 		url: result.url,
@@ -154,6 +154,9 @@ function buildFetchDetail(result: ExtractedContent, index: number, includeMetada
 		cacheHit: rawCache?.cacheHit,
 		cacheAgeMs: rawCache?.cacheAgeMs,
 		cacheShared: rawCache?.shared,
+		cacheStatus: rawCache?.status,
+		cacheStorage: rawCache?.storage,
+		cacheWarning: rawCache?.warning,
 		contentRef: includeMetadata ? result.contentRef : undefined,
 		metadata: includeMetadata ? result.metadata : undefined,
 	};
@@ -283,22 +286,22 @@ export default function (pi: ExtensionAPI) {
 	const initConfig = loadConfigForExtensionInit();
 	const activityKey = initConfig.shortcuts?.activity || DEFAULT_SHORTCUTS.activity;
 
-	function storeAndPublishSearch(results: QueryResultData[]): string {
+	async function storeAndPublishSearch(results: QueryResultData[]): Promise<string> {
 		const id = generateId();
 		const data: StoredSearchData = {
 			id, type: "search", timestamp: Date.now(), queries: results,
 		};
 		storeResult(id, data);
-		pi.appendEntry("web-search-results", prepareStoredDataForSession(id, data));
+		pi.appendEntry("web-search-results", await prepareStoredDataForSession(id, data));
 		return id;
 	}
 
-	function storeAndPublishFetch(results: ExtractedContent[]): string {
+	async function storeAndPublishFetch(results: ExtractedContent[]): Promise<string> {
 		const id = generateId();
 		const data: StoredSearchData = {
 			id, type: "fetch", timestamp: Date.now(), urls: results,
 		};
-		const sessionData = prepareStoredDataForSession(id, data);
+		const sessionData = await prepareStoredDataForSession(id, data);
 		if (sessionData.urls) {
 			for (let i = 0; i < sessionData.urls.length; i++) {
 				const sessionItem = sessionData.urls[i];
@@ -313,10 +316,10 @@ export default function (pi: ExtensionAPI) {
 		return id;
 	}
 
-	function buildSearchReturn(opts: SearchReturnOptions) {
+	async function buildSearchReturn(opts: SearchReturnOptions) {
 		const successfulQueries = opts.results.filter(result => !result.error).length;
 		const totalResults = opts.results.reduce((sum, result) => sum + result.results.length, 0);
-		const searchId = storeAndPublishSearch(opts.results);
+		const searchId = await storeAndPublishSearch(opts.results);
 		const allDomains = new Set<string>();
 		const perQueryMetrics = opts.results.map(result => {
 			const domains = new Set(result.results.map(source => extractDomain(source.url)));
@@ -339,8 +342,10 @@ export default function (pi: ExtensionAPI) {
 		let output = "";
 		let truncated = false;
 		for (let i = 0; i < opts.results.length; i++) {
-			const { query, answer, results, error } = opts.results[i];
+			const { query, answer, results, error, metadata } = opts.results[i];
 			if (opts.queryList.length > 1) output += `## Query ${i + 1}: "${query}"\n\n`;
+			const cacheWarning = formatSearchCacheWarning(metadata);
+			if (cacheWarning) output += `${cacheWarning}\n\n`;
 			if (error) output += `Error: ${error}\n\n`;
 			else if (results.length === 0) output += "No results found.\n\n";
 			else {
@@ -463,7 +468,7 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 
-			return buildSearchReturn({ queryList, results: perQuery, returnMetadata: params.returnMetadata === true });
+			return await buildSearchReturn({ queryList, results: perQuery, returnMetadata: params.returnMetadata === true });
 		},
 
 		renderCall(args, theme) {
@@ -757,7 +762,7 @@ export default function (pi: ExtensionAPI) {
 			const fetchResults = await fetchAllContent(urlList, signal, options);
 			const successful = fetchResults.filter((r) => !r.error).length;
 			const totalChars = fetchResults.reduce((sum, r) => sum + r.content.length, 0);
-			const responseId = storeAndPublishFetch(fetchResults);
+			const responseId = await storeAndPublishFetch(fetchResults);
 			const perUrl = fetchResults.map((result, index) => buildFetchDetail(result, index, params.returnMetadata === true));
 
 			if (urlList.length === 1) {
@@ -918,7 +923,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params) {
-			const data = getStoredResult(params.responseId);
+			const data = await getStoredResult(params.responseId);
 			if (!data) {
 				return {
 					content: [{ type: "text", text: `Error: No stored results for "${params.responseId}"` }],
@@ -1008,11 +1013,11 @@ export default function (pi: ExtensionAPI) {
 
 			if (data.type === "fetch" && data.urls) {
 				const selected: Array<{ index: number; urlData: ExtractedContent }> = [];
-				const selectIndex = (index: number | null) => {
+				const selectIndex = async (index: number | null) => {
 					if (index === null || !data.urls) return `Invalid URL index`;
 					const urlData = data.urls[index];
 					if (!urlData) return `Index ${index} out of range (0-${data.urls.length - 1})`;
-					selected.push({ index, urlData: hydrateStoredFetchItem(urlData) });
+					selected.push({ index, urlData: await hydrateStoredFetchItem(urlData) });
 					return null;
 				};
 
@@ -1025,19 +1030,19 @@ export default function (pi: ExtensionAPI) {
 							details: { error: "URL not found" },
 						};
 					}
-					selected.push({ index, urlData: hydrateStoredFetchItem(data.urls[index]) });
+					selected.push({ index, urlData: await hydrateStoredFetchItem(data.urls[index]) });
 				} else if (params.urlIndex !== undefined) {
-					const error = selectIndex(normalizeContentIndex(params.urlIndex));
+					const error = await selectIndex(normalizeContentIndex(params.urlIndex));
 					if (error) return { content: [{ type: "text", text: error }], details: { error: "Index out of range" } };
 				} else {
 					const indexes = normalizeContentIndexes(params.urlIndexes);
 					if (indexes.length > 0) {
 						for (const index of indexes) {
-							const error = selectIndex(index);
+							const error = await selectIndex(index);
 							if (error) return { content: [{ type: "text", text: error }], details: { error: "Index out of range" } };
 						}
 					} else if (params.allUrls === true) {
-						data.urls.forEach((urlData, index) => selected.push({ index, urlData: hydrateStoredFetchItem(urlData) }));
+						for (let index = 0; index < data.urls.length; index++) selected.push({ index, urlData: await hydrateStoredFetchItem(data.urls[index]) });
 					} else {
 						const available = data.urls.map((u, i) => `${i}: ${u.url}`).join("\n  ");
 						return {
@@ -1214,7 +1219,7 @@ export default function (pi: ExtensionAPI) {
 			const action = await ctx.ui.select(`Result ${selected.id.slice(0, 6)}`, actions);
 
 			if (action === "Delete") {
-				deleteResult(selected.id);
+				await deleteResult(selected.id);
 				ctx.ui.notify(`Deleted ${selected.id.slice(0, 6)}`, "info");
 			} else if (action === "View details") {
 				let info = `ID: ${selected.id}\nType: ${selected.type}\nAge: ${Math.floor((Date.now() - selected.timestamp) / 60000)}m\n\n`;

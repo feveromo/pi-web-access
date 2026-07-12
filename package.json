@@ -1,6 +1,6 @@
 {
   "name": "pi-web-access",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "Keyless local-first web research via self-hosted SearXNG, docs/API search, GitHub examples, URL fetching, PDF extraction, and scholarly research for Pi coding agent",
   "type": "module",
   "scripts": {

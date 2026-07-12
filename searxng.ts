@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { isAbortError, readErrorSnippet, readResponseJson, requestSignal } from "./http-response.js";
 import { sanitizeSearchText } from "./search-output.js";
 import type { SearchResult } from "./search-types.js";
+import { createPersistentCache } from "./persistent-cache.js";
 
 const HOST = "127.0.0.1";
 const rawPort = Number(process.env.SEARXNG_PORT ?? "8888");
@@ -20,8 +21,10 @@ const HEALTH_TTL_MS = 15_000;
 const START_TIMEOUT_MS = 30_000;
 const SEARCH_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
-const SEARCH_CACHE_TTL_MS = 2 * 60 * 1000;
-const MAX_SEARCH_CACHE_ENTRIES = 100;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const SEARCH_FRESH_MS = { day: 10 * 60 * 1000, week: 60 * 60 * 1000, month: 6 * 60 * 60 * 1000, year: DAY_MS } as const;
+const SEARCH_HARD_RETAIN_MS = 7 * DAY_MS;
+const MAX_SEARCH_CACHE_ENTRIES = 500;
 
 export interface SearxngSearchOptions {
 	numResults?: number;
@@ -51,8 +54,25 @@ interface SearxngRawResult {
 	publishedDate?: string;
 }
 
-const searchCache = new Map<string, { expiresAt: number; response: SearxngSearchResponse }>();
-const inFlightSearches = new Map<string, SharedTask<SearxngSearchResponse>>();
+function isSearchResponse(value: unknown): value is SearxngSearchResponse {
+	if (!value || typeof value !== "object") return false;
+	const item = value as Record<string, unknown>;
+	return typeof item.answer === "string" && Array.isArray(item.results) && item.results.length <= 20
+		&& item.results.every(result => !!result && typeof result === "object"
+			&& typeof (result as Record<string, unknown>).title === "string"
+			&& typeof (result as Record<string, unknown>).url === "string"
+			&& typeof (result as Record<string, unknown>).snippet === "string");
+}
+
+const searchCache = createPersistentCache({
+	namespace: "web-search",
+	freshMs: DAY_MS,
+	staleMs: SEARCH_HARD_RETAIN_MS,
+	maxEntries: MAX_SEARCH_CACHE_ENTRIES,
+	maxBytes: 32 * 1024 * 1024,
+	maxValueBytes: 2 * 1024 * 1024,
+	validate: isSearchResponse,
+});
 let readinessTask: SharedTask<void> | null = null;
 let healthyUntil = 0;
 
@@ -103,8 +123,13 @@ function buildQuery(rawQuery: string, domainFilter?: string[]): string {
 	return [rawQuery.trim(), includeTerm, ...excluded].filter(Boolean).join(" ");
 }
 
+export function webSearchFreshnessMs(recencyFilter: SearxngSearchOptions["recencyFilter"]): number {
+	return recencyFilter ? SEARCH_FRESH_MS[recencyFilter] : DAY_MS;
+}
+
 function searchCacheKey(query: string, opts: SearxngSearchOptions): string {
 	return JSON.stringify({
+		baseUrl: BASE,
 		query: query.trim().replace(/\s+/g, " ").toLowerCase(),
 		numResults: normalizeNumResults(opts.numResults),
 		recencyFilter: opts.recencyFilter,
@@ -112,34 +137,14 @@ function searchCacheKey(query: string, opts: SearxngSearchOptions): string {
 	});
 }
 
-function cloneResponse(response: SearxngSearchResponse, cacheHit = false): SearxngSearchResponse {
+function cloneResponse(response: SearxngSearchResponse, cache?: Record<string, unknown>): SearxngSearchResponse {
 	return {
 		...response,
 		results: response.results.map(result => ({ ...result })),
-		metadata: response.metadata || cacheHit
-			? { ...(response.metadata ?? {}), ...(cacheHit ? { cacheHit: true } : {}) }
+		metadata: response.metadata || cache
+			? { ...(response.metadata ?? {}), ...(cache ? { cacheHit: cache.status !== "miss", cache } : {}) }
 			: undefined,
 	};
-}
-
-function cachedResponse(key: string): SearxngSearchResponse | null {
-	const cached = searchCache.get(key);
-	if (!cached) return null;
-	if (cached.expiresAt <= Date.now()) {
-		searchCache.delete(key);
-		return null;
-	}
-	searchCache.delete(key);
-	searchCache.set(key, cached);
-	return cloneResponse(cached.response, true);
-}
-
-function storeCachedResponse(key: string, response: SearxngSearchResponse): void {
-	if (searchCache.size >= MAX_SEARCH_CACHE_ENTRIES) {
-		const oldest = searchCache.keys().next().value as string | undefined;
-		if (oldest) searchCache.delete(oldest);
-	}
-	searchCache.set(key, { expiresAt: Date.now() + SEARCH_CACHE_TTL_MS, response: cloneResponse(response) });
 }
 
 async function waitForTask<T>(task: SharedTask<T>, signal?: AbortSignal): Promise<T> {
@@ -329,7 +334,9 @@ async function performSearch(query: string, opts: SearxngSearchOptions, signal: 
 	}
 	if (!response.ok) {
 		const body = await readErrorSnippet(response, 200);
-		throw new Error(`SearXNG search failed: HTTP ${response.status}${body ? ` ${body}` : ""}`);
+		const error = new Error(`SearXNG search failed: HTTP ${response.status}${body ? ` ${body}` : ""}`) as Error & { status: number };
+		error.status = response.status;
+		throw error;
 	}
 	const data = await readResponseJson<{ results?: SearxngRawResult[]; unresponsive_engines?: unknown[] }>(response, MAX_RESPONSE_BYTES);
 	if (!data || typeof data !== "object" || !Array.isArray(data.results)) {
@@ -373,26 +380,13 @@ export async function searxngSearch(query: string, opts: SearxngSearchOptions = 
 	if (!normalizedQuery) throw new Error("No SearXNG query provided");
 	opts.signal?.throwIfAborted();
 	const key = searchCacheKey(normalizedQuery, opts);
-	const cached = cachedResponse(key);
-	if (cached) return cached;
-
-	let task = inFlightSearches.get(key);
-	if (!task) {
-		const controller = new AbortController();
-		task = { controller, waiters: 0, promise: Promise.resolve(null as never) };
-		const currentTask = task;
-		task.promise = performSearch(normalizedQuery, opts, controller.signal)
-			.then(response => {
-				storeCachedResponse(key, response);
-				return response;
-			})
-			.finally(() => {
-				if (inFlightSearches.get(key) === currentTask) inFlightSearches.delete(key);
-			});
-		task.promise.catch(() => {});
-		inFlightSearches.set(key, task);
-	}
-	return cloneResponse(await waitForTask(task, opts.signal));
+	const freshMs = webSearchFreshnessMs(opts.recencyFilter);
+	const cached = await searchCache.get(key, signal => performSearch(normalizedQuery, opts, signal), {
+		signal: opts.signal,
+		freshMs,
+		staleMs: SEARCH_HARD_RETAIN_MS,
+	});
+	return cloneResponse(cached.value, cached.metadata);
 }
 
 async function main() {

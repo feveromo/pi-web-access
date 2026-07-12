@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import pLimit from "p-limit";
@@ -9,6 +9,7 @@ import TurndownService from "turndown";
 import { readErrorSnippet, readResponseJson, readResponseText } from "./http-response.js";
 import { loadSsrfAllowRanges } from "./ssrf-config.js";
 import { fetchRemoteUrl, validateRemoteUrl, type Lookup } from "./ssrf-protection.ts";
+import { createPersistentCache } from "./persistent-cache.js";
 
 export type DocsSearchMode = "auto" | "llms" | "crawl";
 
@@ -71,6 +72,7 @@ interface DocsCacheInfo {
 	expiresAt: number;
 	discovery: { hit: boolean; shared: boolean; storage: "memory" | "disk" | "fresh" };
 	pages: { memoryHits: number; diskHits: number; sharedHits: number; misses: number; failures: number };
+	staleWarnings: string[];
 }
 
 interface DiskDiscovery extends CachedDiscovery {
@@ -100,7 +102,11 @@ interface OpenApiEndpoint {
 	baseUrl: string;
 }
 
-const DOCS_CACHE_TTL_MS = 30 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DOCS_CACHE_TTL_MS = 7 * DAY_MS;
+const DOCS_CACHE_HARD_RETAIN_MS = 30 * DAY_MS;
+const OPENAPI_CACHE_TTL_MS = DAY_MS;
+const OPENAPI_CACHE_HARD_RETAIN_MS = 7 * DAY_MS;
 const DISCOVERY_CACHE_MAX = 30;
 const DISCOVERY_CACHE_MAX_BYTES = 1024 * 1024;
 const PAGE_CACHE_MAX = 200;
@@ -110,7 +116,7 @@ const DOCS_DISK_CACHE_MAX_FILES = 300;
 const DOCS_DISK_CACHE_MAX_BYTES = 40 * 1024 * 1024;
 // Disk quotas are eventual; avoid a synchronous directory scan on every docs request.
 const DOCS_DISK_PRUNE_WRITE_CADENCE = 100;
-const DOCS_CACHE_DIR = process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR?.trim() || join(homedir(), ".pi", "web-access", "docs-cache");
+const DOCS_CACHE_DIR = resolve(process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR?.trim() || join(homedir(), ".pi", "web-access", "docs-cache"));
 const DEFAULT_MAX_PAGES = 40;
 const MAX_PAGES_CAP = 100;
 const DEFAULT_MAX_RESULTS = 6;
@@ -127,7 +133,25 @@ const discoveryCache = new Map<string, CachedDiscovery>();
 const pageCache = new Map<string, CachedPage>();
 const inFlightDiscovery = new Map<string, SharedTask<CachedDiscovery>>();
 const inFlightPages = new Map<string, SharedTask<DocsPage | null>>();
-const openApiCache = new Map<string, { expiresAt: number; endpoints: OpenApiEndpoint[]; tags: string[] }>();
+const persistentDiscoveryCache = createPersistentCache({
+	namespace: "docs-discovery", freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS,
+	maxEntries: 100, maxBytes: 8 * 1024 * 1024, maxValueBytes: 1024 * 1024,
+	validate: (value: unknown) => !!value && typeof value === "object"
+		&& typeof (value as CachedDiscovery).source === "string"
+		&& Array.isArray((value as CachedDiscovery).links)
+		&& (value as CachedDiscovery).links.length <= DISCOVERY_LINK_CAP
+		&& (value as CachedDiscovery).links.every(isDiscoveredDoc),
+});
+const persistentPageCache = createPersistentCache({
+	namespace: "docs-page", freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS,
+	maxEntries: 500, maxBytes: 64 * 1024 * 1024, maxValueBytes: MAX_DOCS_PAGE_BYTES + 64 * 1024,
+	validate: isDocsPage,
+});
+const persistentOpenApiCache = createPersistentCache({
+	namespace: "openapi", freshMs: OPENAPI_CACHE_TTL_MS, staleMs: OPENAPI_CACHE_HARD_RETAIN_MS,
+	maxEntries: 50, maxBytes: 64 * 1024 * 1024, maxValueBytes: MAX_OPENAPI_BYTES,
+	validate: isCachedOpenApi,
+});
 let discoveryCacheBytes = 0;
 let pageCacheBytes = 0;
 let lastDocsCachePrune = 0;
@@ -212,7 +236,35 @@ function isDocsPage(value: unknown): value is DocsPage {
 function isDiscoveredDoc(value: unknown): value is DiscoveredDoc {
 	if (!value || typeof value !== "object") return false;
 	const item = value as Record<string, unknown>;
-	return typeof item.title === "string" && typeof item.url === "string";
+	return typeof item.title === "string" && item.title.length <= 10_000 && typeof item.url === "string" && item.url.length <= 16_384;
+}
+
+function isBoundedJson(value: unknown, budget: { nodes: number }, depth = 0): boolean {
+	if (++budget.nodes > 100_000 || depth > 16) return false;
+	if (value === null || typeof value === "boolean") return true;
+	if (typeof value === "number") return Number.isFinite(value);
+	if (typeof value === "string") return value.length <= 100_000;
+	if (Array.isArray(value)) return value.length <= 10_000 && value.every(item => isBoundedJson(item, budget, depth + 1));
+	if (!value || typeof value !== "object") return false;
+	const entries = Object.entries(value);
+	return entries.length <= 10_000 && entries.every(([key, item]) => key.length <= 10_000 && isBoundedJson(item, budget, depth + 1));
+}
+
+function isCachedOpenApi(value: unknown): boolean {
+	if (!value || typeof value !== "object") return false;
+	const item = value as { endpoints?: unknown; tags?: unknown };
+	if (!Array.isArray(item.tags) || item.tags.length > 10_000 || !item.tags.every(tag => typeof tag === "string" && tag.length <= 1000)) return false;
+	if (!Array.isArray(item.endpoints) || item.endpoints.length > 100_000) return false;
+	const budget = { nodes: 0 };
+	return item.endpoints.every(raw => {
+		if (!raw || typeof raw !== "object") return false;
+		const endpoint = raw as Record<string, unknown>;
+		return ["method", "path", "operationId", "summary", "description", "baseUrl"].every(key => typeof endpoint[key] === "string" && (endpoint[key] as string).length <= 100_000)
+			&& Array.isArray(endpoint.tags) && endpoint.tags.length <= 1000 && endpoint.tags.every(tag => typeof tag === "string" && tag.length <= 1000)
+			&& Array.isArray(endpoint.parameters) && endpoint.parameters.length <= 10_000 && endpoint.parameters.every(parameter => isBoundedJson(parameter, budget))
+			&& (endpoint.requestBody === undefined || isBoundedJson(endpoint.requestBody, budget))
+			&& (endpoint.responses === undefined || isBoundedJson(endpoint.responses, budget));
+	});
 }
 
 function isDiskDiscovery(value: unknown): value is DiskDiscovery {
@@ -265,10 +317,31 @@ function pruneMemoryCaches(now = Date.now()): void {
 	}
 }
 
+async function safeLegacyDocsRoot(create = false): Promise<boolean> {
+	try {
+		if (create) {
+			let ancestor = DOCS_CACHE_DIR;
+			while (true) {
+				try { await lstat(ancestor); break; } catch {
+					const parent = dirname(ancestor);
+					if (parent === ancestor) return false;
+					ancestor = parent;
+				}
+			}
+			const ancestorStat = await lstat(ancestor);
+			if (ancestorStat.isSymbolicLink() || await realpath(ancestor) !== resolve(ancestor)) return false;
+			await mkdir(DOCS_CACHE_DIR, { recursive: true, mode: 0o700 });
+		}
+		const info = await lstat(DOCS_CACHE_DIR);
+		return info.isDirectory() && !info.isSymbolicLink() && await realpath(DOCS_CACHE_DIR) === DOCS_CACHE_DIR;
+	} catch { return false; }
+}
+
 const OWNED_DOCS_CACHE_FILE = /^(?:discovery|page)-[a-f0-9]{64}\.json$/;
 const OWNED_DOCS_TEMP_FILE = /^(?:discovery|page)-[a-f0-9]{64}\.json\.\d+\.[a-z0-9]+\.tmp$/;
 
 async function runDocsDiskPrune(now: number): Promise<void> {
+	if (!await safeLegacyDocsRoot(false)) return;
 	try {
 		const entries: Array<{ path: string; bytes: number; mtimeMs: number }> = [];
 		for (const file of await readdir(DOCS_CACHE_DIR)) {
@@ -312,10 +385,12 @@ async function pruneDocsDiskCache(force = false): Promise<void> {
 }
 
 async function removeDiskValue(kind: "discovery" | "page", key: string): Promise<void> {
+	if (!await safeLegacyDocsRoot(false)) return;
 	await rm(docsDiskCacheFile(kind, key), { force: true }).catch(() => {});
 }
 
 async function readDiskValue(kind: "discovery" | "page", key: string): Promise<unknown | null> {
+	if (!await safeLegacyDocsRoot(false)) return null;
 	try {
 		const path = docsDiskCacheFile(kind, key);
 		const value = JSON.parse(await readFile(path, "utf8")) as unknown;
@@ -335,6 +410,7 @@ async function readDiskValue(kind: "discovery" | "page", key: string): Promise<u
 async function writeDiskValue(kind: "discovery" | "page", key: string, value: DiskDiscovery | DiskPage): Promise<void> {
 	let temp: string | undefined;
 	try {
+		if (!await safeLegacyDocsRoot(true)) return;
 		const body = JSON.stringify(value);
 		if (Buffer.byteLength(body, "utf8") > MAX_DOCS_PAGE_BYTES + 64 * 1024) return;
 		await mkdir(DOCS_CACHE_DIR, { recursive: true });
@@ -412,7 +488,11 @@ async function fetchText(url: string, signal?: AbortSignal, options?: DocsReques
 		},
 		signal: requestSignal(signal),
 	}, remoteOptions(options));
-	if (!res.ok) throw new Error(`HTTP ${res.status}: ${await readErrorSnippet(res, 200)}`);
+	if (!res.ok) {
+		const error = new Error(`HTTP ${res.status}: ${await readErrorSnippet(res, 200)}`) as Error & { status: number };
+		error.status = res.status;
+		throw error;
+	}
 	return { text: await readResponseText(res, MAX_DOCS_PAGE_BYTES), url: res.url || url, contentType: res.headers.get("content-type") || "", status: res.status };
 }
 
@@ -512,7 +592,7 @@ function markdownCandidate(url: string): string | null {
 
 async function fetchDocsPage(item: { title: string; url: string }, signal?: AbortSignal, options?: DocsRequestOptions): Promise<DocsPage | null> {
 	const candidates = [markdownCandidate(item.url), item.url].filter((v): v is string => !!v);
-	let lastError = "";
+	let lastError: unknown;
 	for (const candidate of candidates) {
 		try {
 			const fetched = await fetchText(candidate, signal, options);
@@ -530,10 +610,10 @@ async function fetchDocsPage(item: { title: string; url: string }, signal?: Abor
 			return { title, url: item.url, fetchUrl: fetched.url, content, contentType: fetched.contentType, glimpse: truncate(content, 220) };
 		} catch (err) {
 			if (signal?.aborted) throw abortReason(signal);
-			lastError = errorMessage(err);
+			lastError = err;
 		}
 	}
-	if (lastError) return null;
+	if (lastError) throw lastError;
 	return null;
 }
 
@@ -618,8 +698,18 @@ function canonicalPageKey(rawUrl: string): string | null {
 	}
 }
 
-async function getDiscovery(source: URL, mode: DocsSearchMode, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ value: CachedDiscovery; storage: "memory" | "disk" | "fresh"; shared: boolean }> {
+async function getDiscovery(source: URL, mode: DocsSearchMode, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ value: CachedDiscovery; storage: "memory" | "disk" | "fresh"; shared: boolean; warning?: string }> {
 	await validateRemoteUrl(source, { ...remoteOptions(options), signal: requestSignal(signal) });
+	{
+		const key = discoveryKey(source, mode);
+		// Legacy docs-cache files are ignored. No operation touches the legacy root.
+		const cached = await persistentDiscoveryCache.get(key, async sharedSignal => ({
+			value: { expiresAt: Date.now() + DOCS_CACHE_TTL_MS, source: source.toString(), mode, links: await discoverDocsPages(source, mode, sharedSignal, options) },
+			freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS,
+		}), { signal, freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS });
+		const storage = cached.metadata.storage === "memory" ? "memory" : cached.metadata.storage === "disk" ? "disk" : "fresh";
+		return { value: cached.value, storage, shared: cached.metadata.shared, ...(cached.metadata.warning ? { warning: cached.metadata.warning } : {}) };
+	}
 	pruneMemoryCaches();
 	const key = discoveryKey(source, mode);
 	const memory = discoveryCache.get(key);
@@ -666,8 +756,24 @@ async function getDiscovery(source: URL, mode: DocsSearchMode, signal?: AbortSig
 	};
 }
 
-async function getCachedPage(item: DiscoveredDoc, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ page: DocsPage | null; storage: "memory" | "disk" | "fresh" | "shared" }> {
+async function getCachedPage(item: DiscoveredDoc, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ page: DocsPage | null; storage: "memory" | "disk" | "fresh" | "shared"; warning?: string }> {
 	await validateRemoteUrl(item.url, { ...remoteOptions(options), signal: requestSignal(signal) });
+	{
+		const key = canonicalPageKey(item.url);
+		if (!key) return { page: null, storage: "fresh" };
+		try {
+			const cached = await persistentPageCache.get(key, async sharedSignal => {
+				const page = await fetchLimit(() => fetchDocsPage(item, sharedSignal, options));
+				if (!page) throw new Error("Documentation page contained no usable content");
+				return { value: page, freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS };
+			}, { signal, freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS });
+			const storage = cached.metadata.shared ? "shared" : cached.metadata.storage === "memory" ? "memory" : cached.metadata.storage === "disk" ? "disk" : "fresh";
+			return { page: cached.value, storage, ...(cached.metadata.warning ? { warning: cached.metadata.warning } : {}) };
+		} catch (err) {
+			if (signal?.aborted) throw err;
+			return { page: null, storage: "fresh" };
+		}
+	}
 	pruneMemoryCaches();
 	const key = canonicalPageKey(item.url);
 	if (!key) return { page: null, storage: "fresh" };
@@ -723,6 +829,7 @@ async function getDocsPages(params: DocsSearchParams, signal?: AbortSignal, opti
 	const fetched = await Promise.all(selected.map(item => getCachedPage(item, signal, options)));
 	const pages = fetched.flatMap(result => result.page ? [result.page] : []);
 	const pageMetrics = { memoryHits: 0, diskHits: 0, sharedHits: 0, misses: 0, failures: 0 };
+	const staleWarnings = [discovery.warning, ...fetched.map(result => result.warning)].filter((warning): warning is string => !!warning);
 	for (const result of fetched) {
 		if (!result.page) pageMetrics.failures++;
 		if (result.storage === "memory") pageMetrics.memoryHits++;
@@ -744,6 +851,7 @@ async function getDocsPages(params: DocsSearchParams, signal?: AbortSignal, opti
 			hit, storage, expiresAt: discovery.value.expiresAt,
 			discovery: { hit: discoveryHit, shared: discovery.shared, storage: discovery.storage },
 			pages: pageMetrics,
+			staleWarnings,
 		},
 	};
 }
@@ -802,7 +910,8 @@ export async function executeDocsSearch(params: DocsSearchParams, signal?: Abort
 		const pageCacheSummary = `${cache.pages.memoryHits} memory, ${cache.pages.diskHits} disk, ${cache.pages.sharedHits} shared, ${cache.pages.misses} fetched, ${cache.pages.failures} failed`;
 		const discoveryCacheSummary = cache.discovery.shared ? "shared in-flight" : cache.discovery.hit ? cache.discovery.storage : "fetched";
 		const cacheSummary = `Cache: discovery ${discoveryCacheSummary}; pages ${pageCacheSummary}; expires ${new Date(cache.expiresAt).toISOString()}.`;
-		const lines = [`# Docs search: ${source.toString()}`, query ? `Query: "${query}"` : "No query provided — showing discovered pages.", `Indexed ${pages.length} page(s); showing ${ranked.length}.`, cacheSummary, ""];
+		const staleWarning = cache.staleWarnings.length ? `WARNING: stale cached documentation is shown because refresh failed (${cache.staleWarnings.join("; ")}).` : "";
+		const lines = [`# Docs search: ${source.toString()}`, query ? `Query: "${query}"` : "No query provided — showing discovered pages.", `Indexed ${pages.length} page(s); showing ${ranked.length}.`, cacheSummary, staleWarning, ""].filter(Boolean);
 		for (let i = 0; i < ranked.length; i++) {
 			const { page, score } = ranked[i];
 			lines.push(`## ${i + 1}. ${page.title}`);
@@ -832,13 +941,15 @@ export async function executeDocsSearch(params: DocsSearchParams, signal?: Abort
 	}
 }
 
-async function fetchOpenApi(url: string, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ endpoints: OpenApiEndpoint[]; tags: string[] }> {
+async function loadOpenApiFresh(url: string, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ endpoints: OpenApiEndpoint[]; tags: string[] }> {
 	const normalized = normalizeSource(url).toString();
 	await validateRemoteUrl(normalized, { ...remoteOptions(options), signal: requestSignal(signal) });
-	const cached = openApiCache.get(normalized);
-	if (cached && cached.expiresAt > Date.now()) return cached;
 	const res = await fetchRemoteUrl(normalized, { headers: { "Accept": "application/json", "User-Agent": "pi-web-access/0.10" }, signal: requestSignal(signal) }, remoteOptions(options));
-	if (!res.ok) throw new Error(`HTTP ${res.status}: ${await readErrorSnippet(res, 200)}`);
+	if (!res.ok) {
+		const error = new Error(`HTTP ${res.status}: ${await readErrorSnippet(res, 200)}`) as Error & { status: number };
+		error.status = res.status;
+		throw error;
+	}
 	const spec = await readResponseJson<Record<string, unknown>>(res, MAX_OPENAPI_BYTES);
 	const servers = Array.isArray(spec.servers) ? spec.servers as Array<Record<string, unknown>> : [];
 	const baseUrl = typeof servers[0]?.url === "string" ? servers[0].url : new URL(normalized).origin;
@@ -866,9 +977,19 @@ async function fetchOpenApi(url: string, signal?: AbortSignal, options?: DocsReq
 		}
 	}
 	const tags = [...new Set(endpoints.flatMap(ep => ep.tags))].sort();
-	const value = { endpoints, tags };
-	openApiCache.set(normalized, { expiresAt: Date.now() + DOCS_CACHE_TTL_MS, ...value });
-	return value;
+	return { endpoints, tags };
+}
+
+async function fetchOpenApi(url: string, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ endpoints: OpenApiEndpoint[]; tags: string[]; cache: Record<string, unknown> }> {
+	const normalized = normalizeSource(url).toString();
+	// Validate the current DNS answer before any warm disk or memory lookup.
+	await validateRemoteUrl(normalized, { ...remoteOptions(options), signal: requestSignal(signal) });
+	const cached = await persistentOpenApiCache.get(normalized, async sharedSignal => ({
+		value: await loadOpenApiFresh(normalized, sharedSignal, options),
+		freshMs: OPENAPI_CACHE_TTL_MS,
+		staleMs: OPENAPI_CACHE_HARD_RETAIN_MS,
+	}), { signal, freshMs: OPENAPI_CACHE_TTL_MS, staleMs: OPENAPI_CACHE_HARD_RETAIN_MS });
+	return { ...cached.value, cache: cached.metadata };
 }
 
 function endpointText(ep: OpenApiEndpoint): string {
@@ -955,7 +1076,7 @@ export async function executeOpenApiSearch(params: OpenApiSearchParams, signal?:
 		const tag = params.tag?.trim() || "";
 		if (!query && !tag) throw new Error("Provide `query` and/or `tag`.");
 		const maxResults = clampInt(params.maxResults, DEFAULT_MAX_RESULTS, MAX_RESULTS_CAP);
-		const { endpoints, tags } = await fetchOpenApi(url, signal, options);
+		const { endpoints, tags, cache } = await fetchOpenApi(url, signal, options);
 		const ranked = endpoints
 			.filter(ep => !tag || ep.tags.includes(tag))
 			.map((endpoint, index) => ({ endpoint, index, score: query ? scoreEndpoint(endpoint, query) : 1 }))
@@ -963,7 +1084,8 @@ export async function executeOpenApiSearch(params: OpenApiSearchParams, signal?:
 			.sort((a, b) => b.score - a.score || a.index - b.index)
 			.slice(0, maxResults);
 
-		const lines = [`# OpenAPI search: ${url}`, query ? `Query: "${query}"` : `Tag: ${tag}`, `Indexed ${endpoints.length} endpoint(s); showing ${ranked.length}.`, ""];
+		const staleWarning = cache.warning ? `WARNING: stale cached OpenAPI data is shown because refresh failed (${cache.warning}).` : "";
+		const lines = [`# OpenAPI search: ${url}`, query ? `Query: "${query}"` : `Tag: ${tag}`, `Indexed ${endpoints.length} endpoint(s); showing ${ranked.length}.`, staleWarning, ""].filter(Boolean);
 		for (let i = 0; i < ranked.length; i++) {
 			const { endpoint, score } = ranked[i];
 			lines.push(`## ${i + 1}. ${endpoint.method} ${endpoint.path}`);
@@ -976,7 +1098,7 @@ export async function executeOpenApiSearch(params: OpenApiSearchParams, signal?:
 			lines.push("**Usage:**", "```bash", curlForEndpoint(endpoint), "```", "");
 		}
 		if (ranked.length === 0 && tags.length > 0) lines.push(`Available tags: ${tags.slice(0, 80).join(", ")}`);
-		return { content: [{ type: "text", text: lines.join("\n") }], details: { url, query, tag, count: ranked.length, totalEndpoints: endpoints.length, tags, results: ranked.map(({ endpoint, score }) => ({ ...endpoint, score })) } };
+		return { content: [{ type: "text", text: lines.join("\n") }], details: { url, query, tag, count: ranked.length, totalEndpoints: endpoints.length, tags, cache, results: ranked.map(({ endpoint, score }) => ({ ...endpoint, score })) } };
 	} catch (err) {
 		const message = errorMessage(err);
 		return { content: [{ type: "text", text: `OpenAPI search failed: ${message}` }], details: { error: message } };
