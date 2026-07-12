@@ -18,6 +18,8 @@ import { fetchRemoteUrl, validateRemoteUrl, validateThirdPartySourceUrl, type Lo
 import { loadSsrfAllowRanges } from "./ssrf-config.js";
 import { createRawExtractionCache } from "./raw-extraction-cache.js";
 import { approximateRawResultBytes, buildRawExtractionCacheKey, shouldCacheRawExtraction } from "./raw-cache-policy.js";
+import { extractNpmPackage, parseNpmPackageUrl } from "./npm-registry.js";
+import { extractStaticHtmlPartial, isLikelyJSRendered, preferJinaResult } from "./static-html-partial.js";
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const MIN_TIMEOUT_MS = 100;
@@ -132,6 +134,9 @@ function shapeExtractedContent(result: ExtractedContent, options?: ExtractOption
 	let shaped = result.content;
 	if (mode === "highlights") shaped = buildHighlights(shaped, tokens);
 	else if (mode === "summary") shaped = buildSummary(shaped, tokens);
+	if (result.retrievalStatus === "partial" && !shaped.includes("[Partial extraction:")) {
+		shaped = `[Partial extraction: JavaScript was not executed. Only static HTML evidence is available.]\n\n${shaped}`;
+	}
 	const capped = capContent(shaped, normalizeMaxChars(options?.maxChars));
 	return {
 		...result,
@@ -315,6 +320,17 @@ async function extractRawContent(
 	if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
 		return { url, title: "", content: "", error: `Unsupported URL protocol: ${parsedUrl.protocol}` };
 	}
+	const npmTarget = parseNpmPackageUrl(url);
+	if (npmTarget) {
+		fallbackPath.push("npm-registry");
+		const npmResult = await extractNpmPackage(url, npmTarget, {
+			signal,
+			timeoutMs: normalizeTimeoutMs(options?.timeoutMs),
+			lookup: options?.lookup,
+			allowRanges: loadSsrfAllowRanges(),
+		});
+		return finalizeRawResult(npmResult, "npm-registry", fallbackPath);
+	}
 	if (parseGitHubUrl(url)) {
 		try {
 			await validateRemoteUrl(parsedUrl, {
@@ -355,10 +371,25 @@ async function extractRawContent(
 	if (isSafeForThirdPartyFetch(url)) {
 		fallbackPath.push("jina");
 		const jinaResult = await extractWithJinaReader(url, signal, options?.timeoutMs, options?.lookup);
-		if (jinaResult) return finalizeRawResult(jinaResult, "jina", fallbackPath);
+		const preferredResult = preferJinaResult(jinaResult, httpResult);
+		if (!preferredResult.error) return finalizeRawResult(preferredResult, "jina", fallbackPath);
 		if (signal?.aborted) return abortedResult(url, fallbackPath);
 	} else {
 		fallbackPath.push("jina-skipped-sensitive-url");
+	}
+
+	if (httpResult.content && httpResult.method === "js-rendered" && httpResult.metadata?.staticHtmlPartial === true) {
+		return finalizeRawResult({
+			...httpResult,
+			error: null,
+			retrievalStatus: "partial",
+			method: "static-html-partial",
+			metadata: {
+				...(httpResult.metadata ?? {}),
+				extractionWarning: httpResult.error,
+				provenance: "Static HTML metadata and same-origin route evidence; JavaScript was not executed",
+			},
+		}, "static-html-partial", fallbackPath);
 	}
 
 	const guidance = [
@@ -395,28 +426,6 @@ export async function extractContent(
 		throw err;
 	});
 	return shapeExtractedContent(withRawCacheMetadata(cached.value, cached.cacheHit, cached.cacheAgeMs, cached.shared), options);
-}
-
-function isLikelyJSRendered(html: string): boolean {
-	// Extract body content
-	const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-	if (!bodyMatch) return false;
-
-	const bodyHtml = bodyMatch[1];
-
-	// Strip tags to get text content
-	const textContent = bodyHtml
-		.replace(/<script[\s\S]*?<\/script>/gi, "")
-		.replace(/<style[\s\S]*?<\/style>/gi, "")
-		.replace(/<[^>]+>/g, "")
-		.replace(/\s+/g, " ")
-		.trim();
-
-	// Count scripts
-	const scriptCount = (html.match(/<script/gi) || []).length;
-
-	// Heuristic: little text content but many scripts suggests JS rendering
-	return textContent.length < 500 && scriptCount > 3;
 }
 
 async function extractViaHttp(
@@ -535,14 +544,17 @@ async function extractViaHttp(
 		if (!article) {
 			activityMonitor.logComplete(activityId, response.status);
 			const jsRendered = isLikelyJSRendered(text);
+			const warning = jsRendered
+				? "Page appears to be JavaScript-rendered (content loads dynamically)"
+				: "Could not extract readable content from HTML structure";
+			const partial = extractStaticHtmlPartial(text, fetchedUrl, warning);
 			return {
 				url,
-				title: "",
-				content: "",
-				error: jsRendered
-					? "Page appears to be JavaScript-rendered (content loads dynamically)"
-					: "Could not extract readable content from HTML structure",
+				title: partial.title,
+				content: partial.content,
+				error: warning,
 				...httpMeta,
+				metadata: partial.metadata,
 				method: jsRendered ? "js-rendered" : "readability-failed",
 			};
 		}
@@ -551,14 +563,17 @@ async function extractViaHttp(
 		activityMonitor.logComplete(activityId, response.status);
 		if (markdown.length < MIN_USEFUL_CONTENT) {
 			const incompleteJsRendered = isLikelyJSRendered(text);
+			const warning = incompleteJsRendered
+				? "Page appears to be JavaScript-rendered (content loads dynamically)"
+				: "Extracted content appears incomplete";
+			const partial = extractStaticHtmlPartial(text, fetchedUrl, warning);
 			return {
 				url,
-				title: article.title || "",
-				content: markdown,
-				error: incompleteJsRendered
-					? "Page appears to be JavaScript-rendered (content loads dynamically)"
-					: "Extracted content appears incomplete",
+				title: partial.title || article.title || "",
+				content: partial.content,
+				error: warning,
 				...httpMeta,
+				metadata: partial.metadata,
 				method: incompleteJsRendered ? "js-rendered" : "readability-incomplete",
 			};
 		}

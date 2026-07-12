@@ -1,6 +1,6 @@
 {
   "name": "pi-web-access",
-  "version": "0.13.1",
+  "version": "0.14.0",
   "description": "Keyless local-first web research via self-hosted SearXNG, docs/API search, GitHub examples, URL fetching, PDF extraction, and scholarly research for Pi coding agent",
   "type": "module",
   "scripts": {
@@ -21,6 +21,9 @@
   ],
   "author": "Nico Bailon",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/feveromo/pi-web-access.git"
@@ -38,11 +41,12 @@
     "LICENSE"
   ],
   "dependencies": {
-    "@mozilla/readability": "^0.6.0",
-    "linkedom": "^0.16.0",
-    "p-limit": "^6.1.0",
-    "turndown": "^7.2.0",
-    "unpdf": "^1.6.2"
+    "@mozilla/readability": "0.6.0",
+    "linkedom": "0.18.12",
+    "p-limit": "7.3.0",
+    "turndown": "7.2.4",
+    "undici": "7.28.0",
+    "unpdf": "1.6.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

@@ -7,8 +7,10 @@
 
 import { getResolvedPDFJS } from "unpdf";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
+import { isManagedCacheRoot, pruneManagedEntries } from "./managed-cache.js";
 
 export interface PDFExtractResult {
   title: string;
@@ -28,7 +30,10 @@ export interface PDFExtractOptions {
 
 const DEFAULT_MAX_PAGES = 100;
 const DEFAULT_MAX_CHARS = 2_000_000;
-const DEFAULT_OUTPUT_DIR = join(homedir(), "Downloads");
+const DEFAULT_OUTPUT_DIR = join(homedir(), ".pi", "web-access", "pdf-cache");
+const PDF_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const PDF_CACHE_MAX_FILES = 100;
+const PDF_CACHE_MAX_BYTES = 250 * 1024 * 1024;
 const DESTROY_TIMEOUT_MS = 1000;
 
 type Destroyable = { destroy(): Promise<unknown> };
@@ -78,10 +83,12 @@ export async function extractPDFToMarkdown(
   const {
     maxPages = DEFAULT_MAX_PAGES,
     maxChars = DEFAULT_MAX_CHARS,
-    outputDir = DEFAULT_OUTPUT_DIR,
     filename,
     signal,
   } = options;
+  const environmentOutputDir = process.env.PI_WEB_ACCESS_PDF_OUTPUT_DIR?.trim() || undefined;
+  const outputDir = options.outputDir ?? environmentOutputDir ?? DEFAULT_OUTPUT_DIR;
+  const manageOutput = options.outputDir === undefined && !environmentOutputDir;
   const safeMaxPages = Number.isFinite(maxPages)
     ? Math.max(1, Math.floor(maxPages))
     : DEFAULT_MAX_PAGES;
@@ -167,13 +174,55 @@ export async function extractPDFToMarkdown(
       : uncappedContent;
     const preferredName = basename(filename || `${sanitizeFilename(title)}.md`);
     signal?.throwIfAborted();
+    if (manageOutput && !isManagedCacheRoot(outputDir, DEFAULT_OUTPUT_DIR)) {
+      throw new Error(`Refusing to write through unsafe managed PDF cache root: ${outputDir}`);
+    }
     await mkdir(outputDir, { recursive: true });
+    if (manageOutput && !isManagedCacheRoot(outputDir, DEFAULT_OUTPUT_DIR)) {
+      throw new Error(`Refusing to write through unsafe managed PDF cache root: ${outputDir}`);
+    }
+    if (manageOutput) {
+      try { prunePDFCache(outputDir); } catch {}
+    }
     signal?.throwIfAborted();
     const outputPath = await writeWithoutOverwrite(outputDir, preferredName, content, signal);
+    if (manageOutput) {
+      try { prunePDFCache(outputDir, new Set([outputPath])); } catch {}
+    }
     return { title, pages: pdf.numPages, chars: content.length, outputPath, content };
   } finally {
     await destroyWithin(pdf ?? loadingTask);
   }
+}
+
+export function prunePDFCache(
+  outputDir: string,
+  protectedPaths: ReadonlySet<string> = new Set(),
+  limits: { maxAgeMs: number; maxFiles: number; maxBytes: number } = {
+    maxAgeMs: PDF_CACHE_MAX_AGE_MS,
+    maxFiles: PDF_CACHE_MAX_FILES,
+    maxBytes: PDF_CACHE_MAX_BYTES,
+  },
+  now = Date.now(),
+): string[] {
+  if (!existsSync(outputDir) || !isManagedCacheRoot(outputDir, outputDir)) return [];
+  const entries: { path: string; mtimeMs: number; sizeBytes: number }[] = [];
+  try {
+    for (const item of readdirSync(outputDir, { withFileTypes: true })) {
+      if (!item.isFile() || item.isSymbolicLink()) continue;
+      const path = join(outputDir, item.name);
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.isSymbolicLink()) continue;
+      entries.push({ path, mtimeMs: stat.mtimeMs, sizeBytes: stat.size });
+    }
+  } catch {
+    return [];
+  }
+  return pruneManagedEntries(outputDir, entries, {
+    maxAgeMs: limits.maxAgeMs,
+    maxEntries: limits.maxFiles,
+    maxBytes: limits.maxBytes,
+  }, protectedPaths, now);
 }
 
 async function writeWithoutOverwrite(outputDir: string, preferredName: string, content: string, signal?: AbortSignal): Promise<string> {

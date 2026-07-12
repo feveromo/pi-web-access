@@ -1,8 +1,10 @@
 import { lookup as dnsLookup } from "node:dns/promises";
 import net from "node:net";
+import { Agent } from "undici";
 
 const DEFAULT_MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const SENSITIVE_REDIRECT_HEADERS = ["authorization", "cookie", "proxy-authorization"];
 
 export type LookupAddress = { address: string; family: number };
 export type Lookup = (hostname: string) => Promise<LookupAddress[]>;
@@ -13,6 +15,12 @@ interface ValidationOptions {
 	signal?: AbortSignal;
 	/** Strict CIDRs exempted from private/special-use-address blocking. */
 	allowRanges?: string[];
+}
+
+interface ValidatedTarget {
+	url: URL;
+	hostname: string;
+	addresses: LookupAddress[];
 }
 
 interface ParsedCidr {
@@ -39,7 +47,7 @@ function waitForLookup(promise: Promise<LookupAddress[]>, signal?: AbortSignal):
 	});
 }
 
-export async function validateRemoteUrl(rawUrl: string | URL, options: ValidationOptions = {}): Promise<URL> {
+async function validateTarget(rawUrl: string | URL, options: ValidationOptions = {}): Promise<ValidatedTarget> {
 	const url = rawUrl instanceof URL ? rawUrl : new URL(rawUrl);
 	if (url.protocol !== "http:" && url.protocol !== "https:") {
 		throw new Error("Only HTTP and HTTPS URLs can be fetched remotely");
@@ -52,24 +60,41 @@ export async function validateRemoteUrl(rawUrl: string | URL, options: Validatio
 	}
 
 	const allowRanges = parseAllowRanges(options.allowRanges);
-	if (net.isIP(hostname)) {
+	const ipVersion = net.isIP(hostname);
+	if (ipVersion) {
 		assertPublicAddress(hostname, hostname, allowRanges);
-		return url;
+		return { url, hostname, addresses: [{ address: hostname, family: ipVersion }] };
 	}
 
-	let addresses: LookupAddress[];
+	let resolved: LookupAddress[];
 	try {
 		options.signal?.throwIfAborted();
 		const lookupPromise = (options.lookup ?? defaultLookup)(hostname);
-		addresses = await waitForLookup(lookupPromise, options.signal);
+		resolved = await waitForLookup(lookupPromise, options.signal);
 	} catch (err) {
 		if (options.signal?.aborted) throw options.signal.reason ?? err;
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to resolve ${hostname}: ${message}`);
 	}
-	if (addresses.length === 0) throw new Error(`Failed to resolve ${hostname}: no addresses returned`);
-	for (const { address } of addresses) assertPublicAddress(address, hostname, allowRanges);
-	return url;
+	if (resolved.length === 0) throw new Error(`Failed to resolve ${hostname}: no addresses returned`);
+
+	const addresses: LookupAddress[] = [];
+	const seen = new Set<string>();
+	for (const { address } of resolved) {
+		assertPublicAddress(address, hostname, allowRanges);
+		const normalized = normalizeHostname(address);
+		const family = net.isIP(normalized);
+		const key = `${family}:${normalized}`;
+		if (!seen.has(key)) {
+			seen.add(key);
+			addresses.push({ address: normalized, family });
+		}
+	}
+	return { url, hostname, addresses };
+}
+
+export async function validateRemoteUrl(rawUrl: string | URL, options: ValidationOptions = {}): Promise<URL> {
+	return (await validateTarget(rawUrl, options)).url;
 }
 
 /** Validate an original URL before disclosing it to a third-party fetch service. */
@@ -80,6 +105,31 @@ export function validateThirdPartySourceUrl(
 	return validateRemoteUrl(rawUrl, { lookup: options.lookup, signal: options.signal });
 }
 
+/** A Node-compatible lookup that can return only the addresses validated for this request hop. */
+export function createPinnedLookup(target: { hostname: string; addresses: LookupAddress[] }) {
+	const expectedHostname = normalizeHostname(target.hostname);
+	const addresses = target.addresses.map(({ address, family }) => ({ address, family }));
+	return (hostname: string, options: unknown, callback?: (...args: unknown[]) => void): void => {
+		const cb = typeof options === "function" ? options as (...args: unknown[]) => void : callback;
+		if (!cb) throw new TypeError("lookup callback is required");
+		if (normalizeHostname(hostname) !== expectedHostname) {
+			cb(new Error(`Pinned DNS lookup rejected unexpected hostname: ${hostname}`));
+			return;
+		}
+		const lookupOptions = typeof options === "object" && options !== null ? options as { all?: boolean; family?: number } : {};
+		const requestedFamily = typeof options === "number" ? options : Number(lookupOptions.family ?? 0);
+		const matching = requestedFamily === 4 || requestedFamily === 6
+			? addresses.filter(item => item.family === requestedFamily)
+			: addresses;
+		if (matching.length === 0) {
+			cb(Object.assign(new Error(`No pinned address for ${hostname} with family ${requestedFamily}`), { code: "ENOTFOUND" }));
+			return;
+		}
+		if (lookupOptions.all) cb(null, matching.map(item => ({ ...item })));
+		else cb(null, matching[0].address, matching[0].family);
+	};
+}
+
 export async function fetchRemoteUrl(
 	url: string | URL,
 	init: RequestInit = {},
@@ -88,25 +138,102 @@ export async function fetchRemoteUrl(
 	const fetchImpl = options.fetch ?? fetch;
 	const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
 	const validationOptions = { ...options, signal: init.signal ?? options.signal };
-	let current = await validateRemoteUrl(url, validationOptions);
+	let target = await validateTarget(url, validationOptions);
 	let requestInit = init;
 
 	for (let redirects = 0; redirects <= maxRedirects; redirects++) {
-		const response = await fetchImpl(current, { ...requestInit, redirect: "manual" });
-		if (!REDIRECT_STATUSES.has(response.status)) return response;
+		const agent = new Agent({ connect: { lookup: createPinnedLookup(target) } });
+		let closed = false;
+		const closeAgent = () => {
+			if (closed) return;
+			closed = true;
+			void agent.close().catch(() => {});
+		};
+		const signal = requestInit.signal ?? options.signal;
+		const onAbort = () => closeAgent();
+		signal?.addEventListener("abort", onAbort, { once: true });
 
-		const location = response.headers.get("location");
-		if (!location) return response;
+		let response: Response;
+		try {
+			response = await fetchImpl(target.url, { ...requestInit, redirect: "manual", dispatcher: agent } as RequestInit);
+		} catch (error) {
+			signal?.removeEventListener("abort", onAbort);
+			closeAgent();
+			throw error;
+		}
+
+		if (!REDIRECT_STATUSES.has(response.status) || !response.headers.get("location")) {
+			return responseWithAgentLifecycle(response, closeAgent, () => signal?.removeEventListener("abort", onAbort));
+		}
+
+		const location = response.headers.get("location")!;
 		await response.body?.cancel().catch(() => {});
-		if (redirects === maxRedirects) throw new Error(`Too many redirects fetching ${current.toString()}`);
+		signal?.removeEventListener("abort", onAbort);
+		closeAgent();
+		if (redirects === maxRedirects) throw new Error(`Too many redirects fetching ${target.url.toString()}`);
 
-		current = await validateRemoteUrl(new URL(location, current), validationOptions);
+		const nextTarget = await validateTarget(new URL(location, target.url), validationOptions);
+		if (nextTarget.url.origin !== target.url.origin) requestInit = stripSensitiveHeaders(requestInit);
+		target = nextTarget;
 		if (response.status === 303 || ((response.status === 301 || response.status === 302) && requestInit.method?.toUpperCase() === "POST")) {
 			const { body: _body, ...nextInit } = requestInit;
 			requestInit = { ...nextInit, method: "GET" };
 		}
 	}
-	throw new Error(`Too many redirects fetching ${current.toString()}`);
+	throw new Error(`Too many redirects fetching ${target.url.toString()}`);
+}
+
+function stripSensitiveHeaders(init: RequestInit): RequestInit {
+	if (!init.headers) return init;
+	const headers = new Headers(init.headers);
+	for (const name of SENSITIVE_REDIRECT_HEADERS) headers.delete(name);
+	return { ...init, headers };
+}
+
+function responseWithAgentLifecycle(response: Response, close: () => void, cleanup: () => void): Response {
+	if (!response.body) {
+		cleanup();
+		close();
+		return response;
+	}
+	const reader = response.body.getReader();
+	let finalized = false;
+	const finalize = () => {
+		if (finalized) return;
+		finalized = true;
+		cleanup();
+		close();
+	};
+	const body = new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			try {
+				const result = await reader.read();
+				if (result.done) {
+					controller.close();
+					finalize();
+				} else controller.enqueue(result.value);
+			} catch (error) {
+				controller.error(error);
+				finalize();
+			}
+		},
+		async cancel(reason) {
+			try {
+				await reader.cancel(reason);
+			} finally {
+				finalize();
+			}
+		},
+	});
+	const wrapped = new Response(body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+	});
+	for (const property of ["url", "redirected", "type"] as const) {
+		Object.defineProperty(wrapped, property, { configurable: true, value: response[property] });
+	}
+	return wrapped;
 }
 
 function normalizeHostname(hostname: string): string {
