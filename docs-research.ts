@@ -1,7 +1,3 @@
-import { createHash } from "node:crypto";
-import { lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import pLimit from "p-limit";
@@ -53,19 +49,6 @@ interface CachedDiscovery {
 	links: DiscoveredDoc[];
 }
 
-interface CachedPage {
-	expiresAt: number;
-	page: DocsPage;
-	bytes: number;
-}
-
-interface SharedTask<T> {
-	controller: AbortController;
-	promise: Promise<T>;
-	waiters: number;
-	settled: boolean;
-}
-
 interface DocsCacheInfo {
 	hit: boolean;
 	storage: "memory" | "disk" | "fresh";
@@ -73,20 +56,6 @@ interface DocsCacheInfo {
 	discovery: { hit: boolean; shared: boolean; storage: "memory" | "disk" | "fresh" };
 	pages: { memoryHits: number; diskHits: number; sharedHits: number; misses: number; failures: number };
 	staleWarnings: string[];
-}
-
-interface DiskDiscovery extends CachedDiscovery {
-	version: number;
-	kind: "discovery";
-	savedAt: number;
-}
-
-interface DiskPage {
-	version: number;
-	kind: "page";
-	savedAt: number;
-	expiresAt: number;
-	page: DocsPage;
 }
 
 interface OpenApiEndpoint {
@@ -107,32 +76,20 @@ const DOCS_CACHE_TTL_MS = 7 * DAY_MS;
 const DOCS_CACHE_HARD_RETAIN_MS = 30 * DAY_MS;
 const OPENAPI_CACHE_TTL_MS = DAY_MS;
 const OPENAPI_CACHE_HARD_RETAIN_MS = 7 * DAY_MS;
-const DISCOVERY_CACHE_MAX = 30;
-const DISCOVERY_CACHE_MAX_BYTES = 1024 * 1024;
-const PAGE_CACHE_MAX = 200;
-const PAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
-const DOCS_CACHE_VERSION = 3;
-const DOCS_DISK_CACHE_MAX_FILES = 300;
-const DOCS_DISK_CACHE_MAX_BYTES = 40 * 1024 * 1024;
-// Disk quotas are eventual; avoid a synchronous directory scan on every docs request.
-const DOCS_DISK_PRUNE_WRITE_CADENCE = 100;
-const DOCS_CACHE_DIR = resolve(process.env.PI_WEB_ACCESS_DOCS_CACHE_DIR?.trim() || join(homedir(), ".pi", "web-access", "docs-cache"));
 const DEFAULT_MAX_PAGES = 40;
 const MAX_PAGES_CAP = 100;
 const DEFAULT_MAX_RESULTS = 6;
 const MAX_RESULTS_CAP = 25;
 const DEFAULT_MAX_CHARS = 450;
 const MAX_SNIPPET_CHARS = 1500;
+const MAX_DOCS_OUTPUT_CHARS = 50_000;
+const MAX_DOCS_ERROR_CHARS = 4_000;
 const DISCOVERY_LINK_CAP = 300;
 const REQUEST_TIMEOUT_MS = 25000;
 const MAX_DOCS_PAGE_BYTES = 2 * 1024 * 1024;
 const MAX_OPENAPI_BYTES = 20 * 1024 * 1024;
 const DEFAULT_OPENAPI_URL = "https://huggingface.co/.well-known/openapi.json";
 
-const discoveryCache = new Map<string, CachedDiscovery>();
-const pageCache = new Map<string, CachedPage>();
-const inFlightDiscovery = new Map<string, SharedTask<CachedDiscovery>>();
-const inFlightPages = new Map<string, SharedTask<DocsPage | null>>();
 const persistentDiscoveryCache = createPersistentCache({
 	namespace: "docs-discovery", freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS,
 	maxEntries: 100, maxBytes: 8 * 1024 * 1024, maxValueBytes: 1024 * 1024,
@@ -152,12 +109,6 @@ const persistentOpenApiCache = createPersistentCache({
 	maxEntries: 50, maxBytes: 64 * 1024 * 1024, maxValueBytes: MAX_OPENAPI_BYTES,
 	validate: isCachedOpenApi,
 });
-let discoveryCacheBytes = 0;
-let pageCacheBytes = 0;
-let lastDocsCachePrune = 0;
-let docsDiskWritesSincePrune = 0;
-let docsCachePrunePromise: Promise<void> | null = null;
-
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
 const fetchLimit = pLimit(5);
 
@@ -179,7 +130,12 @@ function errorMessage(err: unknown): string {
 function normalizeSource(input: string): URL {
 	const trimmed = input.trim();
 	if (!trimmed) throw new Error("No docs source provided.");
-	const source = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+	let source: URL;
+	try {
+		source = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+	} catch {
+		throw new Error("Invalid docs source URL.");
+	}
 	if (source.protocol !== "http:" && source.protocol !== "https:") throw new Error("Docs source must use HTTP or HTTPS.");
 	source.hash = "";
 	if (source.pathname !== "/" && !/\/llms(?:-full)?\.txt$/i.test(source.pathname)) {
@@ -217,9 +173,15 @@ function truncate(text: string, max = DEFAULT_MAX_CHARS): string {
 	return normalized.length > max ? `${normalized.slice(0, max).trimEnd()}…` : normalized;
 }
 
-function docsDiskCacheFile(kind: "discovery" | "page", key: string): string {
-	const digest = createHash("sha256").update(`${kind}:${key}`).digest("hex");
-	return join(DOCS_CACHE_DIR, `${kind}-${digest}.json`);
+function capDocsOutput(text: string): { text: string; truncated: boolean; originalChars: number } {
+	if (text.length <= MAX_DOCS_OUTPUT_CHARS) return { text, truncated: false, originalChars: text.length };
+	const marker = "\n\n[Docs search output capped; use a narrower query or fetch_content on a selected result URL.]";
+	const bodyLimit = Math.max(0, MAX_DOCS_OUTPUT_CHARS - marker.length);
+	return {
+		text: `${text.slice(0, bodyLimit).trimEnd()}${marker}`,
+		truncated: true,
+		originalChars: text.length,
+	};
 }
 
 function isDocsPage(value: unknown): value is DocsPage {
@@ -267,207 +229,8 @@ function isCachedOpenApi(value: unknown): boolean {
 	});
 }
 
-function isDiskDiscovery(value: unknown): value is DiskDiscovery {
-	if (!value || typeof value !== "object") return false;
-	const data = value as Record<string, unknown>;
-	return data.version === DOCS_CACHE_VERSION && data.kind === "discovery"
-		&& typeof data.expiresAt === "number" && typeof data.savedAt === "number"
-		&& typeof data.source === "string"
-		&& (data.mode === "auto" || data.mode === "llms" || data.mode === "crawl")
-		&& Array.isArray(data.links) && data.links.every(isDiscoveredDoc);
-}
-
-function isDiskPage(value: unknown): value is DiskPage {
-	if (!value || typeof value !== "object") return false;
-	const data = value as Record<string, unknown>;
-	return data.version === DOCS_CACHE_VERSION && data.kind === "page"
-		&& typeof data.expiresAt === "number" && typeof data.savedAt === "number"
-		&& isDocsPage(data.page);
-}
-
-function byteLength(value: unknown): number {
-	try { return Buffer.byteLength(JSON.stringify(value), "utf8"); }
-	catch { return 0; }
-}
-
-function pruneMemoryCaches(now = Date.now()): void {
-	for (const [key, value] of discoveryCache) {
-		if (value.expiresAt > now) continue;
-		discoveryCache.delete(key);
-		discoveryCacheBytes -= byteLength(value);
-	}
-	while (discoveryCache.size > DISCOVERY_CACHE_MAX || discoveryCacheBytes > DISCOVERY_CACHE_MAX_BYTES) {
-		const key = discoveryCache.keys().next().value as string | undefined;
-		if (!key) break;
-		const value = discoveryCache.get(key);
-		discoveryCache.delete(key);
-		discoveryCacheBytes -= value ? byteLength(value) : 0;
-	}
-	for (const [key, value] of pageCache) {
-		if (value.expiresAt > now) continue;
-		pageCache.delete(key);
-		pageCacheBytes -= value.bytes;
-	}
-	while (pageCache.size > PAGE_CACHE_MAX || pageCacheBytes > PAGE_CACHE_MAX_BYTES) {
-		const key = pageCache.keys().next().value as string | undefined;
-		if (!key) break;
-		const value = pageCache.get(key);
-		pageCache.delete(key);
-		pageCacheBytes -= value?.bytes ?? 0;
-	}
-}
-
-async function safeLegacyDocsRoot(create = false): Promise<boolean> {
-	try {
-		if (create) {
-			let ancestor = DOCS_CACHE_DIR;
-			while (true) {
-				try { await lstat(ancestor); break; } catch {
-					const parent = dirname(ancestor);
-					if (parent === ancestor) return false;
-					ancestor = parent;
-				}
-			}
-			const ancestorStat = await lstat(ancestor);
-			if (ancestorStat.isSymbolicLink() || await realpath(ancestor) !== resolve(ancestor)) return false;
-			await mkdir(DOCS_CACHE_DIR, { recursive: true, mode: 0o700 });
-		}
-		const info = await lstat(DOCS_CACHE_DIR);
-		return info.isDirectory() && !info.isSymbolicLink() && await realpath(DOCS_CACHE_DIR) === DOCS_CACHE_DIR;
-	} catch { return false; }
-}
-
-const OWNED_DOCS_CACHE_FILE = /^(?:discovery|page)-[a-f0-9]{64}\.json$/;
-const OWNED_DOCS_TEMP_FILE = /^(?:discovery|page)-[a-f0-9]{64}\.json\.\d+\.[a-z0-9]+\.tmp$/;
-
-async function runDocsDiskPrune(now: number): Promise<void> {
-	if (!await safeLegacyDocsRoot(false)) return;
-	try {
-		const entries: Array<{ path: string; bytes: number; mtimeMs: number }> = [];
-		for (const file of await readdir(DOCS_CACHE_DIR)) {
-			const path = join(DOCS_CACHE_DIR, file);
-			if (OWNED_DOCS_TEMP_FILE.test(file)) {
-				await rm(path, { force: true }).catch(() => {});
-				continue;
-			}
-			if (!OWNED_DOCS_CACHE_FILE.test(file)) continue;
-			try {
-				const fileStat = await stat(path);
-				if (fileStat.isFile()) entries.push({ path, bytes: fileStat.size, mtimeMs: fileStat.mtimeMs });
-			} catch {
-			}
-		}
-		entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
-		let files = 0;
-		let bytes = 0;
-		for (const entry of entries) {
-			const expired = now - entry.mtimeMs > DOCS_CACHE_TTL_MS * 2;
-			if (expired || files >= DOCS_DISK_CACHE_MAX_FILES || bytes + entry.bytes > DOCS_DISK_CACHE_MAX_BYTES) {
-				await rm(entry.path, { force: true }).catch(() => {});
-				continue;
-			}
-			files++;
-			bytes += entry.bytes;
-		}
-	} catch {
-		// Cache maintenance is failure-open, including a missing cache directory.
-	}
-}
-
-async function pruneDocsDiskCache(force = false): Promise<void> {
-	const now = Date.now();
-	if (!force && now - lastDocsCachePrune < 60 * 60 * 1000) return;
-	if (docsCachePrunePromise) return docsCachePrunePromise;
-	lastDocsCachePrune = now;
-	docsDiskWritesSincePrune = 0;
-	docsCachePrunePromise = runDocsDiskPrune(now).finally(() => { docsCachePrunePromise = null; });
-	return docsCachePrunePromise;
-}
-
-async function removeDiskValue(kind: "discovery" | "page", key: string): Promise<void> {
-	if (!await safeLegacyDocsRoot(false)) return;
-	await rm(docsDiskCacheFile(kind, key), { force: true }).catch(() => {});
-}
-
-async function readDiskValue(kind: "discovery" | "page", key: string): Promise<unknown | null> {
-	if (!await safeLegacyDocsRoot(false)) return null;
-	try {
-		const path = docsDiskCacheFile(kind, key);
-		const value = JSON.parse(await readFile(path, "utf8")) as unknown;
-		const expiresAt = (value as { expiresAt?: unknown })?.expiresAt;
-		if (typeof expiresAt !== "number" || expiresAt <= Date.now()) {
-			await rm(path, { force: true }).catch(() => {});
-			return null;
-		}
-		const now = new Date();
-		await utimes(path, now, now).catch(() => {});
-		return value;
-	} catch {
-		return null;
-	}
-}
-
-async function writeDiskValue(kind: "discovery" | "page", key: string, value: DiskDiscovery | DiskPage): Promise<void> {
-	let temp: string | undefined;
-	try {
-		if (!await safeLegacyDocsRoot(true)) return;
-		const body = JSON.stringify(value);
-		if (Buffer.byteLength(body, "utf8") > MAX_DOCS_PAGE_BYTES + 64 * 1024) return;
-		await mkdir(DOCS_CACHE_DIR, { recursive: true });
-		const path = docsDiskCacheFile(kind, key);
-		temp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-		await writeFile(temp, body, "utf8");
-		await rename(temp, path);
-		temp = undefined;
-		docsDiskWritesSincePrune++;
-		if (docsDiskWritesSincePrune >= DOCS_DISK_PRUNE_WRITE_CADENCE) await pruneDocsDiskCache(true);
-	} catch {
-		if (temp) await rm(temp, { force: true }).catch(() => {});
-	}
-}
-
-function putDiscovery(key: string, value: CachedDiscovery): void {
-	const existing = discoveryCache.get(key);
-	if (existing) discoveryCacheBytes -= byteLength(existing);
-	discoveryCache.delete(key);
-	discoveryCache.set(key, value);
-	discoveryCacheBytes += byteLength(value);
-	pruneMemoryCaches();
-}
-
-function putPage(key: string, page: DocsPage, expiresAt: number): void {
-	let bytes = byteLength({ expiresAt, page, bytes: 0 });
-	bytes = byteLength({ expiresAt, page, bytes });
-	if (bytes > PAGE_CACHE_MAX_BYTES) return;
-	const existing = pageCache.get(key);
-	if (existing) pageCacheBytes -= existing.bytes;
-	pageCache.delete(key);
-	pageCache.set(key, { expiresAt, page, bytes });
-	pageCacheBytes += bytes;
-	pruneMemoryCaches();
-}
-
 function abortReason(signal: AbortSignal): unknown {
 	return signal.reason ?? new DOMException("Aborted", "AbortError");
-}
-
-async function waitForTask<T>(task: SharedTask<T>, signal: AbortSignal | undefined, removeIfCurrent: () => void): Promise<T> {
-	signal?.throwIfAborted();
-	task.waiters++;
-	try {
-		if (!signal) return await task.promise;
-		return await new Promise<T>((resolve, reject) => {
-			const onAbort = () => reject(abortReason(signal));
-			signal.addEventListener("abort", onAbort, { once: true });
-			task.promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
-		});
-	} finally {
-		task.waiters--;
-		if (task.waiters === 0 && !task.settled) {
-			removeIfCurrent();
-			task.controller.abort();
-		}
-	}
 }
 
 interface DocsRequestOptions {
@@ -498,7 +261,11 @@ async function fetchText(url: string, signal?: AbortSignal, options?: DocsReques
 
 function isLikelyMarkdown(url: string, contentType: string, text: string): boolean {
 	if (/markdown|text\/plain/i.test(contentType)) return true;
-	if (/\.(md|mdx|txt)$/i.test(new URL(url).pathname)) return true;
+	try {
+		if (/\.(md|mdx|txt)$/i.test(new URL(url).pathname)) return true;
+	} catch {
+		// A malformed final response URL does not change the content-based fallback.
+	}
 	return /^#\s|\n#{1,3}\s|\[[^\]]+\]\([^)]+\)/.test(text.slice(0, 2000));
 }
 
@@ -525,6 +292,7 @@ function markdownLinks(markdown: string, base: URL): Array<{ title: string; url:
 			seen.add(key);
 			links.push({ title: textContent(title) || titleFromUrl(key), url: key });
 		} catch {
+			return;
 		}
 	};
 	for (const match of markdown.matchAll(/\[([^\]]{1,160})\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g)) {
@@ -586,6 +354,7 @@ function markdownCandidate(url: string): string | null {
 			return `${parsed.toString().replace(/\/$/, "")}.md`;
 		}
 	} catch {
+		return null;
 	}
 	return null;
 }
@@ -638,9 +407,13 @@ function selectDiscoveredLinks(items: Array<{ title: string; url: string }>, que
 async function fetchRoot(source: URL, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ text: string; root: URL }> {
 	const candidates = [source.toString()];
 	if (source.pathname !== "/" && !source.pathname.endsWith("/")) {
-		const withSlash = new URL(source);
-		withSlash.pathname += "/";
-		candidates.push(withSlash.toString());
+		try {
+			const withSlash = new URL(source);
+			withSlash.pathname += "/";
+			candidates.push(withSlash.toString());
+		} catch {
+			throw new Error(`Invalid docs root ${source.toString()}`);
+		}
 	}
 	let lastError: unknown;
 	for (const candidate of candidates) {
@@ -700,124 +473,32 @@ function canonicalPageKey(rawUrl: string): string | null {
 
 async function getDiscovery(source: URL, mode: DocsSearchMode, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ value: CachedDiscovery; storage: "memory" | "disk" | "fresh"; shared: boolean; warning?: string }> {
 	await validateRemoteUrl(source, { ...remoteOptions(options), signal: requestSignal(signal) });
-	{
-		const key = discoveryKey(source, mode);
-		// Legacy docs-cache files are ignored. No operation touches the legacy root.
-		const cached = await persistentDiscoveryCache.get(key, async sharedSignal => ({
-			value: { expiresAt: Date.now() + DOCS_CACHE_TTL_MS, source: source.toString(), mode, links: await discoverDocsPages(source, mode, sharedSignal, options) },
-			freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS,
-		}), { signal, freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS });
-		const storage = cached.metadata.storage === "memory" ? "memory" : cached.metadata.storage === "disk" ? "disk" : "fresh";
-		return { value: cached.value, storage, shared: cached.metadata.shared, ...(cached.metadata.warning ? { warning: cached.metadata.warning } : {}) };
-	}
-	pruneMemoryCaches();
 	const key = discoveryKey(source, mode);
-	const memory = discoveryCache.get(key);
-	if (memory && memory.expiresAt > Date.now()) {
-		discoveryCache.delete(key);
-		discoveryCache.set(key, memory);
-		return { value: memory, storage: "memory", shared: false };
-	}
-	const disk = await readDiskValue("discovery", key);
-	if (isDiskDiscovery(disk)) {
-		const value: CachedDiscovery = { expiresAt: disk.expiresAt, source: disk.source, mode: disk.mode, links: disk.links };
-		putDiscovery(key, value);
-		return { value, storage: "disk", shared: false };
-	}
-	if (disk !== null) await removeDiskValue("discovery", key);
-	let task = inFlightDiscovery.get(key);
-	const shared = !!task;
-	if (!task) {
-		const controller = new AbortController();
-		task = { controller, waiters: 0, settled: false, promise: Promise.resolve(null as never) };
-		const current = task;
-		task.promise = discoverDocsPages(source, mode, controller.signal, options)
-			.then(async links => {
-				controller.signal.throwIfAborted();
-				const value: CachedDiscovery = { expiresAt: Date.now() + DOCS_CACHE_TTL_MS, source: source.toString(), mode, links };
-				putDiscovery(key, value);
-				await writeDiskValue("discovery", key, { version: DOCS_CACHE_VERSION, kind: "discovery", savedAt: Date.now(), ...value });
-				return value;
-			})
-			.finally(() => {
-				current.settled = true;
-				if (inFlightDiscovery.get(key) === current) inFlightDiscovery.delete(key);
-			});
-		task.promise.catch(() => {});
-		inFlightDiscovery.set(key, task);
-	}
-	const current = task;
-	return {
-		value: await waitForTask(task, signal, () => {
-			if (inFlightDiscovery.get(key) === current) inFlightDiscovery.delete(key);
-		}),
-		storage: "fresh",
-		shared,
-	};
+	// Legacy docs-cache files are ignored. No operation touches the legacy root.
+	const cached = await persistentDiscoveryCache.get(key, async (sharedSignal: AbortSignal) => ({
+		value: { expiresAt: Date.now() + DOCS_CACHE_TTL_MS, source: source.toString(), mode, links: await discoverDocsPages(source, mode, sharedSignal, options) },
+		freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS,
+	}), { signal, freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS });
+	const storage = cached.metadata.storage === "memory" ? "memory" : cached.metadata.storage === "disk" ? "disk" : "fresh";
+	return { value: cached.value, storage, shared: cached.metadata.shared, ...(cached.metadata.warning ? { warning: cached.metadata.warning } : {}) };
 }
 
 async function getCachedPage(item: DiscoveredDoc, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ page: DocsPage | null; storage: "memory" | "disk" | "fresh" | "shared"; warning?: string }> {
 	await validateRemoteUrl(item.url, { ...remoteOptions(options), signal: requestSignal(signal) });
-	{
-		const key = canonicalPageKey(item.url);
-		if (!key) return { page: null, storage: "fresh" };
-		try {
-			const cached = await persistentPageCache.get(key, async sharedSignal => {
-				const page = await fetchLimit(() => fetchDocsPage(item, sharedSignal, options));
-				if (!page) throw new Error("Documentation page contained no usable content");
-				return { value: page, freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS };
-			}, { signal, freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS });
-			const storage = cached.metadata.shared ? "shared" : cached.metadata.storage === "memory" ? "memory" : cached.metadata.storage === "disk" ? "disk" : "fresh";
-			return { page: cached.value, storage, ...(cached.metadata.warning ? { warning: cached.metadata.warning } : {}) };
-		} catch (err) {
-			if (signal?.aborted) throw err;
-			return { page: null, storage: "fresh" };
-		}
-	}
-	pruneMemoryCaches();
 	const key = canonicalPageKey(item.url);
 	if (!key) return { page: null, storage: "fresh" };
-	const memory = pageCache.get(key);
-	if (memory && memory.expiresAt > Date.now()) {
-		pageCache.delete(key);
-		pageCache.set(key, memory);
-		return { page: memory.page, storage: "memory" };
+	try {
+		const cached = await persistentPageCache.get(key, async (sharedSignal: AbortSignal) => {
+			const page = await fetchLimit(() => fetchDocsPage(item, sharedSignal, options));
+			if (!page) throw new Error("Documentation page contained no usable content");
+			return { value: page, freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS };
+		}, { signal, freshMs: DOCS_CACHE_TTL_MS, staleMs: DOCS_CACHE_HARD_RETAIN_MS });
+		const storage = cached.metadata.shared ? "shared" : cached.metadata.storage === "memory" ? "memory" : cached.metadata.storage === "disk" ? "disk" : "fresh";
+		return { page: cached.value, storage, ...(cached.metadata.warning ? { warning: cached.metadata.warning } : {}) };
+	} catch (err) {
+		if (signal?.aborted) throw err;
+		return { page: null, storage: "fresh" };
 	}
-	const disk = await readDiskValue("page", key);
-	if (isDiskPage(disk)) {
-		putPage(key, disk.page, disk.expiresAt);
-		return { page: disk.page, storage: "disk" };
-	}
-	if (disk !== null) await removeDiskValue("page", key);
-	let task = inFlightPages.get(key);
-	const shared = !!task;
-	if (!task) {
-		const controller = new AbortController();
-		task = { controller, waiters: 0, settled: false, promise: Promise.resolve(null) };
-		const current = task;
-		task.promise = fetchLimit(() => fetchDocsPage(item, controller.signal, options))
-			.then(async page => {
-				controller.signal.throwIfAborted();
-				if (!page) return null;
-				const expiresAt = Date.now() + DOCS_CACHE_TTL_MS;
-				putPage(key, page, expiresAt);
-				await writeDiskValue("page", key, { version: DOCS_CACHE_VERSION, kind: "page", savedAt: Date.now(), expiresAt, page });
-				return page;
-			})
-			.finally(() => {
-				current.settled = true;
-				if (inFlightPages.get(key) === current) inFlightPages.delete(key);
-			});
-		task.promise.catch(() => {});
-		inFlightPages.set(key, task);
-	}
-	const current = task;
-	return {
-		page: await waitForTask(task, signal, () => {
-			if (inFlightPages.get(key) === current) inFlightPages.delete(key);
-		}),
-		storage: shared ? "shared" : "fresh",
-	};
 }
 
 async function getDocsPages(params: DocsSearchParams, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ pages: DocsPage[]; source: URL; mode: DocsSearchMode; cache: DocsCacheInfo }> {
@@ -858,7 +539,10 @@ async function getDocsPages(params: DocsSearchParams, signal?: AbortSignal, opti
 
 function tokenize(value: string): string[] {
 	const stop = new Set(["about", "after", "also", "and", "are", "can", "for", "from", "how", "into", "not", "that", "the", "this", "with", "your"]);
-	return (value.toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) ?? []).filter(t => !stop.has(t));
+	const tokens = (value.toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) ?? [])
+		.filter(token => !stop.has(token))
+		.map(token => token.slice(0, 128));
+	return [...new Set(tokens)].slice(0, 64);
 }
 
 function scorePage(page: DocsPage, query: string): number {
@@ -921,10 +605,13 @@ export async function executeDocsSearch(params: DocsSearchParams, signal?: Abort
 			lines.push(snippetForPage(page, query, maxCharacters), "");
 		}
 		if (ranked.length > 0) lines.push("Use `fetch_content` on a result URL for the full page, or call `docs_search` with a narrower query.");
+		const output = capDocsOutput(lines.join("\n"));
 		return {
-			content: [{ type: "text", text: lines.join("\n") }],
+			content: [{ type: "text", text: output.text }],
 			details: {
 				source: source.toString(), mode, query, pagesIndexed: pages.length, count: ranked.length,
+				outputTruncated: output.truncated,
+				originalOutputChars: output.originalChars,
 				cacheHit: cache.hit,
 				cacheStorage: cache.storage,
 				cacheExpiresAt: new Date(cache.expiresAt).toISOString(),
@@ -936,13 +623,14 @@ export async function executeDocsSearch(params: DocsSearchParams, signal?: Abort
 			},
 		};
 	} catch (err) {
-		const message = errorMessage(err);
+		const message = truncate(errorMessage(err), MAX_DOCS_ERROR_CHARS);
 		return { content: [{ type: "text", text: `Docs search failed: ${message}` }], details: { error: message, source: params.source } };
 	}
 }
 
 async function loadOpenApiFresh(url: string, signal?: AbortSignal, options?: DocsRequestOptions): Promise<{ endpoints: OpenApiEndpoint[]; tags: string[] }> {
-	const normalized = normalizeSource(url).toString();
+	const normalizedSource = normalizeSource(url);
+	const normalized = normalizedSource.toString();
 	await validateRemoteUrl(normalized, { ...remoteOptions(options), signal: requestSignal(signal) });
 	const res = await fetchRemoteUrl(normalized, { headers: { "Accept": "application/json", "User-Agent": "pi-web-access/0.10" }, signal: requestSignal(signal) }, remoteOptions(options));
 	if (!res.ok) {
@@ -950,9 +638,9 @@ async function loadOpenApiFresh(url: string, signal?: AbortSignal, options?: Doc
 		error.status = res.status;
 		throw error;
 	}
-	const spec = await readResponseJson<Record<string, unknown>>(res, MAX_OPENAPI_BYTES);
+	const spec = await readResponseJson(res, MAX_OPENAPI_BYTES) as Record<string, unknown>;
 	const servers = Array.isArray(spec.servers) ? spec.servers as Array<Record<string, unknown>> : [];
-	const baseUrl = typeof servers[0]?.url === "string" ? servers[0].url : new URL(normalized).origin;
+	const baseUrl = typeof servers[0]?.url === "string" ? servers[0].url : normalizedSource.origin;
 	const endpoints: OpenApiEndpoint[] = [];
 	const paths = spec.paths && typeof spec.paths === "object" ? spec.paths as Record<string, Record<string, unknown>> : {};
 	for (const [path, pathItem] of Object.entries(paths)) {
@@ -984,7 +672,7 @@ async function fetchOpenApi(url: string, signal?: AbortSignal, options?: DocsReq
 	const normalized = normalizeSource(url).toString();
 	// Validate the current DNS answer before any warm disk or memory lookup.
 	await validateRemoteUrl(normalized, { ...remoteOptions(options), signal: requestSignal(signal) });
-	const cached = await persistentOpenApiCache.get(normalized, async sharedSignal => ({
+	const cached = await persistentOpenApiCache.get(normalized, async (sharedSignal: AbortSignal) => ({
 		value: await loadOpenApiFresh(normalized, sharedSignal, options),
 		freshMs: OPENAPI_CACHE_TTL_MS,
 		staleMs: OPENAPI_CACHE_HARD_RETAIN_MS,

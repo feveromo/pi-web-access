@@ -1,5 +1,5 @@
 import { lookup as dnsLookup } from "node:dns/promises";
-import net from "node:net";
+import net, { type LookupFunction } from "node:net";
 import { Agent } from "undici";
 
 const DEFAULT_MAX_REDIRECTS = 5;
@@ -106,27 +106,24 @@ export function validateThirdPartySourceUrl(
 }
 
 /** A Node-compatible lookup that can return only the addresses validated for this request hop. */
-export function createPinnedLookup(target: { hostname: string; addresses: LookupAddress[] }) {
+export function createPinnedLookup(target: { hostname: string; addresses: LookupAddress[] }): LookupFunction {
 	const expectedHostname = normalizeHostname(target.hostname);
 	const addresses = target.addresses.map(({ address, family }) => ({ address, family }));
-	return (hostname: string, options: unknown, callback?: (...args: unknown[]) => void): void => {
-		const cb = typeof options === "function" ? options as (...args: unknown[]) => void : callback;
-		if (!cb) throw new TypeError("lookup callback is required");
+	return (hostname, options, callback): void => {
 		if (normalizeHostname(hostname) !== expectedHostname) {
-			cb(new Error(`Pinned DNS lookup rejected unexpected hostname: ${hostname}`));
+			callback(new Error(`Pinned DNS lookup rejected unexpected hostname: ${hostname}`), options.all ? [] : "");
 			return;
 		}
-		const lookupOptions = typeof options === "object" && options !== null ? options as { all?: boolean; family?: number } : {};
-		const requestedFamily = typeof options === "number" ? options : Number(lookupOptions.family ?? 0);
+		const requestedFamily = Number(options.family ?? 0);
 		const matching = requestedFamily === 4 || requestedFamily === 6
 			? addresses.filter(item => item.family === requestedFamily)
 			: addresses;
 		if (matching.length === 0) {
-			cb(Object.assign(new Error(`No pinned address for ${hostname} with family ${requestedFamily}`), { code: "ENOTFOUND" }));
+			callback(Object.assign(new Error(`No pinned address for ${hostname} with family ${requestedFamily}`), { code: "ENOTFOUND" }), options.all ? [] : "");
 			return;
 		}
-		if (lookupOptions.all) cb(null, matching.map(item => ({ ...item })));
-		else cb(null, matching[0].address, matching[0].family);
+		if (options.all) callback(null, matching.map(item => ({ ...item })));
+		else callback(null, matching[0].address, matching[0].family);
 	};
 }
 

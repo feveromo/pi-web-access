@@ -34,7 +34,8 @@ test("package stays lean and Pi-native", () => {
     linkedom: "0.18.12",
     "p-limit": "7.3.0",
     turndown: "7.2.4",
-    undici: "7.28.0",
+    typebox: "^1.1.38",
+    undici: "7.29.0",
     unpdf: "1.6.2",
   });
 
@@ -42,7 +43,6 @@ test("package stays lean and Pi-native", () => {
     "@earendil-works/pi-ai",
     "@earendil-works/pi-coding-agent",
     "@earendil-works/pi-tui",
-    "typebox",
   ]) {
     assert.equal(pkg.peerDependencies?.[dep], "*");
     assert.equal(pkg.dependencies?.[dep], undefined);
