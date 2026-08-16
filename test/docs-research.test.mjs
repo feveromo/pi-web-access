@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -111,6 +111,85 @@ test("docs_search defaults to compact result counts and snippets", async () => {
 
     assert.equal(result.details.count, 6);
     assert.ok(result.content[0].text.length < 7000, `unexpectedly large docs output: ${result.content[0].text.length}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("docs_search hard-caps pathological aggregate output", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const links = Array.from(
+      { length: 25 },
+      (_, i) => `- [Page ${i + 1}](/page-${i + 1}-${"u".repeat(600)})`,
+    ).join("\n");
+    globalThis.fetch = async (url) => {
+      const href = String(url);
+      if (href === "https://docs.output-cap/llms.txt") {
+        return textResponse(`# Docs\n\n${links}`);
+      }
+      if (href.startsWith("https://docs.output-cap/page-")) {
+        return textResponse(`# Page\n\nneedle ${"x".repeat(2_000)}`);
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    };
+
+    const { executeDocsSearch } = await import(`../docs-research.ts?output-cap=${Date.now()}`);
+    const result = await executeDocsSearch({
+      source: "https://docs.output-cap",
+      query: "needle",
+      maxPages: 25,
+      maxResults: 25,
+      maxCharacters: 1_500,
+    });
+
+    assert.ok(result.content[0].text.length <= 50_000);
+    assert.match(result.content[0].text, /Docs search output capped/);
+    assert.equal(result.details.outputTruncated, true);
+    assert.ok(result.details.originalOutputChars > 50_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("docs_search bounds oversized query tokens without regex failure", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url) => {
+      const href = String(url);
+      if (href === "https://docs.query-cap/llms.txt") return textResponse("# Docs\n\n- [Page](/page)");
+      if (href === "https://docs.query-cap/page") return textResponse("# Page\n\nneedle documentation content");
+      throw new Error(`unexpected fetch ${href}`);
+    };
+
+    const { executeDocsSearch } = await import(`../docs-research.ts?query-cap=${Date.now()}`);
+    const result = await executeDocsSearch({
+      source: "https://docs.query-cap",
+      query: `needle ${"q".repeat(60_000)}`,
+      maxPages: 1,
+    });
+
+    assert.doesNotMatch(result.content[0].text, /Docs search failed/);
+    assert.match(result.content[0].text, /Docs search output capped/);
+    assert.equal(result.details.outputTruncated, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("docs_search caps error text returned to the model", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => {
+      throw new Error(`upstream failed: ${"x".repeat(10_000)}`);
+    };
+
+    const { executeDocsSearch } = await import(`../docs-research.ts?error-cap=${Date.now()}`);
+    const result = await executeDocsSearch({ source: "https://docs.error-cap", query: "needle" });
+
+    assert.match(result.content[0].text, /Docs search failed/);
+    assert.ok(result.content[0].text.length <= 4_050);
+    assert.ok(result.details.error.length <= 4_001);
   } finally {
     globalThis.fetch = originalFetch;
   }

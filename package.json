@@ -45,14 +45,14 @@
     "linkedom": "0.18.12",
     "p-limit": "7.3.0",
     "turndown": "7.2.4",
-    "undici": "7.28.0",
+    "typebox": "^1.1.38",
+    "undici": "7.29.0",
     "unpdf": "1.6.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-tui": "*"
   },
   "pi": {
     "extensions": [
