@@ -19,6 +19,7 @@ test("package stays lean and Pi-native", () => {
   assert.ok(pkg.files.includes("*.js"));
   assert.ok(!pkg.files.includes("skills/"));
   assert.ok(pkg.files.includes("scripts/scan-sensitive.mjs"));
+  assert.ok(pkg.files.includes("SECURITY.md"));
   assert.ok(!pkg.files.includes("banner.png"));
   assert.ok(!pkg.files.includes("eval/"));
   assert.ok(!pkg.files.includes("test/"));

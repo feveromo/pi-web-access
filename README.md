@@ -1,6 +1,6 @@
 # Pi Web Access — Lean Fork
 
-A slimmed-down fork of [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for Pi, synced with the useful retained upstream fixes through `v0.13.0`. This version is intentionally focused on one thing: fast, predictable research and content extraction without interactive review UIs, media analysis, or extra provider layers. It is designed to behave like close-to-the-metal Pi software: small API surface, bounded output, cancellable work, session-safe storage, and native TUI rendering.
+A slimmed-down fork of [`pi-web-access`](https://github.com/nicobailon/pi-web-access) for Pi, selectively synced with applicable retained upstream fixes through `v0.24.0`. This version is intentionally focused on one thing: fast, predictable research and content extraction without interactive review UIs, media analysis, or extra provider layers. It is designed to behave like close-to-the-metal Pi software: small API surface, bounded output, cancellable work, session-safe storage, and native TUI rendering.
 
 ## What is different in this fork?
 
@@ -263,6 +263,7 @@ There is intentionally no curator/browser UI in this fork.
 | `searxng.ts` | Local SearXNG client + auto-start and self-check |
 | `extract.ts` | URL routing and HTTP/Jina extraction orchestration |
 | `github-extract.ts` | GitHub URL parsing, clone cache, repo/file extraction |
+| `clone-process.js` | Non-interactive, timeout-safe GitHub clone process handling |
 | `github-api.ts` | GitHub API fallback for large repos and commit/blob views |
 | `pdf-extract.ts` | PDF text extraction to markdown |
 | `paper-search.ts` | OpenAlex/arXiv scholarly search |

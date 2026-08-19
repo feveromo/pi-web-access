@@ -831,7 +831,7 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme) {
 			const { url, urls } = args as { url?: string; urls?: string[] };
-			const urlList = urls ?? (url ? [url] : []);
+			const urlList = urls?.length ? urls : url ? [url] : [];
 			if (urlList.length === 0) {
 				return new Text(theme.fg("toolTitle", theme.bold("fetch ")) + theme.fg("error", "(no URL)"), 0, 0);
 			}
