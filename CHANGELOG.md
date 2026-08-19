@@ -4,11 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Added a security reporting policy for the fork.
+
 ### Changed
+- Selectively synced applicable retained fixes through upstream `v0.24.0` while preserving the fork's SearXNG-only search path and keeping curator, media, RSC, and legacy provider layers removed.
 - Removed the unreachable legacy docs cache implementation left behind by the persistent-cache migration.
 - Bundled `typebox` as a runtime dependency and updated `undici` to patched `7.29.0` after reviewing current upstream dependency changes.
 
 ### Fixed
+- Prevented GitHub clone commands and credential helpers from reading terminal input, and terminate their complete process groups on cancellation or timeout.
+- Made the `fetch_content` call renderer fall back to singular `url` when `urls` is an empty array, matching execution-time normalization.
 - Cleared the docs cache TypeScript control-flow and possibly-undefined errors, including the stale shared-task path.
 - Bounded aggregate docs output, oversized query tokens, and returned error text, with safer malformed-URL fallbacks.
 

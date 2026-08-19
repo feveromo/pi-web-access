@@ -1,11 +1,11 @@
 import { existsSync, lstatSync, readFileSync, rmSync, statSync, readdirSync, openSync, readSync, closeSync, realpathSync } from "node:fs";
-import { execFile } from "node:child_process";
 import { lstat as lstatAsync, readdir as readdirAsync, rm as rmAsync } from "node:fs/promises";
 import { extname, join, resolve as resolvePath, sep as pathSep } from "node:path";
 import { activityMonitor } from "./activity.js";
 import { isManagedCacheRoot, measureDirectoryBoundedAsync, pruneManagedEntriesAsync } from "./managed-cache.js";
 import type { ExtractedContent } from "./extract.js";
 import { checkGhAvailable, checkRepoSize, fetchViaApi, showGhHint } from "./github-api.js";
+import { execClone } from "./clone-process.js";
 import { getWebSearchConfigPath } from "./utils.js";
 
 const CONFIG_PATH = getWebSearchConfigPath();
@@ -189,28 +189,6 @@ function cacheKey(owner: string, repo: string, ref?: string): string {
 function cloneDir(config: GitHubCloneConfig, owner: string, repo: string, ref?: string): string {
 	const dirName = ref ? `${repo}@${ref}` : repo;
 	return join(config.clonePath, owner, dirName);
-}
-
-function execClone(args: string[], localPath: string, timeoutMs: number, signal?: AbortSignal): Promise<string | null> {
-	return new Promise((resolve) => {
-		const child = execFile(args[0], args.slice(1), { timeout: timeoutMs }, (err) => {
-			if (err) {
-				try {
-					rmSync(localPath, { recursive: true, force: true });
-				} catch {
-				}
-				resolve(null);
-				return;
-			}
-			resolve(localPath);
-		});
-
-		if (signal) {
-			const onAbort = () => child.kill();
-			signal.addEventListener("abort", onAbort, { once: true });
-			child.on("exit", () => signal.removeEventListener("abort", onAbort));
-		}
-	});
 }
 
 async function cloneRepo(

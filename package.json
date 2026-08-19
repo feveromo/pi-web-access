@@ -38,6 +38,7 @@
     "scripts/scan-sensitive.mjs",
     "README.md",
     "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "dependencies": {
