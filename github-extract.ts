@@ -1,12 +1,15 @@
-import { existsSync, readFileSync, rmSync, statSync, readdirSync, openSync, readSync, closeSync, realpathSync } from "node:fs";
-import { execFile } from "node:child_process";
-import { homedir } from "node:os";
+import { existsSync, lstatSync, readFileSync, rmSync, statSync, readdirSync, openSync, readSync, closeSync, realpathSync } from "node:fs";
+import { lstat as lstatAsync, readdir as readdirAsync, rm as rmAsync } from "node:fs/promises";
 import { extname, join, resolve as resolvePath, sep as pathSep } from "node:path";
 import { activityMonitor } from "./activity.js";
+import { isManagedCacheRoot, measureDirectoryBoundedAsync, pruneManagedEntriesAsync } from "./managed-cache.js";
 import type { ExtractedContent } from "./extract.js";
 import { checkGhAvailable, checkRepoSize, fetchViaApi, showGhHint } from "./github-api.js";
+import { execClone } from "./clone-process.js";
+import { getWebSearchConfigPath } from "./utils.js";
 
-const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
+const CONFIG_PATH = getWebSearchConfigPath();
+const DEFAULT_CLONE_PATH = "/tmp/pi-github-repos";
 
 const BINARY_EXTENSIONS = new Set([
 	".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg", ".tiff", ".tif",
@@ -28,6 +31,13 @@ const NOISE_DIRS = new Set([
 
 const MAX_INLINE_FILE_CHARS = 100_000;
 const MAX_TREE_ENTRIES = 200;
+const CLONE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_MAX_CACHED_REPOS = 20;
+const DEFAULT_MAX_CLONE_CACHE_MB = 2_000;
+// Full legacy-cache measurement is synchronous, so quotas are enforced eventually:
+// on first use, then hourly or after ten successful clone writes, whichever comes first.
+const CLONE_CACHE_PRUNE_MIN_INTERVAL_MS = 60 * 60 * 1000;
+const CLONE_CACHE_PRUNE_WRITE_CADENCE = 10;
 
 export interface GitHubUrlInfo {
 	owner: string;
@@ -48,11 +58,16 @@ interface GitHubCloneConfig {
 	maxRepoSizeMB: number;
 	cloneTimeoutSeconds: number;
 	clonePath: string;
+	maxCachedRepos: number;
+	maxCacheSizeMB: number;
 }
 
 const cloneCache = new Map<string, CachedClone>();
+const inFlightClonePaths = new Set<string>();
 
 let cachedConfig: GitHubCloneConfig | null = null;
+let lastCloneCachePrune = 0;
+let cloneWritesSincePrune = 0;
 
 function normalizeEnabled(value: unknown, fallback: boolean): boolean {
 	return typeof value === "boolean" ? value : fallback;
@@ -76,7 +91,9 @@ function loadGitHubConfig(): GitHubCloneConfig {
 		enabled: true,
 		maxRepoSizeMB: 350,
 		cloneTimeoutSeconds: 30,
-		clonePath: "/tmp/pi-github-repos",
+		clonePath: DEFAULT_CLONE_PATH,
+		maxCachedRepos: DEFAULT_MAX_CACHED_REPOS,
+		maxCacheSizeMB: DEFAULT_MAX_CLONE_CACHE_MB,
 	};
 
 	if (!existsSync(CONFIG_PATH)) {
@@ -85,9 +102,9 @@ function loadGitHubConfig(): GitHubCloneConfig {
 	}
 
 	const rawText = readFileSync(CONFIG_PATH, "utf-8");
-	let raw: { githubClone?: { enabled?: unknown; maxRepoSizeMB?: unknown; cloneTimeoutSeconds?: unknown; clonePath?: unknown } };
+	let raw: { githubClone?: { enabled?: unknown; maxRepoSizeMB?: unknown; cloneTimeoutSeconds?: unknown; clonePath?: unknown; maxCachedRepos?: unknown; maxCacheSizeMB?: unknown } };
 	try {
-		raw = JSON.parse(rawText) as { githubClone?: { enabled?: unknown; maxRepoSizeMB?: unknown; cloneTimeoutSeconds?: unknown; clonePath?: unknown } };
+		raw = JSON.parse(rawText) as typeof raw;
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
@@ -99,6 +116,8 @@ function loadGitHubConfig(): GitHubCloneConfig {
 		maxRepoSizeMB: normalizePositiveNumber(gc.maxRepoSizeMB, defaults.maxRepoSizeMB),
 		cloneTimeoutSeconds: normalizePositiveNumber(gc.cloneTimeoutSeconds, defaults.cloneTimeoutSeconds),
 		clonePath: normalizeClonePath(gc.clonePath, defaults.clonePath),
+		maxCachedRepos: Math.max(1, Math.floor(normalizePositiveNumber(gc.maxCachedRepos, defaults.maxCachedRepos))),
+		maxCacheSizeMB: normalizePositiveNumber(gc.maxCacheSizeMB, defaults.maxCacheSizeMB),
 	};
 	return cachedConfig;
 }
@@ -170,28 +189,6 @@ function cacheKey(owner: string, repo: string, ref?: string): string {
 function cloneDir(config: GitHubCloneConfig, owner: string, repo: string, ref?: string): string {
 	const dirName = ref ? `${repo}@${ref}` : repo;
 	return join(config.clonePath, owner, dirName);
-}
-
-function execClone(args: string[], localPath: string, timeoutMs: number, signal?: AbortSignal): Promise<string | null> {
-	return new Promise((resolve) => {
-		const child = execFile(args[0], args.slice(1), { timeout: timeoutMs }, (err) => {
-			if (err) {
-				try {
-					rmSync(localPath, { recursive: true, force: true });
-				} catch {
-				}
-				resolve(null);
-				return;
-			}
-			resolve(localPath);
-		});
-
-		if (signal) {
-			const onAbort = () => child.kill();
-			signal.addEventListener("abort", onAbort, { once: true });
-			child.on("exit", () => signal.removeEventListener("abort", onAbort));
-		}
-	});
 }
 
 async function cloneRepo(
@@ -284,6 +281,82 @@ function readTextFile(path: string): string | null {
 	} catch {
 		return null;
 	}
+}
+
+function isDefaultClonePath(clonePath: string): boolean {
+	return isManagedCacheRoot(clonePath, DEFAULT_CLONE_PATH);
+}
+
+function isPathWithinRoot(rootRealPath: string, candidateRealPath: string): boolean {
+	if (candidateRealPath === rootRealPath) return true;
+	const prefix = rootRealPath.endsWith(pathSep) ? rootRealPath : rootRealPath + pathSep;
+	return candidateRealPath.startsWith(prefix);
+}
+
+async function pruneClonePath(config: GitHubCloneConfig, protectedPaths: ReadonlySet<string> = inFlightClonePaths): Promise<string[]> {
+	if (!isDefaultClonePath(config.clonePath) || !existsSync(config.clonePath)) return [];
+	const entries: { path: string; mtimeMs: number; sizeBytes: number }[] = [];
+	let owners;
+	try {
+		owners = await readdirAsync(config.clonePath, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	for (const owner of owners) {
+		if (!owner.isDirectory() || owner.isSymbolicLink()) continue;
+		const ownerPath = join(config.clonePath, owner.name);
+		let repos;
+		try { repos = await readdirAsync(ownerPath, { withFileTypes: true }); }
+		catch { continue; }
+		for (const repo of repos) {
+			if (!repo.isDirectory() || repo.isSymbolicLink()) continue;
+			const path = join(ownerPath, repo.name);
+			try {
+				const repoStat = await lstatAsync(path);
+				if (!repoStat.isDirectory() || repoStat.isSymbolicLink()) continue;
+				entries.push({
+					path,
+					mtimeMs: repoStat.mtimeMs,
+					sizeBytes: await measureDirectoryBoundedAsync(path, config.maxCacheSizeMB * 1024 * 1024),
+				});
+			} catch {
+			}
+		}
+	}
+	const removed = await pruneManagedEntriesAsync(config.clonePath, entries, {
+		maxAgeMs: CLONE_CACHE_TTL_MS,
+		maxEntries: config.maxCachedRepos,
+		maxBytes: config.maxCacheSizeMB * 1024 * 1024,
+	}, protectedPaths);
+	for (const removedPath of removed) {
+		for (const [key, cached] of cloneCache) {
+			if (resolvePath(cached.localPath) === resolvePath(removedPath)) cloneCache.delete(key);
+		}
+	}
+	for (const owner of owners) {
+		if (!owner.isDirectory() || owner.isSymbolicLink()) continue;
+		const ownerPath = join(config.clonePath, owner.name);
+		try {
+			if ((await readdirAsync(ownerPath)).length === 0) await rmAsync(ownerPath, { recursive: true, force: true });
+		} catch {
+		}
+	}
+	return removed;
+}
+
+
+async function maybePruneClonePath(
+	config: GitHubCloneConfig,
+	protectedPaths: ReadonlySet<string> = inFlightClonePaths,
+	force = false,
+): Promise<string[]> {
+	const now = Date.now();
+	if (!force && lastCloneCachePrune !== 0
+		&& now - lastCloneCachePrune < CLONE_CACHE_PRUNE_MIN_INTERVAL_MS
+		&& cloneWritesSincePrune < CLONE_CACHE_PRUNE_WRITE_CADENCE) return [];
+	lastCloneCachePrune = now;
+	cloneWritesSincePrune = 0;
+	return pruneClonePath(config, protectedPaths);
 }
 
 function buildTree(rootPath: string): string {
@@ -588,11 +661,21 @@ export async function extractGitHub(
 		return cachedResult;
 	}
 
-	const clonePromise = cloneRepo(owner, repo, info.ref, config, signal);
 	const localPath = cloneDir(config, owner, repo, info.ref);
+	try {
+		await maybePruneClonePath(config, new Set([...inFlightClonePaths, localPath]));
+	} catch {
+	}
+	inFlightClonePaths.add(localPath);
+	const clonePromise = cloneRepo(owner, repo, info.ref, config, signal);
 	cloneCache.set(key, { localPath, clonePromise });
 
-	const result = await clonePromise;
+	const result = await clonePromise.finally(() => inFlightClonePaths.delete(localPath));
+	if (result) cloneWritesSincePrune++;
+	try {
+		await maybePruneClonePath(config, new Set([...inFlightClonePaths, localPath]));
+	} catch {
+	}
 	if (signal?.aborted) {
 		if (!result) cloneCache.delete(key);
 		activityMonitor.logComplete(activityId, 0);
@@ -622,13 +705,19 @@ export async function extractGitHub(
 	return { url, title, content, error: null };
 }
 
-export function clearCloneCache(): void {
-	for (const entry of cloneCache.values()) {
-		try {
-			rmSync(entry.localPath, { recursive: true, force: true });
-		} catch {
+export function clearCloneCache(options: { removeFiles?: boolean } = {}): void {
+	if (options.removeFiles === true) {
+		for (const entry of cloneCache.values()) {
+			try {
+				rmSync(entry.localPath, { recursive: true, force: true });
+			} catch {
+			}
 		}
+	} else {
+		const protectedPaths = new Set(inFlightClonePaths);
+		void maybePruneClonePath(loadGitHubConfig(), protectedPaths, true).catch(() => {});
 	}
 	cloneCache.clear();
+	// Active clone paths stay protected until each clone's finally handler removes them.
 	cachedConfig = null;
 }
