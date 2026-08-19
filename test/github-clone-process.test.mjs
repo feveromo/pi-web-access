@@ -74,7 +74,7 @@ test("GitHub clones disable interactive credential prompts", { skip: process.pla
   });
 });
 
-test("GitHub clone timeout force-kills the process group", { skip: process.platform === "win32" }, async () => {
+test("GitHub clone timeout force-kills helpers after the parent exits", { skip: process.platform === "win32" }, async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-web-access-github-timeout-tree-"));
   const binDir = join(root, "bin");
   const clonePath = join(root, "repo");
@@ -85,7 +85,6 @@ test("GitHub clone timeout force-kills the process group", { skip: process.platf
     "git",
     `
       const { spawn } = require("node:child_process");
-      process.on("SIGTERM", () => {});
       const helperSource = ${JSON.stringify(`
         const { writeFileSync } = require("node:fs");
         process.on("SIGTERM", () => {});
@@ -112,7 +111,7 @@ test("GitHub clone timeout force-kills the process group", { skip: process.platf
   const { rootPid, helperPid } = JSON.parse(await readFile(processPidFile, "utf8"));
   try {
     assert.equal(await waitForProcessExit(rootPid), true, `clone process ${rootPid} survived SIGKILL fallback`);
-    assert.equal(await waitForProcessExit(helperPid), true, `clone helper ${helperPid} survived SIGKILL fallback`);
+    assert.equal(await waitForProcessExit(helperPid, 5000), true, `clone helper ${helperPid} survived SIGKILL fallback`);
   } finally {
     if (processIsAlive(rootPid)) process.kill(rootPid, "SIGKILL");
     if (processIsAlive(helperPid)) process.kill(helperPid, "SIGKILL");
