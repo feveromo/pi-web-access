@@ -4,15 +4,92 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [0.10.7] - 2026-05-02
-
 ### Added
-- Added `summaryModel` config for choosing the default curator summary draft model from `~/.pi/web-search.json`.
+- Added a security reporting policy for the fork.
+
+### Changed
+- Selectively synced applicable retained fixes through upstream `v0.24.0` while preserving the fork's SearXNG-only search path and keeping curator, media, RSC, and legacy provider layers removed.
+- Removed the unreachable legacy docs cache implementation left behind by the persistent-cache migration.
+- Bundled `typebox` as a runtime dependency and updated `undici` to patched `7.29.0` after reviewing current upstream dependency changes.
 
 ### Fixed
-- Made Gemini Web browser-cookie access opt-in via `allowBrowserCookies` or `PI_ALLOW_BROWSER_COOKIES=1`, preventing surprise macOS Keychain prompts during provider checks.
-- Restored `code_search` after Exa removed the `get_code_context_exa` MCP tool by falling back to `web_search_exa` with code-focused queries.
-- Migrated extension tool schemas from `@sinclair/typebox` to Pi's bundled `typebox` 1.x import path.
+- Prevented GitHub clone commands and credential helpers from reading terminal input, and now terminate their complete process groups on cancellation or timeout.
+- Made the `fetch_content` call renderer fall back to singular `url` when `urls` is an empty array, matching execution-time normalization.
+- Cleared the docs cache TypeScript control-flow and possibly-undefined errors, including the stale shared-task path.
+- Bounded aggregate docs output, oversized query tokens, and returned error text, with safer malformed-URL fallbacks.
+
+## [0.15.0] - 2026-07-12
+
+### Added
+- Added a shared, bounded persistent research cache with versioned schema-validated envelopes, SHA-256 keys, atomic async writes, memory LRU, abort-isolated request coalescing, explicit stale-on-transient-error handling, and symlink-safe owned-file pruning.
+- Persisted web search, documentation, OpenAPI, public raw extraction, paper research, and responseId records with policy-specific freshness and hard-retention bounds.
+
+### Changed
+- Public raw fetch freshness now honors origin `Cache-Control` up to 24 hours while excluding private, signed, credentialed, GitHub, custom-network, and non-cacheable responses; URL SSRF validation always precedes cache lookup.
+- Stored responseIds and externalized content now remain available for seven days across reloads, with bounded record/content storage and explicit deletion of owned files.
+
+### Added
+- Added age/count/byte quota pruning for the plugin-managed GitHub clone and PDF markdown caches, with active-output protection, bounded symlink-safe traversal, and no automatic pruning of custom user paths.
+- Added bounded static partial extraction for JavaScript/SPA shells after Jina failure, plus a cancellation- and SSRF-aware `npm-registry` adapter for canonical npm package URLs with metadata, links, and bounded README content.
+- Added bounded content-aware ranking to `github_examples`, a short-lived 20 MiB raw extraction cache below fetch shaping, cache metrics, and paper abstract/TOC aliases. Raw cache keys isolate extraction timeouts, retained-object byte accounting is bounded, and GitHub/sensitive/allow-ranged fetches are excluded.
+- Added abort-aware, redirect-validating SSRF protection for `fetch_content`, blocking private/internal/metadata targets by default with a strict `ssrf.allowRanges` escape hatch for direct trusted-network and fake-IP proxy access; exemptions never authorize third-party Jina forwarding.
+- Added modern Pi config discovery through `PI_CODING_AGENT_DIR`, `XDG_CONFIG_HOME/pi`, and the legacy `~/.pi` fallback.
+- Added mocked SearXNG, snippet-formatting, bounded-response, PDF-wrapper, and session-restore regression coverage for the primary research path.
+- Added shared response streaming guards that enforce actual body limits for chunked/compressed responses instead of trusting `Content-Length`.
+- Added bounded, short-lived `docs_search` caching under `~/.pi/web-access/docs-cache/`, with split discovery/page entries, concurrent fetch sharing, detailed hit/miss/failure metadata, atomic writes, and a 30-minute TTL for safe reuse across queries and quick Pi reloads.
+- Added compact-output guardrails: `web_search` caps inline synthesized snippets and stores full search text for `get_search_content`, `docs_search` uses smaller default snippets, and large single-page `fetch_content` results now return a preview plus retrieval hint.
+- Added `get_search_content` batch selectors (`urlIndexes`, `queryIndexes`, `allUrls`, `allQueries`) plus optional per-item `maxChars` caps so agents can retrieve selected stored sources without many one-at-a-time calls.
+
+### Changed
+- **`web_search` is now keyless** and backed by a self-hosted SearXNG meta-search instance (Google, Bing, DuckDuckGo, Brave, and more). The Exa provider, API key, MCP fallback, usage metering, and Exa-specific options (`researchDepth`, `searchType`, `contentMode`, `maxCharacters`, `livecrawl`, `synthesize`, `includeContent`, `provider`) have been removed. Configure an existing instance with `SEARXNG_URL`; the default local endpoint can use `start-web-search` or `SEARXNG_START_HELPER` when installed. Use `fetch_content` for full source text.
+- `web_search` now limits query fan-out, collapses concurrent duplicates, caches repeated searches briefly, reports progress, propagates cancellation, and bounds startup/health/search waits.
+- `fetch_content` now limits URL batches, normalizes timeouts, stream-limits HTML/PDF/Jina bodies, and avoids sending syntactically obvious private-address or credential-bearing URLs to Jina.
+- `get_search_content` now applies safe default per-item and total caps to batch retrieval while preserving uncapped single-item retrieval.
+- PDF extraction now returns bounded markdown content, cleans up pdf.js resources, reuses identical output, honors cancellation through persistence, and never overwrites a differing output. New default outputs use `~/.pi/web-access/pdf-cache/` instead of accumulating in `~/Downloads/`; `PI_WEB_ACCESS_PDF_OUTPUT_DIR` remains an unpruned user-owned override.
+- `paper_research` topic maps and two-way citation graphs fetch independent branches concurrently through one request limiter; its JSON cache is now TTL- and byte-bounded.
+- Release checks now scan all tracked package files for sensitive residue and ignore local `.pi-subagents/` runtime artifacts.
+
+### Fixed
+- Closed the direct-fetch DNS-rebinding gap by pinning every request and redirect connection to that hop's complete validated DNS answer set while preserving hostname-based Host, TLS SNI, and certificate verification.
+- Fixed mixed fetch batches recommending failed URL index 0, GitHub read truncation lacking a ready next-range call, unbounded live stored-result memory, and eager hydration of every externalized URL.
+- Fixed multiple positive `domainFilter` values to use OR semantics, invalid/empty `urls` arrays to fall back to `url`, and Pi widget clearing to use the current `undefined` API contract.
+- Updated `@mozilla/readability` to 0.6.0, which includes upstream performance improvements and fixes the published regex denial-of-service advisory affecting older releases.
+- Fixed the SearXNG migration regression that collected source snippets but omitted them from both `web_search` and `get_search_content` output.
+- Fixed URL result deduplication so case-sensitive paths remain distinct while fragments/tracking parameters collapse correctly.
+- Fixed malformed session entries being restored and dereferenced later.
+
+## [0.10.8] - 2026-05-29
+
+### Added
+- Added `paper_research` as a no-key OpenAlex/arXiv/Hugging Face research flow: topic maps, citation graphs, abstract search, related works, arXiv section reading, and paper-linked HF datasets/models.
+- Added `docs_search` for official docs and `llms.txt` indexing, plus `openapi_search` for OpenAPI endpoint discovery with curl examples.
+- Added `github_examples` for GitHub API-based example discovery and remote file-range reads without cloning; it can use `GITHUB_TOKEN` or private config `githubToken` for higher API limits.
+- Added `paper_search` for structured scholarly search via OpenAlex with arXiv support/fallback.
+- Added Exa research controls on `web_search`: `researchDepth`, `searchType`, `contentMode`, `maxCharacters`, `livecrawl`, and `synthesize`.
+- Added parser/error regression tests for `paper_search` plus a Node 22 PDF extraction regression test and `npm test` script.
+- Added `npm run syntax`, `npm run pack:dry-run`, `npm run scan:sensitive`, and `npm run check` so repeated session-polish validation is one command with a targeted residue scan.
+
+### Changed
+- Expanded `.gitignore` for local editor/runtime logs and accidental package tarballs.
+- Removed Perplexity and Gemini search/fetch/media paths; web search now routes through Exa only (direct API when keyed, Exa MCP otherwise).
+- Made Exa direct API use `/search` by default for fast source-passage retrieval; Exa `/answer` is now opt-in with `synthesize: true`.
+- Removed video/YouTube frame extraction and media analysis to keep the extension lean, fast, and focused on research/content extraction.
+- Removed the curator UI, summary-review workflow, `/websearch`, and `/curator`; `web_search` now returns results directly after all requested search/content work finishes.
+- Removed the `code_search` wrapper for now because Exa MCP no longer exposes the dedicated code-context tool; use `web_search` with code/doc-specific queries and GitHub fetches for the baseline.
+- Removed the RSC flight-data extractor from the baseline; `fetch_content` now stays on deterministic extraction paths: GitHub, HTTP/Readability, PDF/text, and Jina fallback.
+- Merged relevant upstream baseline fixes through upstream `v0.10.7`: Pi bundled `typebox` import for tool schemas, `unpdf` 1.6.x for Node 22 PDF extraction compatibility, and package/test metadata.
+- Pointed package repository/homepage metadata at this lean fork so package/search surfaces do not default to the removed upstream feature set.
+- Intentionally kept the lean fork removals in place instead of re-adding upstream Gemini/Perplexity, curator, media, and `code_search` paths.
+
+### Fixed
+- Fixed `paper_research` arXiv-to-OpenAlex resolution so arXiv-driven operations only bind to verified matching OpenAlex works instead of first title-search candidates.
+- Fixed `paper_research` Hugging Face linked-resource output to display collection titles/slugs and avoid counting failed resource category lookups as successful results.
+- Fixed `github_examples` large-file reads by falling back to raw GitHub content when the Contents API reports `encoding: "none"`.
+- Fixed `github_examples` repository-tree truncation reporting and branch/ref metadata so users and programmatic callers can tell when discovery may be incomplete.
+- Fixed `docs_search` query-biased cache reuse and heading-only snippet selection.
+- Fixed `openapi_search` curl examples to include path-item parameters as well as operation-level parameters.
+- Reduced `paper_search` auto-mode noise when OpenAlex is transiently unavailable and arXiv fallback is rate-limited; OpenAlex requests now ask for only the fields this tool displays.
+- Avoided duplicated title headings when `get_search_content` renders stored fetched content that already starts with the same title.
 
 ## [0.10.6] - 2026-04-04
 
@@ -253,9 +330,6 @@ All notable changes to this project will be documented in this file.
 - `youtube-extract.ts` -- YouTube extraction orchestrator with three-tier fallback and activity logging
 
 ## [0.5.1] - 2026-02-02
-
-### Added
-- Bundled `librarian` skill -- structured research workflow for open-source libraries with GitHub permalinks, combining fetch_content (cloning), web_search (recent info), and git operations (blame, log, show)
 
 ### Fixed
 - Session fork event handler was registered as `session_branch` (non-existent event) instead of `session_fork`, meaning forks never triggered cleanup (abort pending fetches, clear clone cache, restore session data)
