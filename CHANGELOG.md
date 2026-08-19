@@ -13,7 +13,7 @@ All notable changes to this project will be documented in this file.
 - Bundled `typebox` as a runtime dependency and updated `undici` to patched `7.29.0` after reviewing current upstream dependency changes.
 
 ### Fixed
-- Prevented GitHub clone commands and credential helpers from reading terminal input, and terminate their complete process groups on cancellation or timeout.
+- Prevented GitHub clone commands and credential helpers from reading terminal input, and now terminate their complete process groups on cancellation or timeout.
 - Made the `fetch_content` call renderer fall back to singular `url` when `urls` is an empty array, matching execution-time normalization.
 - Cleared the docs cache TypeScript control-flow and possibly-undefined errors, including the stale shared-task path.
 - Bounded aggregate docs output, oversized query tokens, and returned error text, with safer malformed-URL fallbacks.

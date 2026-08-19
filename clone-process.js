@@ -6,11 +6,11 @@ const PROCESS_KILL_GRACE_MS = 3000;
 /**
  * Terminate a clone command and its credential-helper descendants.
  * @param {import("node:child_process").ChildProcess} child
- * @returns {ReturnType<typeof setTimeout> | undefined}
+ * @returns {void}
  */
 function terminateProcessTree(child) {
   const pid = child.pid;
-  if (!pid) return undefined;
+  if (!pid) return;
 
   if (process.platform === "win32") {
     const killer = execFile(
@@ -22,7 +22,7 @@ function terminateProcessTree(child) {
       },
     );
     killer.unref();
-    return undefined;
+    return;
   }
 
   try {
@@ -43,7 +43,6 @@ function terminateProcessTree(child) {
     }
   }, PROCESS_KILL_GRACE_MS);
   forceKill.unref();
-  return forceKill;
 }
 
 /**
@@ -58,14 +57,13 @@ export function execClone(args, localPath, timeoutMs, signal) {
   return new Promise(resolve => {
     let settled = false;
     let timeout;
-    let forceKill;
     let onAbort;
+    let terminating = false;
 
     const finish = success => {
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
-      if (forceKill) clearTimeout(forceKill);
       if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 
       if (!success) {
@@ -93,17 +91,19 @@ export function execClone(args, localPath, timeoutMs, signal) {
     });
 
     child.once("error", () => finish(false));
-    child.once("close", code => finish(code === 0));
+    child.once("close", code => finish(!terminating && code === 0));
 
     timeout = setTimeout(() => {
-      forceKill = terminateProcessTree(child);
+      terminating = true;
+      terminateProcessTree(child);
     }, timeoutMs);
     timeout.unref();
 
     if (signal) {
       onAbort = () => {
+        terminating = true;
         if (timeout) clearTimeout(timeout);
-        forceKill = terminateProcessTree(child);
+        terminateProcessTree(child);
       };
       if (signal.aborted) onAbort();
       else signal.addEventListener("abort", onAbort, { once: true });
